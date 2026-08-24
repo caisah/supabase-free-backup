@@ -1,0 +1,41 @@
+# Node
+node_modules/
+
+# Local environment files (never committed; contain secrets)
+.env
+.env.*.local
+!.env.example
+
+# Supabase CLI runtime/link state
+supabase/.temp/
+supabase/.branches/
+supabase/.link/
+supabase/.env
+supabase/.env.*
+supabase/tmp/
+
+# Temporary backup/restore private paths
+.tmp/
+tmp/
+.candidate/
+.staging/
+staging/
+weekly-staging/
+r2-download/
+restore-*/
+dump-*/
+
+# Private local backup store (repository-local, target-encrypted snapshots)
+local-backups/
+
+# Private plaintext row-data intermediates (never packaged or committed)
+migration-history-data.sql
+database-data.sql
+data.sql
+data.sql.gz
+data.sql.gz.age
+*.age
+
+# OS / logs / editor
+.DS_Store
+*.log

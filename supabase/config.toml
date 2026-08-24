@@ -1,0 +1,55 @@
+# Minimal Supabase workdir used by the backup/restore tooling.
+# It intentionally contains NO application migrations or seeds: remote
+# `db dump` / `db diff` / `db reset --db-url` only need DB connection settings,
+# and managed auth/storage changes are captured as a diff, never applied.
+# For configuration reference: https://supabase.com/docs/guides/local-development/cli/config
+
+project_id = "supabase-db-backup"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+health_timeout = "2m"
+major_version = 17
+
+[db.pooler]
+enabled = false
+port = 54329
+pool_mode = "transaction"
+default_pool_size = 20
+max_client_conn = 100
+
+[db.migrations]
+enabled = true
+schema_paths = []
+
+[db.seed]
+enabled = false
+sql_paths = []
+
+[realtime]
+enabled = false
+
+[studio]
+enabled = false
+
+[storage]
+enabled = false
+file_size_limit = "50MiB"
+
+[auth]
+enabled = false
+site_url = "http://localhost"
+jwt_expiry = 3600
+enable_refresh_token_rotation = true
+enable_signup = true
+
+[local_smtp]
+enabled = false

@@ -1,0 +1,180 @@
+name: Backup
+
+# Daily logical backups of the development and production Supabase databases
+# at 03:17 UTC; the Sunday expression additionally triggers the weekly
+# staged-snapshot commit. Repository must stay private; scheduled workflows
+# require master to be the default branch.
+on:
+  schedule:
+    - cron: '17 3 * * 1-6'
+    - cron: '17 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      commit_weekly:
+        type: boolean
+        default: false
+
+# Backup jobs are read-only in this repository; only the weekly commit job
+# gains `contents: write`.
+permissions:
+  contents: read
+
+concurrency:
+  group: backup-${{ github.ref }}-${{ matrix.environment }}
+  cancel-in-progress: false
+
+env:
+  # The daily staging directory (snapshots pending the Sunday Git commit);
+  # R2 snapshot selection is independent of it.
+  STAGING_DIR: staging
+
+jobs:
+  backup:
+    name: Backup ${{ matrix.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [development, production]
+    # Resolves secrets/variables independently per environment.
+    environment: ${{ matrix.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Repository must stay private
+        run: |
+          if [ "${{ github.event.repository.private }}" != "true" ]; then
+            echo "::error::backup refuses to run in a public repository"
+            exit 1
+          fi
+
+      - name: Set up Vite+ and Node.js (pinned)
+        uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+        with:
+          version: '0.3.0'
+          node-version-file: .node-version
+          cache: true
+          run-install: false
+
+      - name: Install age
+        run: |
+          if ! command -v age >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq age
+          fi
+          age --version
+
+      - name: Verify Docker
+        run: docker info >/dev/null
+
+      - name: Install dependencies
+        run: vp install --frozen-lockfile
+
+      - name: Unit checks (no network/Docker/secrets)
+        run: vp run check
+
+      - name: Back up environment (daily)
+        if: github.event.schedule != '17 3 * * 0' && github.event.inputs.commit_weekly != 'true'
+        env:
+          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+          BACKUP_ENVIRONMENT: ${{ matrix.environment }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          SUPABASE_PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          ENCRYPT_KEY: ${{ vars.ENCRYPT_KEY }}
+        run: vp run backup --environment ${{ matrix.environment }}
+
+      - name: Back up environment (with weekly staging)
+        if: github.event.schedule == '17 3 * * 0' || github.event.inputs.commit_weekly == 'true'
+        env:
+          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+          BACKUP_ENVIRONMENT: ${{ matrix.environment }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          SUPABASE_PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          ENCRYPT_KEY: ${{ vars.ENCRYPT_KEY }}
+        run: vp run backup --environment ${{ matrix.environment }} --staging-dir ${{ env.STAGING_DIR }}
+
+      - name: Upload weekly staging artifact
+        if: (github.event.schedule == '17 3 * * 0' || github.event.inputs.commit_weekly == 'true') && always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: weekly-${{ matrix.environment }}-${{ github.run_id }}
+          path: ${{ env.STAGING_DIR }}
+          if-no-files-found: ignore
+          retention-days: 1
+          compression-level: 0
+
+  weekly-commit:
+    name: Commit weekly snapshots
+    needs: backup
+    if: (github.event.schedule == '17 3 * * 0' || github.event.inputs.commit_weekly == 'true') && github.event.repository.private == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attach to the master branch
+        # actions/checkout leaves a detached HEAD; commit:weekly asserts the
+        # branch, and pull/push must operate on a real branch.
+        run: git checkout master
+
+      - name: Download both staging artifacts (outside backups/)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: weekly-staging
+          merge-multiple: false
+
+      - name: Update from origin master (ff-only)
+        run: git pull --ff-only origin master
+
+      - name: Set up Vite+ and Node.js (pinned)
+        uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+        with:
+          version: '0.3.0'
+          node-version-file: .node-version
+          cache: true
+          run-install: false
+
+      - name: Install dependencies
+        run: vp install --frozen-lockfile
+
+      - name: Merge staged snapshots and copy changed snapshots into backups/
+        run: |
+          mkdir -p /tmp/weekly-staging
+          cp -R weekly-staging/*/* /tmp/weekly-staging/
+          # A partial weekly commit is forbidden: both environments are required.
+          test -d /tmp/weekly-staging/development
+          test -d /tmp/weekly-staging/production
+          vp run commit:weekly --staging-dir /tmp/weekly-staging --repo-root .
+
+      - name: Stage only backups/
+        run: git add backups/
+
+      - name: Skip when nothing changed
+        run: |
+          if git diff --cached --quiet; then
+            echo "weekly: no staged changes; skipping commit"
+            exit 0
+          fi
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "backups: $(date -u +%Y-%m-%d) development and production snapshots"
+          git push origin HEAD:master
