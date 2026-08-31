@@ -49,10 +49,10 @@ test('workflow: every backup job requires explicit opt-in in a private repositor
   }
 });
 
-test('workflow: backup matrix jobs do not share a serialized concurrency group', () => {
+test('workflow: serializes overlapping runs by ref', () => {
   assert.match(
     yaml,
-    /group: backup-\${{ github\.ref }}-\${{ matrix\.environment }}/,
-    'development and production must be able to run in parallel',
+    /^concurrency:\n {2}group: backup-\${{ github\.ref }}\n {2}cancel-in-progress: false$/m,
+    'workflow-level concurrency must not reference the job matrix',
   );
 });
