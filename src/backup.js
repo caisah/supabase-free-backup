@@ -42,7 +42,7 @@ export function resolveBackupExecutables({ lookup, locateCli, root, platform, re
  * never see another process's directories.
  */
 export function createBackupWorkspace(token = process.pid) {
-  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), `fragtrack-backup-${token}-`));
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), `db-backup-${token}-`));
   fs.chmodSync(workspace, 0o700);
   const outDir = path.join(workspace, 'dumps');
   // NOT pre-created: packageSnapshot (and unpackAndVerify) own destination
@@ -56,7 +56,7 @@ export function createBackupWorkspace(token = process.pid) {
 /**
  * Dump and package the snapshot; validated before ANY deletion. `dbUrl` is
  * the ONLY source input; `cwd` is the working directory for the dump
- * commands (the backup repository for local runs, never the Fragtrack
+ * commands (the backup repository for local runs, never the project
  * workdir). `pkgDir` is caller-owned: the remote pipeline uses the OS
  * workspace, the local pipeline a candidate on the destination filesystem
  * for the same-filesystem atomic rename.

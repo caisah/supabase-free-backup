@@ -41,7 +41,7 @@ function devFile(root, overrides = {}) {
     R2_SECRET_ACCESS_KEY: 'dev-secret-key-abcdefghijklmnop',
     ENCRYPT_KEY: 'age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
     DECRYPT_KEY: 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ',
-    PROJECT_WORKDIR: '../fragtrack',
+    PROJECT_WORKDIR: '../project',
     ...overrides,
   });
 }
@@ -555,7 +555,7 @@ test('config: local backup succeeds with only its own requirements', () => {
   assert.equal(cfg.environment, 'development');
   assert.equal(cfg.projectRef, REF_DEV);
   assert.equal(cfg.ageRecipient, undefined, 'ENCRYPT_KEY is not consumed by local backup');
-  assert.equal(cfg.fragtrackWorkdir, path.join(root, '..', 'fragtrack'));
+  assert.equal(cfg.projectWorkdir, path.join(root, '..', 'project'));
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -587,7 +587,7 @@ test('config: local backup returns only consumed fields', () => {
   assert.deepEqual(cfg, {
     environment: 'development',
     projectRef: REF_DEV,
-    fragtrackWorkdir: path.resolve(root, '../fragtrack'),
+    projectWorkdir: path.resolve(root, '../project'),
   });
   for (const name of [
     'dbUrl',
@@ -604,15 +604,17 @@ test('config: local backup returns only consumed fields', () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('config: local backup resolves explicit and default workdirs', () => {
+test('config: local backup resolves an explicit workdir and requires PROJECT_WORKDIR', () => {
   const root = makeRoot();
-  devFile(root, { PROJECT_WORKDIR: '../fragtrack-proj' });
+  devFile(root, { PROJECT_WORKDIR: '../project-proj' });
   const cfg = loadLocalBackupConfig({ environment: 'development', root, vars: {} });
-  assert.equal(path.resolve(root, '../fragtrack-proj'), cfg.fragtrackWorkdir);
+  assert.equal(path.resolve(root, '../project-proj'), cfg.projectWorkdir);
 
   devFile(root, { PROJECT_WORKDIR: undefined });
-  const defaulted = loadLocalBackupConfig({ environment: 'development', root, vars: {} });
-  assert.equal(defaulted.fragtrackWorkdir, path.join(root, '..', 'fragtrack'));
+  assert.throws(
+    () => loadLocalBackupConfig({ environment: 'development', root, vars: {} }),
+    (err) => err instanceof ConfigError && err.message.includes('MISSING PROJECT_WORKDIR'),
+  );
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -724,7 +726,7 @@ test('config: hosted local-source restore consumes only ref, URL, and environmen
     cfg.dbUrl,
     `postgresql://postgres.${REF_DEV}:${PASSWORD}@aws-0-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require`,
   );
-  assert.equal(cfg.fragtrackWorkdir, undefined);
+  assert.equal(cfg.projectWorkdir, undefined);
   for (const name of [
     'accountId',
     'bucket',

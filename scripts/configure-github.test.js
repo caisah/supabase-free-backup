@@ -22,7 +22,7 @@ const ACCESS_KEY = 'r2-access-key-1234567890';
 const SECRET_KEY = 'r2-secret-key-abcdefghijklmnopqrstuv';
 const AGE_RECIPIENT = AGE_RECIPIENT_1;
 const AGE_IDENTITY = AGE_IDENTITY_1;
-const WORKDIR = '/tmp/fragtrack-workdir';
+const WORKDIR = '/tmp/project-workdir';
 const UNKNOWN_SENTINEL = 'unknown-sentinel-value-never-uploaded';
 const CANONICAL = 'owner/canonical-repo';
 
@@ -98,7 +98,7 @@ function stubConfig(environment) {
     secretAccessKey: SECRET_KEY,
     ageRecipient: AGE_RECIPIENT,
     ageIdentity: AGE_IDENTITY,
-    fragtrackWorkdir: WORKDIR,
+    projectWorkdir: WORKDIR,
   };
 }
 
@@ -197,7 +197,7 @@ test('github:configure: no arguments selects default repository resolution', () 
 });
 
 test('github:configure: one valid OWNER/REPO is accepted', () => {
-  assert.deepEqual(parseConfigureGitHubArgs(['fragtrack/db']), { repository: 'fragtrack/db' });
+  assert.deepEqual(parseConfigureGitHubArgs(['acme/db']), { repository: 'acme/db' });
 });
 
 test('github:configure: -h and --help return help', () => {

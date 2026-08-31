@@ -898,7 +898,7 @@ test('restore: an acquisition failure removes the allocated download directory',
       throw new Error('download exploded');
     },
   };
-  await assertNoNewPrivateDirs(['fragtrack-download-'], () =>
+  await assertNoNewPrivateDirs(['db-backup-download-'], () =>
     assert.rejects(
       () =>
         prepareRestore({
@@ -933,7 +933,7 @@ test('restore: a failed identity write removes its temp directory', async () => 
     return originalWrite(file, ...rest);
   };
   try {
-    await assertNoNewPrivateDirs(['fragtrack-identity-'], () =>
+    await assertNoNewPrivateDirs(['db-backup-identity-'], () =>
       assert.rejects(
         () =>
           prepareRestore({
@@ -964,7 +964,7 @@ test(
     fs.cpSync(pkg, path.join(repoRoot, 'backups', ENV, ID), { recursive: true });
     // Wrong identity makes unpack/decrypt fail after identity + prepared dirs
     // were allocated; no identity override so the generated dir is also owned.
-    await assertNoNewPrivateDirs(['fragtrack-identity-', 'fragtrack-prepared-'], () =>
+    await assertNoNewPrivateDirs(['db-backup-identity-', 'db-backup-prepared-'], () =>
       assert.rejects(
         () =>
           prepareRestore({

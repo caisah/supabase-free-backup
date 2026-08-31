@@ -23,7 +23,7 @@ import dotenv from 'dotenv';
 
 export const ENVIRONMENTS = ['development', 'production'];
 
-/** Config/dotenv identity of the single local Fragtrack stack: selects the
+/** Config/dotenv identity of the single local project stack: selects the
  * `.env.<value>.local` file and must equal the BACKUP_ENVIRONMENT inside it.
  * Deliberately NOT derived from ENVIRONMENTS[0]: the hosted environment list
  * may change without the local stack's config identity changing, and the
@@ -247,7 +247,7 @@ function conflictScopedNames(requirements) {
   if (requirements.r2) names.push('R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET');
   if (requirements.ageRecipient) names.push('ENCRYPT_KEY');
   if (requirements.ageIdentity) names.push('DECRYPT_KEY');
-  if (requirements.fragtrackWorkdir) names.push('PROJECT_WORKDIR');
+  if (requirements.projectWorkdir) names.push('PROJECT_WORKDIR');
   return new Set(names);
 }
 
@@ -308,6 +308,9 @@ function collectRequirementProblems({ requirements, resolved }) {
   if (requirements.ageIdentity && !resolved.DECRYPT_KEY) {
     problems.push('MISSING DECRYPT_KEY');
   }
+  if (requirements.projectWorkdir && !resolved.PROJECT_WORKDIR) {
+    problems.push('MISSING PROJECT_WORKDIR');
+  }
   return problems;
 }
 
@@ -328,17 +331,12 @@ function collectCrossFieldProblems({ environment, requirements, resolved }) {
   return problems;
 }
 
-/** Resolve BACKUP_ENVIRONMENT / PROJECT_WORKDIR against the repository root. */
-function resolveFragtrackWorkdir({ resolved, requirements, root }) {
-  if (resolved.PROJECT_WORKDIR) {
-    return path.isAbsolute(resolved.PROJECT_WORKDIR)
-      ? resolved.PROJECT_WORKDIR
-      : path.resolve(root, resolved.PROJECT_WORKDIR);
-  }
-  if (requirements.fragtrackWorkdir) {
-    return path.resolve(root, '..', 'fragtrack');
-  }
-  return undefined;
+/** Resolve PROJECT_WORKDIR against the repository root. */
+function resolveProjectWorkdir({ resolved, root }) {
+  if (!resolved.PROJECT_WORKDIR) return undefined;
+  return path.isAbsolute(resolved.PROJECT_WORKDIR)
+    ? resolved.PROJECT_WORKDIR
+    : path.resolve(root, resolved.PROJECT_WORKDIR);
 }
 
 /** Select the fields this operation is allowed to resolve. */
@@ -359,7 +357,7 @@ function resolveConfigFields({ vars, fileValues, fieldNames }) {
 }
 
 /** Build the stable public config shape from validated fields. */
-function buildOperationConfig({ environment, requirements, resolved, fragtrackWorkdir }) {
+function buildOperationConfig({ environment, requirements, resolved, projectWorkdir }) {
   const config = {
     environment,
     projectRef: resolved.SUPABASE_PROJECT_REF,
@@ -370,7 +368,7 @@ function buildOperationConfig({ environment, requirements, resolved, fragtrackWo
     secretAccessKey: resolved.R2_SECRET_ACCESS_KEY,
     ageRecipient: resolved.ENCRYPT_KEY,
     ageIdentity: resolved.DECRYPT_KEY,
-    fragtrackWorkdir,
+    projectWorkdir,
     r2Endpoint: resolved.CLOUDFLARE_ACCOUNT_ID
       ? `https://${resolved.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`
       : undefined,
@@ -391,7 +389,7 @@ function buildOperationConfig({ environment, requirements, resolved, fragtrackWo
   }
   if (requirements.ageRecipient) scoped.ageRecipient = config.ageRecipient;
   if (requirements.ageIdentity) scoped.ageIdentity = config.ageIdentity;
-  if (requirements.fragtrackWorkdir) scoped.fragtrackWorkdir = fragtrackWorkdir;
+  if (requirements.projectWorkdir) scoped.projectWorkdir = projectWorkdir;
   return scoped;
 }
 
@@ -406,7 +404,7 @@ const BACKUP_REQUIREMENTS = {
 /** Local backup: target metadata + workdir only, never age or the hosted path. */
 const LOCAL_BACKUP_REQUIREMENTS = {
   projectRef: true,
-  fragtrackWorkdir: true,
+  projectWorkdir: true,
   consumedOnly: true,
 };
 
@@ -505,7 +503,7 @@ export function loadOperationConfig({
     environment,
     requirements,
     resolved,
-    fragtrackWorkdir: resolveFragtrackWorkdir({ resolved, requirements, root }),
+    projectWorkdir: resolveProjectWorkdir({ resolved, root }),
   });
 }
 

@@ -199,11 +199,11 @@ export function localDbUrl(dbPort) {
 
 /** Static offline guidance; never echoes addresses or credentials. */
 export const LOCAL_STACK_OFFLINE_MESSAGE =
-  'local stack is not reachable; start the local stack in the Fragtrack workdir (supabase start) and retry';
+  'local stack is not reachable; start the local stack in the workdir (supabase start) and retry';
 
 /** Static guidance for a wrong/missing db container; names only, no paths. */
 export const LOCAL_STACK_CONTAINER_MESSAGE =
-  'local stack container %s not found or not running; start the local stack in the Fragtrack workdir (supabase start), or fix the project_id in the Fragtrack config, and retry';
+  'local stack container %s not found or not running; start the local stack in the workdir (supabase start), or fix the project_id in the project config, and retry';
 
 /** Static guidance for a Postgres major mismatch. */
 export const LOCAL_STACK_VERSION_MESSAGE =

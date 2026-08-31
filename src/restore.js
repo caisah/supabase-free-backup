@@ -192,7 +192,7 @@ export async function listLocalSnapshots({ repoRoot, limits }) {
 }
 
 async function writeIdentityFile(ageIdentity) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fragtrack-identity-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-backup-identity-'));
   try {
     ensurePrivateDir(dir, PRIVATE_DIRECTORY_MODE);
     const identityFile = path.join(dir, 'identity.txt');
@@ -275,7 +275,7 @@ async function selectRestoreSnapshot({
  */
 async function acquireSourceDirectory({ selected, adapter, bucket, cleanupWork, limits }) {
   if (selected.kind !== 'r2') return selected.dir;
-  const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fragtrack-download-'));
+  const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-backup-download-'));
   fs.chmodSync(downloadDir, PRIVATE_DIRECTORY_MODE);
   cleanupWork.push(downloadDir);
   await downloadSnapshot({
@@ -315,7 +315,7 @@ async function createPreparedWorkspace({
   limits,
   cleanupWork,
 }) {
-  const parentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fragtrack-prepared-'));
+  const parentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-backup-prepared-'));
   fs.chmodSync(parentDir, PRIVATE_DIRECTORY_MODE);
   cleanupWork.push(parentDir);
   return unpackAndVerify({

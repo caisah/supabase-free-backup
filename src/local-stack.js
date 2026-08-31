@@ -57,8 +57,8 @@ export function parseWorkdirConfig(configToml) {
 }
 
 /** Resolve PROJECT_WORKDIR and enforce the type/self-reference checks. */
-function resolveWorkdirPath({ fragtrackWorkdir, repoRoot }) {
-  const resolved = path.resolve(fragtrackWorkdir);
+function resolveWorkdirPath({ projectWorkdir, repoRoot }) {
+  const resolved = path.resolve(projectWorkdir);
   let stat;
   try {
     stat = fs.statSync(resolved);
@@ -76,7 +76,7 @@ function resolveWorkdirPath({ fragtrackWorkdir, repoRoot }) {
   const realRepo = fs.realpathSync(repoRoot);
   if (realRoot === realRepo) {
     throw new LocalStackError(
-      'PROJECT_WORKDIR must point at the sibling Fragtrack project, not this repository',
+      'PROJECT_WORKDIR must point at the sibling project, not this repository',
       { stage: 'workdir' },
     );
   }
@@ -84,14 +84,14 @@ function resolveWorkdirPath({ fragtrackWorkdir, repoRoot }) {
 }
 
 /** Load the workdir's supabase/config.toml text and canonical path. */
-function loadWorkdirConfig({ realRoot, fragtrackWorkdir }) {
+function loadWorkdirConfig({ realRoot, projectWorkdir }) {
   const configPath = path.join(realRoot, 'supabase', 'config.toml');
   let configToml;
   try {
     configToml = fs.readFileSync(configPath, 'utf8');
   } catch {
     throw new LocalStackError(
-      `PROJECT_WORKDIR has no supabase/config.toml: ${path.join(fragtrackWorkdir, 'supabase')}`,
+      `PROJECT_WORKDIR has no supabase/config.toml: ${path.join(projectWorkdir, 'supabase')}`,
       { stage: 'workdir' },
     );
   }
@@ -106,18 +106,18 @@ function loadWorkdirConfig({ realRoot, fragtrackWorkdir }) {
 function validateParsedWorkdirConfig({ configToml, configPath, expectedMajorVersion }) {
   const parsed = parseWorkdirConfig(configToml);
   if (!parsed.projectId) {
-    throw new LocalStackError(`Fragtrack config must set project_id: ${configPath}`, {
+    throw new LocalStackError(`The project config must set project_id: ${configPath}`, {
       stage: 'workdir',
     });
   }
   if (parsed.majorVersion !== expectedMajorVersion) {
     throw new LocalStackError(
-      `Fragtrack config must use Postgres major version ${expectedMajorVersion}`,
+      `The project config must use Postgres major version ${expectedMajorVersion}`,
       { stage: 'workdir' },
     );
   }
   if (!parsed.dbPort) {
-    throw new LocalStackError('Fragtrack config must expose a [db] port', { stage: 'workdir' });
+    throw new LocalStackError('The project config must expose a [db] port', { stage: 'workdir' });
   }
   return parsed;
 }
@@ -134,16 +134,16 @@ function buildWorkdirResult({ realRoot, configPath, parsed }) {
 }
 
 /**
- * Validate the Fragtrack workdir: a real directory (not the backup repo
+ * Validate the project workdir: a real directory (not the backup repo
  * itself) containing supabase/config.toml with Postgres major version 17.
  */
 export function validateWorkdir({
-  fragtrackWorkdir,
+  projectWorkdir,
   repoRoot,
   expectedMajorVersion = POSTGRES_MAJOR_VERSION,
 }) {
-  const { realRoot } = resolveWorkdirPath({ fragtrackWorkdir, repoRoot });
-  const { configPath, configToml } = loadWorkdirConfig({ realRoot, fragtrackWorkdir });
+  const { realRoot } = resolveWorkdirPath({ projectWorkdir, repoRoot });
+  const { configPath, configToml } = loadWorkdirConfig({ realRoot, projectWorkdir });
   const parsed = validateParsedWorkdirConfig({ configToml, configPath, expectedMajorVersion });
   return buildWorkdirResult({ realRoot, configPath, parsed });
 }

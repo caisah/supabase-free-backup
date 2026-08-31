@@ -42,7 +42,7 @@ export function assertNodeVersion({ version = process.version } = {}) {
 
   if (isOlder) {
     throw new Error(
-      `Fragtrack backup requires Node.js >= ${REQUIRED_NODE_VERSION}; running ${version}. ` +
+      `db-backup requires Node.js >= ${REQUIRED_NODE_VERSION}; running ${version}. ` +
         `Upgrade Node.js (see .node-version) and re-run.`,
     );
   }

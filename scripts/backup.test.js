@@ -560,7 +560,7 @@ test('backup: plaintext workspace cleanup occurs on every failure', async () => 
   const { deps } = backupDeps({ contentSha256: 'd'.repeat(64), recipient: AGE_RECIPIENT_1 });
   const before = fs
     .readdirSync(os.tmpdir())
-    .filter((n) => n.startsWith(`fragtrack-backup-${process.pid}-`));
+    .filter((n) => n.startsWith(`db-backup-${process.pid}-`));
   await assert.rejects(
     () =>
       runBackup({
@@ -579,7 +579,7 @@ test('backup: plaintext workspace cleanup occurs on every failure', async () => 
   );
   const after = fs
     .readdirSync(os.tmpdir())
-    .filter((n) => n.startsWith(`fragtrack-backup-${process.pid}-`));
+    .filter((n) => n.startsWith(`db-backup-${process.pid}-`));
   assert.deepEqual(after, before, 'workspace must be removed after failure');
 });
 

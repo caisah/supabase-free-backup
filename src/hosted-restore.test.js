@@ -14,7 +14,7 @@ import {
   createRestoreInputStream,
   confirmationSummary,
   HostedRestoreError,
-  FRAGTRACK_TRIGGERS,
+  PROJECT_TRIGGERS,
   HOSTED_RESTORE_SCHEMA_ARTIFACTS,
   parsePsqlMajorVersion,
 } from './hosted-restore.js';
@@ -31,8 +31,8 @@ const ROLES_SQL = [
   'SET statement_timeout = 0;',
   'CREATE ROLE "anon";',
   'ALTER ROLE "anon" WITH NOLOGIN;',
-  'CREATE ROLE "fragtrack_custom";',
-  'ALTER ROLE "fragtrack_custom" WITH LOGIN;',
+  'CREATE ROLE "app_custom";',
+  'ALTER ROLE "app_custom" WITH LOGIN;',
   'GRANT USAGE ON SCHEMA "public" TO "anon";',
 ].join('\n');
 
@@ -255,11 +255,11 @@ test('hosted: duplicate roles are commented narrowly, others untouched', () => {
     'ALTER preserved',
   );
   assert.ok(
-    lines.some((l) => !l.startsWith('--') && l.includes('CREATE ROLE "fragtrack_custom"')),
+    lines.some((l) => !l.startsWith('--') && l.includes('CREATE ROLE "app_custom"')),
     'new role kept active',
   );
   assert.ok(
-    lines.some((l) => l.includes('ALTER ROLE "fragtrack_custom" WITH LOGIN')),
+    lines.some((l) => l.includes('ALTER ROLE "app_custom" WITH LOGIN')),
     'its ALTER preserved',
   );
   assert.ok(
@@ -608,8 +608,7 @@ test('hosted: executeHostedRestore restores in one Dockerized transaction stream
     const cIdx = opts.args.indexOf('-c');
     const query = cIdx !== -1 ? opts.args[cIdx + 1] : null;
     if (query === 'SELECT 1') return { stdout: '1\n' };
-    if (query?.startsWith('SELECT rolname'))
-      return { stdout: 'postgres\nanon\nfragtrack_custom\n' };
+    if (query?.startsWith('SELECT rolname')) return { stdout: 'postgres\nanon\napp_custom\n' };
     if (query?.includes('pg_namespace')) return { stdout: '1\n' };
     if (query?.includes('pg_trigger'))
       return { stdout: 'create_account_for_new_user\ncleanup_deleted_user_vouches\n' };
@@ -682,8 +681,8 @@ test('hosted: executeHostedRestore restores in one Dockerized transaction stream
   const lines = rolesPrepared.split('\n');
   const anonCreate = lines.findIndex((l) => l.includes('CREATE ROLE "anon"'));
   assert.ok(lines[anonCreate - 1].startsWith('-- '), 'existing canonical CREATE ROLE commented');
-  assert.ok(lines.find((l) => l.includes('CREATE ROLE "fragtrack_custom"')));
-  assert.ok(lines.find((l) => l.includes('ALTER ROLE "fragtrack_custom" WITH LOGIN')));
+  assert.ok(lines.find((l) => l.includes('CREATE ROLE "app_custom"')));
+  assert.ok(lines.find((l) => l.includes('ALTER ROLE "app_custom" WITH LOGIN')));
   assert.ok(lines.find((l) => l.includes('GRANT USAGE')));
   for (const name of ['roles.prepared.sql', 'cleanup.sql']) {
     assert.equal(
@@ -812,7 +811,7 @@ test('hosted: rolesSkipped counts only roles that were actually prepared away', 
     const query = cIdx !== -1 ? opts.args[cIdx + 1] : null;
     if (query === 'SELECT 1') return { stdout: '1\n' };
     if (query?.startsWith('SELECT rolname')) {
-      // Only 'anon' already exists; fragtrack_custom does not yet exist.
+      // Only 'anon' already exists; app_custom does not yet exist.
       return { stdout: 'postgres\nanon\n' };
     }
     if (query?.includes('pg_namespace')) return { stdout: '1\n' };
@@ -1061,8 +1060,8 @@ test('hosted: local-source summary surfaces the snapshot origin and a cross-proj
   assert.ok(!none.includes('Source project ref'), 'non-local sources have no source ref line');
 });
 
-test('hosted: trigger names default to the Fragtrack triggers', () => {
-  assert.deepEqual(FRAGTRACK_TRIGGERS, [
+test('hosted: trigger names default to the project triggers', () => {
+  assert.deepEqual(PROJECT_TRIGGERS, [
     'create_account_for_new_user',
     'cleanup_deleted_user_vouches',
   ]);

@@ -1,6 +1,6 @@
 name: Backup
 
-# Daily logical backups for both Fragtrack databases at 03:17 UTC; the Sunday
+# Daily logical backups for both project databases at 03:17 UTC; the Sunday
 # expression additionally triggers the weekly staged-snapshot commit. Repository
 # must stay private; scheduled workflows require master to be the default
 # branch.

@@ -46,7 +46,7 @@ const ID_OLDEST_2 = '2026-08-21T03-17-09Z';
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function validateFsArgs(opts) {
-  return { dockerPath: '/bin/docker', dbContainer: 'supabase_db_fragtrack', run: opts.run };
+  return { dockerPath: '/bin/docker', dbContainer: 'supabase_db_project', run: opts.run };
 }
 
 function createdAt(id) {
@@ -324,9 +324,9 @@ test('local-backup: assertLocalStackRunning is read-only and requires live conta
   const inspect = calls[0];
   assert.equal(inspect.args[0], 'inspect');
   assert.ok(inspect.args.includes('{{.State.Running}}'));
-  assert.ok(inspect.args.includes('supabase_db_fragtrack'));
+  assert.ok(inspect.args.includes('supabase_db_project'));
   const version = calls[2];
-  assert.deepEqual(version.args.slice(0, 3), ['exec', 'supabase_db_fragtrack', 'psql']);
+  assert.deepEqual(version.args.slice(0, 3), ['exec', 'supabase_db_project', 'psql']);
   assert.ok(version.args.at(-1).includes('server_version_num'));
 
   // Offline stack: connection failure surfaces a static LocalBackupError.
@@ -334,7 +334,7 @@ test('local-backup: assertLocalStackRunning is read-only and requires live conta
     () =>
       assertLocalStackRunning({
         dockerPath: '/bin/docker',
-        dbContainer: 'supabase_db_fragtrack',
+        dbContainer: 'supabase_db_project',
         run: async () => {
           throw new Error('container not running');
         },
@@ -351,7 +351,7 @@ test('local-backup: assertLocalStackRunning is read-only and requires live conta
     () =>
       assertLocalStackRunning({
         dockerPath: '/bin/docker',
-        dbContainer: 'supabase_db_fragtrack',
+        dbContainer: 'supabase_db_project',
         run: async () => ({ stdout: '0\n' }),
       }),
     (err) => err instanceof LocalBackupError && /start the local stack/.test(err.message),
@@ -385,7 +385,7 @@ test('local-backup: assertLocalStackRunning rejects a running server whose major
     () =>
       assertLocalStackRunning({
         dockerPath: '/bin/docker',
-        dbContainer: 'supabase_db_fragtrack',
+        dbContainer: 'supabase_db_project',
         run: async (opts) => {
           const joined = opts.args.join(' ');
           if (joined.includes('inspect')) return { stdout: 'true\n' };
@@ -429,7 +429,7 @@ test('local-backup: database state token covers mutations, relations, sequences,
     '00000000000000000000000000000000|0123456789abcdef0123456789abcdef|11111111111111111111111111111111|22222222222222222222222222222222';
   const result = await readLocalDatabaseState({
     dockerPath: '/bin/docker',
-    dbContainer: 'supabase_db_fragtrack',
+    dbContainer: 'supabase_db_project',
     run: async (opts) => {
       calls.push(opts);
       return { stdout: `${state}\n` };
@@ -447,7 +447,7 @@ test('local-backup: database state token covers mutations, relations, sequences,
     () =>
       readLocalDatabaseState({
         dockerPath: '/bin/docker',
-        dbContainer: 'supabase_db_fragtrack',
+        dbContainer: 'supabase_db_project',
         run: async () => ({ stdout: 'malformed-state\n' }),
       }),
     (err) => err instanceof LocalBackupError && err.stage === 'consistency',

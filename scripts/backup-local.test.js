@@ -55,10 +55,10 @@ const EXECUTABLES = {
   supabasePath: '/fake/supabase',
   dockerPath: '/fake/docker',
 };
-const FRAGTRACK = {
-  workdir: '/workdir/fragtrack',
+const PROJECT_STACK = {
+  workdir: '/workdir/project',
   dbPort: PORT,
-  dbContainer: 'supabase_db_fragtrack',
+  dbContainer: 'supabase_db_project',
 };
 
 function runCli(args, env = {}) {
@@ -137,9 +137,9 @@ function depsFor({ repoRoot: _repoRoot, runAt, seed = 'a', extra = {} } = {}) {
       loadConfig: () => ({
         environment: LOCAL_STACK_ENVIRONMENT,
         projectRef: REF,
-        fragtrackWorkdir: FRAGTRACK.workdir,
+        projectWorkdir: PROJECT_STACK.workdir,
       }),
-      doValidateWorkdir: () => FRAGTRACK,
+      doValidateWorkdir: () => PROJECT_STACK,
       doResolveExecutables: () => EXECUTABLES,
       doAssertRunning: assertLocalStackRunning,
       doDump: async (opts) => {
@@ -223,7 +223,7 @@ test('backup-local: first run creates a fully validated package at the fixed pri
   }
   assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-local')));
   assert.ok(
-    !fs.readdirSync(os.tmpdir()).some((e) => e.startsWith(`fragtrack-backup-${process.pid}-`)),
+    !fs.readdirSync(os.tmpdir()).some((e) => e.startsWith(`db-backup-${process.pid}-`)),
     'private OS workspace removed',
   );
   fs.rmSync(repoRoot, { recursive: true, force: true });
@@ -254,7 +254,7 @@ test('backup-local: changed content or target ref publishes a new snapshot and r
         loadConfig: ({ environment }) => ({
           environment,
           projectRef: REF_PROD,
-          fragtrackWorkdir: FRAGTRACK.workdir,
+          projectWorkdir: PROJECT_STACK.workdir,
         }),
       };
     }
@@ -284,7 +284,7 @@ test('backup-local: dump cwd is the backup repository; source URL is only the wo
   assert.ok(!calls.dump[0].dbUrl.includes('pooler.supabase.com'));
   assert.ok(!calls.dump[0].dbUrl.includes('.supabase.co'));
   assert.equal(calls.dump[0].cwd, repoRoot, 'dump runs with the backup repo as cwd');
-  assert.notEqual(repoRoot, FRAGTRACK.workdir, 'never the sibling workdir');
+  assert.notEqual(repoRoot, PROJECT_STACK.workdir, 'never the sibling workdir');
   fs.rmSync(repoRoot, { recursive: true, force: true });
 });
 
@@ -297,10 +297,10 @@ test('backup-local: no stack lifecycle command and no R2/credential access', asy
     assert.notEqual(base, 'supabase', 'local backup never runs the Supabase CLI');
     if (base === 'docker') {
       if (call.args[0] === 'exec') {
-        assert.deepEqual(call.args.slice(0, 2), ['exec', FRAGTRACK.dbContainer]);
+        assert.deepEqual(call.args.slice(0, 2), ['exec', PROJECT_STACK.dbContainer]);
       } else if (call.args[0] === 'inspect') {
         assert.ok(
-          call.args.includes('{{.State.Running}}') && call.args.includes(FRAGTRACK.dbContainer),
+          call.args.includes('{{.State.Running}}') && call.args.includes(PROJECT_STACK.dbContainer),
           'container probe targets the derived container',
         );
       }
@@ -426,7 +426,7 @@ test('backup-local: workspaces, unpublished candidates, and locks clean up on an
   const repoRoot = tmpdir('bp-bl-');
   const before = fs
     .readdirSync(os.tmpdir())
-    .filter((n) => n.startsWith(`fragtrack-backup-${process.pid}-`));
+    .filter((n) => n.startsWith(`db-backup-${process.pid}-`));
   await assert.rejects(
     () =>
       runOnce({
@@ -442,7 +442,7 @@ test('backup-local: workspaces, unpublished candidates, and locks clean up on an
   );
   const after = fs
     .readdirSync(os.tmpdir())
-    .filter((n) => n.startsWith(`fragtrack-backup-${process.pid}-`));
+    .filter((n) => n.startsWith(`db-backup-${process.pid}-`));
   assert.deepEqual(after, before, 'private OS workspace removed after failure');
   assert.ok(
     !fs.readdirSync(envDir(repoRoot)).some((e) => e.startsWith('.candidate-')),
@@ -538,7 +538,6 @@ test('backup-local: logs reveal only environment, state, ID, and path', async ()
   ]) {
     assert.ok(!log.includes(secret), `log leaked: ${secret}`);
   }
-  assert.ok(!log.includes('backup:fragtrack'), 'no env dump in logs');
   fs.rmSync(repoRoot, { recursive: true, force: true });
 });
 

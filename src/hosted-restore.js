@@ -30,7 +30,7 @@ export class HostedRestoreError extends Error {
   }
 }
 
-export const FRAGTRACK_TRIGGERS = ['create_account_for_new_user', 'cleanup_deleted_user_vouches'];
+export const PROJECT_TRIGGERS = ['create_account_for_new_user', 'cleanup_deleted_user_vouches'];
 export const CREATE_ROLE_LINE = /^\s*CREATE ROLE "((?:[^"]|"")+)"\s*;\s*$/;
 
 /**
@@ -53,7 +53,7 @@ export const HOSTED_RESTORE_SCHEMA_ARTIFACTS = Object.freeze([
 function prepareRolesFileWithCount({
   rolesSql,
   existingRoles = [],
-  marker = '-- already exists on target; skipped by fragtrack restore',
+  marker = '-- already exists on target; skipped by db-backup restore',
 }) {
   const existing = new Set(existingRoles);
   const lines = rolesSql.split(/\r?\n/);
@@ -492,7 +492,7 @@ export async function executeHostedRestore({
   run,
   logger,
   signal,
-  triggerNames = FRAGTRACK_TRIGGERS,
+  triggerNames = PROJECT_TRIGGERS,
   writeFile = fs.writeFileSync,
 }) {
   const { dbUrl } = config;

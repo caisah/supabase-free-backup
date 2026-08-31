@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Local backup entry point: package the ALREADY-RUNNING local Fragtrack
+ * Local backup entry point: package the ALREADY-RUNNING local project
  * database into the private repository store.
  *
  *   vp run backup:local
@@ -99,7 +99,7 @@ export async function runBackupLocal({
 } = {}) {
   const d = resolveLocalBackupDeps(deps);
   const cfg = d.loadConfig({ environment: LOCAL_STACK_ENVIRONMENT, vars: env, root: repoRoot });
-  const fragtrack = d.doValidateWorkdir({ fragtrackWorkdir: cfg.fragtrackWorkdir, repoRoot });
+  const stack = d.doValidateWorkdir({ projectWorkdir: cfg.projectWorkdir, repoRoot });
   const executables = d.doResolveExecutables({
     lookup: d.lookup,
     locateCli: d.locateCli,
@@ -107,11 +107,11 @@ export async function runBackupLocal({
     platform: process.platform,
     requireAge: false,
   });
-  const localUrl = localDbUrl(fragtrack.dbPort);
+  const localUrl = localDbUrl(stack.dbPort);
   logger.addSecret(localUrl);
   await d.doAssertRunning({
     dockerPath: executables.dockerPath,
-    dbContainer: fragtrack.dbContainer,
+    dbContainer: stack.dbContainer,
     run: d.run,
   });
 
@@ -134,7 +134,7 @@ export async function runBackupLocal({
 
     const stateProbe = {
       dockerPath: executables.dockerPath,
-      dbContainer: fragtrack.dbContainer,
+      dbContainer: stack.dbContainer,
       run: d.run,
     };
     const beforeState = await d.readSourceState(stateProbe);
@@ -147,7 +147,7 @@ export async function runBackupLocal({
 
     const packaged = await dumpAndPackageSnapshot({
       dbUrl: localUrl, // never cfg.dbUrl: the local stack is the only source
-      cwd: repoRoot, // never cfg.fragtrackWorkdir: dump uses the backup repo
+      cwd: repoRoot, // never cfg.projectWorkdir: dump uses the backup repo
       outDir: workspace.outDir,
       pkgDir: candidate.pkgDir,
       snapshotId,

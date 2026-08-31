@@ -1,8 +1,8 @@
 {
-  "name": "fragtrack-db-backup",
+  "name": "db-backup",
   "version": "0.1.0",
   "private": true,
-  "description": "Encrypted logical backups and restores for the Fragtrack Supabase databases",
+  "description": "Encrypted logical backups and restores for the project's Supabase databases",
   "type": "module",
   "scripts": {
     "lint": "vp lint",

@@ -3,7 +3,7 @@
  *
  * Starts a DISPOSABLE local Supabase stack (Postgres 17) in an isolated
  * fixture workdir, seeds a small public schema, rows, migration history, Auth
- * users, and the custom Fragtrack `auth.users` triggers, then dumps through
+ * users, and the custom project `auth.users` triggers, then dumps through
  * the adapter, packages through sub-plan 02, and verifies the packaged output
  * contains no plaintext row data.
  *
@@ -27,7 +27,7 @@ import {
 import { AGE_RECIPIENT_1, AGE_IDENTITY_1, writePrivateFile, tmpdir } from './test-fixtures.js';
 
 const FIXTURE_CONFIG = `
-project_id = "fragtrack-backup-test"
+project_id = "db-backup-test"
 
 [api]
 enabled = false
@@ -107,7 +107,7 @@ const cliAvailable = fs.existsSync(path.join(repoRoot, 'node_modules', '.bin', '
 
 async function psql(fixtureDir, sql) {
   // Feed SQL through psql inside the fixture database container.
-  const dbContainer = 'supabase_db_fragtrack-backup-test';
+  const dbContainer = 'supabase_db_db-backup-test';
   const { spawn } = await import('node:child_process');
   const args = [
     'exec',
@@ -164,7 +164,7 @@ test(
       const dockerPath = lookupExecutable('docker');
       const stateProbe = {
         dockerPath,
-        dbContainer: 'supabase_db_fragtrack-backup-test',
+        dbContainer: 'supabase_db_db-backup-test',
         run: runCommand,
       };
       // The disposable fixture needs Auth's bootstrap migrations, but its
@@ -172,7 +172,7 @@ test(
       // that fixture service so the dump-stability assertion is deterministic.
       await runCommand({
         command: dockerPath,
-        args: ['stop', 'supabase_auth_fragtrack-backup-test'],
+        args: ['stop', 'supabase_auth_db-backup-test'],
         stdout: 'collect',
         stderr: 'collect',
       });
@@ -212,7 +212,7 @@ test(
       assert.ok(data.includes('secret-fixture-user@example.com'), 'Auth user row present');
       assert.ok(!data.includes('buckets_vectors'), 'vector tables excluded');
 
-      // 5. The managed auth/storage delta captures BOTH Fragtrack triggers.
+      // 5. The managed auth/storage delta captures BOTH project triggers.
       const managed = read('managed');
       assert.ok(managed.includes('create_account_for_new_user'), 'trigger 1 in managed delta');
       assert.ok(managed.includes('cleanup_deleted_user_vouches'), 'trigger 2 in managed delta');
