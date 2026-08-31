@@ -1,8 +1,9 @@
 import { readFileSync } from 'node:fs';
 
 /**
- * Canonical runtime pin. The repository runs only on the exact Node.js
- * release recorded in `.node-version`; any other release is rejected.
+ * Canonical runtime pin. The repository requires at least the Node.js
+ * release recorded in `.node-version`; newer releases are accepted for
+ * backwards compatibility.
  * `.node-version` is the single source of truth: CI reads it directly
  * (`node-version-file`) and `package.json` `engines.node` only mirrors it —
  * `runtime.test.js` fails if any mirror drifts.
@@ -18,14 +19,31 @@ export function currentNodeVersion() {
 }
 
 /**
- * Fail unless the running Node.js release is exactly the pinned one.
- * Never silently run on an older or unreviewed later release.
+ * Parse a semver string (e.g. 'v24.20.0') into [major, minor, patch].
+ */
+function parseVersion(version) {
+  const match = version.match(/^v?(\d+)\.(\d+)\.(\d+)$/);
+  if (!match) throw new Error(`Invalid version format: ${version}`);
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+/**
+ * Fail unless the running Node.js release is at least the pinned one.
+ * Accepts the pinned version and any newer release.
  */
 export function assertNodeVersion({ version = process.version } = {}) {
-  if (version !== REQUIRED_NODE_VERSION_LABEL) {
+  const [reqMajor, reqMinor, reqPatch] = parseVersion(REQUIRED_NODE_VERSION_LABEL);
+  const [curMajor, curMinor, curPatch] = parseVersion(version);
+
+  const isOlder =
+    curMajor < reqMajor ||
+    (curMajor === reqMajor && curMinor < reqMinor) ||
+    (curMajor === reqMajor && curMinor === reqMinor && curPatch < reqPatch);
+
+  if (isOlder) {
     throw new Error(
-      `Fragtrack backup requires Node.js ${REQUIRED_NODE_VERSION} exactly; running ${version}. ` +
-        `Install the pinned release (see .node-version) and re-run.`,
+      `Fragtrack backup requires Node.js >= ${REQUIRED_NODE_VERSION}; running ${version}. ` +
+        `Upgrade Node.js (see .node-version) and re-run.`,
     );
   }
   return version;

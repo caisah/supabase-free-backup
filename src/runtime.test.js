@@ -31,19 +31,33 @@ test('runtime preflight: exact pinned version passes', () => {
 });
 
 test('runtime preflight: older version is rejected', () => {
-  // Different older major, mirroring the pre-pin-change boundary coverage.
+  // Older major version must be rejected.
   assert.throws(() => assertNodeVersion({ version: olderMajorVersion }), pinnedVersionPattern);
 });
 
-test('runtime preflight: unreviewed later release is rejected', () => {
-  assert.throws(() => assertNodeVersion({ version: laterPatchVersion }), pinnedVersionPattern);
+test('runtime preflight: same major/minor with older patch is rejected', () => {
+  // Skip if pinned patch is 0 (can't create a valid older patch version)
+  if (pinnedPatch === 0) return;
+  const olderPatchVersion = `v${pinnedMajor}.${pinnedMinor}.${pinnedPatch - 1}`;
+  assert.throws(() => assertNodeVersion({ version: olderPatchVersion }), pinnedVersionPattern);
+});
+
+test('runtime preflight: later patch version is accepted', () => {
+  assert.equal(assertNodeVersion({ version: laterPatchVersion }), laterPatchVersion);
+});
+
+test('runtime preflight: later major version is accepted', () => {
+  assert.equal(assertNodeVersion({ version: laterMajorVersion }), laterMajorVersion);
 });
 
 test('runtime preflight: error names both the required and the current version', () => {
-  assert.throws(() => assertNodeVersion({ version: laterMajorVersion }), pinnedVersionPattern);
   assert.throws(
-    () => assertNodeVersion({ version: laterMajorVersion }),
-    new RegExp(laterMajorVersion.replaceAll('.', '\\.')),
+    () => assertNodeVersion({ version: olderMajorVersion }),
+    new RegExp(`>= ${REQUIRED_NODE_VERSION.replace('.', '\.')}`),
+  );
+  assert.throws(
+    () => assertNodeVersion({ version: olderMajorVersion }),
+    new RegExp(olderMajorVersion.replaceAll('.', '\.')),
   );
 });
 
