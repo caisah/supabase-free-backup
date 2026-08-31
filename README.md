@@ -102,8 +102,6 @@ Git repository (backups/<environment>/):
                                                   # no snapshots/ level
 ```
 
-
-
 ## Configuration
 
 Ignored local files (never commit):
