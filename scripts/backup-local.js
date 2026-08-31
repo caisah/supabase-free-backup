@@ -1,18 +1,21 @@
 #!/usr/bin/env node
 /**
- * Local backup entry point: package the ALREADY-RUNNING local Supabase
- * project database into the private repository store.
+ * Local backup entry point: package the ALREADY-RUNNING local Fragtrack
+ * database into the private repository store.
  *
  *   vp run backup:local --environment <development|production>
  *
- * Flow: config (target metadata + recipient + workdir only, no hosted
- * DB/R2/identity) -> validated local workdir -> read-only connectivity/state
- * guard -> shared dump/package pipeline -> full package validation -> compare with
- * the newest validated local snapshot -> unchanged: retain the prior ID;
+ * Flow: config (target metadata + workdir only, no hosted DB/R2/identity,
+ * no ENCRYPT_KEY/recipient) -> validated local workdir -> read-only
+ * connectivity/state guard -> shared dump/package pipeline with the
+ * PLAINTEXT row-data codec -> full package validation -> compare with the
+ * newest validated local snapshot -> unchanged: retain the prior ID;
  * changed: atomically publish the candidate, then remove older snapshots.
  *
- * The local stack is never started, stopped, reset, or migrated, and no R2
- * adapter, bucket, upload, or hosted DB connection exists in this path.
+ * Row data is gzip-compressed into plaintext `data.sql.gz.part-NNN` parts:
+ * no age binary, no encryption, no ENCRYPT_KEY on this path. The local
+ * stack is never started, stopped, reset, or migrated, and no R2 adapter,
+ * bucket, upload, or hosted DB connection exists in this path.
  */
 
 import fs from 'node:fs';
@@ -29,13 +32,12 @@ import {
   dumpAndPackageSnapshot,
 } from '../src/backup.js';
 import { packageSnapshot, validatePackagedDirectory } from '../src/snapshot.js';
-import { localDbUrl, validateWorkdir } from '../src/local-project.js';
+import { PLAINTEXT_FORMAT } from '../src/encryption.js';
+import { localDbUrl, validateWorkdir } from '../src/local-restore.js';
 import {
   assertLocalStackRunning,
-  assertLocalDbPortPublished,
   readLocalDatabaseState,
   assertLocalDatabaseStateUnchanged,
-  acquireLocalDatabaseBarrier,
   openLocalBackupStore,
   scanLocalBackupSnapshots,
   createLocalBackupCandidate,
@@ -51,10 +53,7 @@ function resolveLocalBackupDeps(deps) {
     doValidateWorkdir: deps.doValidateWorkdir ?? validateWorkdir,
     doResolveExecutables: deps.doResolveExecutables ?? resolveBackupExecutables,
     doAssertRunning: deps.doAssertRunning ?? assertLocalStackRunning,
-    doAssertPortPublished: deps.doAssertPortPublished ?? assertLocalDbPortPublished,
     readSourceState: deps.readSourceState ?? readLocalDatabaseState,
-    doAcquireBarrier: deps.doAcquireBarrier ?? acquireLocalDatabaseBarrier,
-    doReleaseBarrier: deps.doReleaseBarrier ?? ((barrier) => barrier.release()),
     doDump: deps.doDump ?? dumpDatabase,
     doPackage: deps.doPackage ?? packageSnapshot,
     doValidate: deps.doValidate ?? validatePackagedDirectory,
@@ -88,27 +87,19 @@ export async function runBackupLocal({
 } = {}) {
   const d = resolveLocalBackupDeps(deps);
   const cfg = d.loadConfig({ environment: options.environment, vars: env, root: repoRoot });
-  const project = d.doValidateWorkdir({ projectWorkdir: cfg.projectWorkdir, repoRoot });
+  const fragtrack = d.doValidateWorkdir({ fragtrackWorkdir: cfg.fragtrackWorkdir, repoRoot });
   const executables = d.doResolveExecutables({
     lookup: d.lookup,
     locateCli: d.locateCli,
     root: repoRoot,
     platform: process.platform,
+    requireAge: false,
   });
-  const localUrl = localDbUrl(project.dbPort);
+  const localUrl = localDbUrl(fragtrack.dbPort);
   logger.addSecret(localUrl);
   await d.doAssertRunning({
     dockerPath: executables.dockerPath,
-    dbContainer: project.dbContainer,
-    run: d.run,
-  });
-  // Source identity: the probes run INSIDE the derived container while the
-  // dumps go through the host port, so require the container to publish
-  // exactly the config.toml port before reading either route.
-  await d.doAssertPortPublished({
-    dockerPath: executables.dockerPath,
-    dbContainer: project.dbContainer,
-    dbPort: project.dbPort,
+    dbContainer: fragtrack.dbContainer,
     run: d.run,
   });
 
@@ -128,28 +119,11 @@ export async function runBackupLocal({
 
     const stateProbe = {
       dockerPath: executables.dockerPath,
-      dbContainer: project.dbContainer,
+      dbContainer: fragtrack.dbContainer,
       run: d.run,
     };
-    // Write barrier: SHARE-lock every user table for the whole dump window so
-    // no row write can commit between the six dumps; the state token below is
-    // the backstop for sequence/catalog/role drift. The barrier is released
-    // before packaging, so encryption of multi-gigabyte dumps never holds
-    // database locks.
-    const dumpWindow = async (dump) => {
-      const barrier = await d.doAcquireBarrier({
-        dockerPath: executables.dockerPath,
-        dbContainer: project.dbContainer,
-        run: d.run,
-      });
-      try {
-        return await dump();
-      } finally {
-        await d.doReleaseBarrier(barrier);
-      }
-    };
+    const beforeState = await d.readSourceState(stateProbe);
     const guardedDump = async (dumpOptions) => {
-      const beforeState = await d.readSourceState(stateProbe);
       const dumped = await d.doDump(dumpOptions);
       const afterState = await d.readSourceState(stateProbe);
       assertLocalDatabaseStateUnchanged(beforeState, afterState);
@@ -158,15 +132,15 @@ export async function runBackupLocal({
 
     const packaged = await dumpAndPackageSnapshot({
       dbUrl: localUrl, // never cfg.dbUrl: the local stack is the only source
-      cwd: repoRoot, // never cfg.projectWorkdir: dump uses the backup repo
+      cwd: repoRoot, // never cfg.fragtrackWorkdir: dump uses the backup repo
       outDir: workspace.outDir,
       pkgDir: candidate.pkgDir,
       snapshotId,
       environment: cfg.environment,
       sourceProjectRef: cfg.projectRef,
-      ageRecipient: cfg.ageRecipient,
+      format: PLAINTEXT_FORMAT, // plaintext parts; no age binary, no ENCRYPT_KEY
       executables,
-      doDump: (dumpOptions) => dumpWindow(() => guardedDump(dumpOptions)),
+      doDump: guardedDump,
       doPackage: d.doPackage,
       run: d.run,
     });

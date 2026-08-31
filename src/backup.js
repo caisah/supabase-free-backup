@@ -4,27 +4,30 @@
  * Consumed by both `scripts/backup.js` (hosted R2 pipeline) and
  * `scripts/backup-local.js` (private local store): executable preflight,
  * the private OS workspace, and the dump-then-package orchestration.
- * Nothing in this module may import `src/r2.js`; the local backup path must
- * never gain a remote-storage dependency or credential seam.
+ * Row-data storage is a codec choice (age-encrypted | plaintext), not an
+ * unconditional age step: `requireAge: false` skips the age lookup entirely
+ * and `format` selects the packaging codec. Nothing in this module may
+ * import `src/r2.js`; the local backup path must never gain a remote-
+ * storage dependency or credential seam.
  */
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PINNED_SUPABASE_CLI_VERSION } from './database.js';
+import { ENCRYPTION_FORMAT } from './encryption.js';
 
 /**
- * Private OS workspace prefix; shared with tests for before/after leak scans
- * and the source of truth for every CANONICAL temp prefix: the restore
- * workspace prefixes are derived from this constant, so the on-disk
- * convention cannot drift between workflows.
+ * Resolve age (only when required), the pinned Supabase CLI, and Docker;
+ * any required miss aborts preflight. With `requireAge: false` age is
+ * neither looked up nor required.
  */
-export const BACKUP_WORKSPACE_PREFIX = 'supabase-db-backup-';
-
-/** Resolve age, pinned Supabase CLI, and Docker executables; any miss aborts preflight. */
-export function resolveBackupExecutables({ lookup, locateCli, root, platform }) {
-  const ageBin = lookup(platform === 'win32' ? 'age.exe' : 'age');
-  if (!ageBin) throw new Error('age executable not found on PATH; install it and retry');
+export function resolveBackupExecutables({ lookup, locateCli, root, platform, requireAge = true }) {
+  let ageBin;
+  if (requireAge) {
+    ageBin = lookup(platform === 'win32' ? 'age.exe' : 'age');
+    if (!ageBin) throw new Error('age executable not found on PATH; install it and retry');
+  }
   const supabasePath = locateCli({ root });
   if (!supabasePath) throw new Error('Supabase CLI not found; run vp install first');
   const dockerPath = lookup(platform === 'win32' ? 'docker.exe' : 'docker');
@@ -39,7 +42,7 @@ export function resolveBackupExecutables({ lookup, locateCli, root, platform }) 
  * never see another process's directories.
  */
 export function createBackupWorkspace(token = process.pid) {
-  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), `${BACKUP_WORKSPACE_PREFIX}${token}-`));
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), `fragtrack-backup-${token}-`));
   fs.chmodSync(workspace, 0o700);
   const outDir = path.join(workspace, 'dumps');
   // NOT pre-created: packageSnapshot (and unpackAndVerify) own destination
@@ -53,7 +56,7 @@ export function createBackupWorkspace(token = process.pid) {
 /**
  * Dump and package the snapshot; validated before ANY deletion. `dbUrl` is
  * the ONLY source input; `cwd` is the working directory for the dump
- * commands (the backup repository for local runs, never the project
+ * commands (the backup repository for local runs, never the Fragtrack
  * workdir). `pkgDir` is caller-owned: the remote pipeline uses the OS
  * workspace, the local pipeline a candidate on the destination filesystem
  * for the same-filesystem atomic rename.
@@ -73,6 +76,7 @@ export async function dumpAndPackageSnapshot({
   run,
   signal,
   onProgress,
+  format = ENCRYPTION_FORMAT,
 }) {
   onProgress?.('starting logical database dump');
   await doDump({
@@ -94,6 +98,7 @@ export async function dumpAndPackageSnapshot({
     environment,
     sourceProjectRef,
     supabaseCliVersion: PINNED_SUPABASE_CLI_VERSION,
+    format,
     ageRecipient,
     agePath: executables.ageBin,
     run,

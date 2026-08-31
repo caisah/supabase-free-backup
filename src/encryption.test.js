@@ -5,6 +5,8 @@ import path from 'node:path';
 import {
   PART_SIZE,
   ENCRYPTION_FORMAT,
+  PLAINTEXT_FORMAT,
+  DEFAULT_FORMAT,
   gzipFile,
   gunzipFile,
   encryptFile,
@@ -13,6 +15,10 @@ import {
   reassembleParts,
   partName,
   partIndex,
+  partNameFor,
+  partIndexFor,
+  ROW_DATA_CODECS,
+  rowDataCodec,
 } from './encryption.js';
 import {
   tmpdir,
@@ -35,6 +41,8 @@ function identityFile(dir, name = 'identity.txt', identity = AGE_IDENTITY_1) {
 
 test('encryption: format constant and part naming', () => {
   assert.equal(ENCRYPTION_FORMAT, 'age-x25519');
+  assert.equal(PLAINTEXT_FORMAT, 'none');
+  assert.equal(DEFAULT_FORMAT, ENCRYPTION_FORMAT, 'the single shared default is age-x25519');
   assert.equal(PART_SIZE, 90 * 1024 * 1024);
   assert.equal(partName(0), 'data.sql.gz.age.part-000');
   assert.equal(partName(99), 'data.sql.gz.age.part-099');
@@ -43,6 +51,47 @@ test('encryption: format constant and part naming', () => {
   assert.equal(partIndex('data.sql.gz.age.part-xyz'), null);
   assert.equal(partIndex('data.sql.gz.age.part-'), null);
   assert.equal(partIndex('other.sql'), null);
+});
+
+test('encryption: format-aware part helpers share one canonical matcher per codec', () => {
+  assert.equal(partIndexFor(ENCRYPTION_FORMAT, 'data.sql.gz.age.part-042'), 42);
+  assert.equal(partIndexFor(PLAINTEXT_FORMAT, 'data.sql.gz.part-007'), 7);
+  assert.equal(
+    partIndexFor(PLAINTEXT_FORMAT, 'data.sql.gz.age.part-007'),
+    null,
+    'cross-format names never parse',
+  );
+  assert.equal(partIndexFor(PLAINTEXT_FORMAT, 'data.sql.gz.part-xyz'), null);
+  assert.equal(partIndexFor(ENCRYPTION_FORMAT, null), null);
+  assert.equal(partNameFor(PLAINTEXT_FORMAT, 7), 'data.sql.gz.part-007');
+  assert.equal(partNameFor(ENCRYPTION_FORMAT, 42), 'data.sql.gz.age.part-042');
+  // The age-only compatibility helpers delegate to the same codecs.
+  assert.equal(partName(7), 'data.sql.gz.age.part-007');
+  assert.equal(partIndex('data.sql.gz.age.part-042'), 42);
+  // Every stored pattern is generated from the same prefixes.
+  for (const format of [ENCRYPTION_FORMAT, PLAINTEXT_FORMAT]) {
+    const codec = rowDataCodec(format);
+    assert.equal(partNameFor(format, 3), `${codec.partPrefix}003`);
+    assert.ok(codec.partRe.test(partNameFor(format, 3)));
+  }
+});
+
+test('encryption: codec registry and per-codec policy are deeply frozen', () => {
+  assert.ok(Object.isFrozen(ROW_DATA_CODECS));
+  for (const format of [ENCRYPTION_FORMAT, PLAINTEXT_FORMAT]) {
+    const codec = rowDataCodec(format);
+    assert.ok(Object.isFrozen(codec), `${format} codec must be frozen`);
+    assert.throws(() => {
+      codec.encrypted = !codec.encrypted;
+    }, TypeError);
+    assert.throws(() => {
+      codec.partRe = /x/;
+    }, TypeError);
+    assert.throws(() => {
+      codec.partPrefix = 'x';
+    }, TypeError);
+  }
+  assert.throws(() => rowDataCodec('aes-gcm'), /unknown row-data format: aes-gcm/);
 });
 
 test('encryption: gzip/gunzip round trip preserves bytes', async () => {
@@ -55,8 +104,46 @@ test('encryption: gzip/gunzip round trip preserves bytes', async () => {
   await gzipFile({ input, output: gz });
   assert.equal(fileMode(gz), 0o600);
   assert.ok(fs.statSync(gz).size < Buffer.byteLength(payload));
-  await gunzipFile({ input: gz, output: out });
+  await gunzipFile({ input: gz, output: out, maxBytes: 1024 * 1024 });
   assert.equal(fs.readFileSync(out, 'utf8'), payload);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('encryption: gunzipFile enforces the decompressed-size bound and removes partial output', async () => {
+  const dir = tmpdir('bp-enc-');
+  const input = path.join(dir, 'in.sql');
+  const gz = path.join(dir, 'in.sql.gz');
+  const out = path.join(dir, 'out.sql');
+  // 8 MiB of identical bytes: a tiny gzip expanding far beyond any tight bound.
+  writePrivateBytes(input, 8 * 1024 * 1024);
+  await gzipFile({ input, output: gz });
+  assert.ok(fs.statSync(gz).size < 64 * 1024, 'fixture must compress hard');
+
+  await assert.rejects(
+    () => gunzipFile({ input: gz, output: out, maxBytes: 1024 }),
+    /exceeds the 1024-byte limit/,
+  );
+  assert.ok(!fs.existsSync(out), 'partial output must be removed on overflow');
+
+  // An adequate bound succeeds byte-identically.
+  await gunzipFile({ input: gz, output: out, maxBytes: 8 * 1024 * 1024 });
+  assert.equal(fs.statSync(out).size, 8 * 1024 * 1024);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('encryption: gunzipFile rejects non-positive decompressed bounds before writing', async () => {
+  const dir = tmpdir('bp-enc-');
+  const gz = path.join(dir, 'in.sql.gz');
+  const out = path.join(dir, 'out.sql');
+  writePrivateFile(path.join(dir, 'in.sql'), 'x');
+  await gzipFile({ input: path.join(dir, 'in.sql'), output: gz });
+  for (const bad of [0, -1, 1.5, NaN, Infinity]) {
+    await assert.rejects(
+      () => gunzipFile({ input: gz, output: out, maxBytes: bad }),
+      /positive integer/,
+    );
+    assert.ok(!fs.existsSync(out), `maxBytes ${bad} must not create output`);
+  }
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

@@ -10,7 +10,10 @@ import {
   preflightSupabase,
   dumpDatabase,
   PINNED_SUPABASE_CLI_VERSION,
+  PINNED_SUPABASE_POSTGRES_IMAGE,
+  PINNED_SUPABASE_POSTGRES_TAG,
 } from './database.js';
+import { POSTGRES_MAJOR_VERSION } from './snapshot.js';
 import { tmpdir, writePrivateFile, fileMode } from './test-fixtures.js';
 
 const DB_URL =
@@ -50,6 +53,22 @@ function outDirFixture(root) {
   fs.mkdirSync(out, { mode: 0o700 });
   return out;
 }
+
+test('database: Postgres image is pinned by an immutable digest, never a mutable tag', () => {
+  assert.equal(PINNED_SUPABASE_CLI_VERSION, '2.114.0');
+  assert.match(
+    PINNED_SUPABASE_POSTGRES_IMAGE,
+    /^public\.ecr\.aws\/supabase\/postgres@sha256:[0-9a-f]{64}$/,
+    'the image reference must be a digest (registry-verified), not a tag',
+  );
+  // The reviewed human-readable tag is kept for documentation/upgrades only:
+  // code must NEVER execute the tag form, only the digest above.
+  assert.equal(PINNED_SUPABASE_POSTGRES_TAG, 'public.ecr.aws/supabase/postgres:17.6.1.158');
+  assert.ok(
+    PINNED_SUPABASE_POSTGRES_TAG.includes(`:${POSTGRES_MAJOR_VERSION}.`),
+    `tag ${PINNED_SUPABASE_POSTGRES_TAG} must begin with the configured Postgres major ${POSTGRES_MAJOR_VERSION}`,
+  );
+});
 
 test('database: exact executable and argument arrays for every command', async () => {
   const root = tmpdir('bp-db-');

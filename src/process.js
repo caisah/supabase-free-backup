@@ -330,15 +330,21 @@ export async function runCommand({
 
   const observed = observeChild(child, signal);
   const closePromise = awaitClose(child);
+  const settled = { childClosed: false };
+  closePromise.then(() => {
+    settled.childClosed = true;
+  });
   const pumpsPromise = startPumps(child, state);
-  writeInput(child, input);
+  const inputPromise = pumpInput(child, input, settled);
 
   try {
     const exit = await closePromise;
     const pumps = await pumpsPromise;
+    const inputResult = await inputPromise;
     const closeFailures = await closeOutputState(state);
     const ioFailure =
       state.fileErrors[0] ??
+      inputResult.failure ??
       pumps.find((result) => result.failure)?.failure ??
       closeFailures[0] ??
       null;
@@ -362,26 +368,62 @@ function basename(command) {
   return path.basename(String(command));
 }
 
-function writeInput(child, input) {
-  if (!child.stdin) return;
+/**
+ * Deliver stdin with backpressure, never buffering the input. Complete
+ * successful input delivery is part of command success:
+ *
+ * - a SOURCE read failure records a command failure, destroys the child's
+ *   stdin, and terminates a live child. A child that treats the closed pipe
+ *   as EOF must never be allowed to commit a partial input (e.g. `psql
+ *   --single-transaction -f -`) and exit zero; the recorded failure makes
+ *   `runCommand` reject regardless of the child's exit.
+ * - a WRITE failure caused by the child dying (EPIPE on a closed pipe) is
+ *   benign: the child's own exit status is authoritative for commands that
+ *   exit without consuming stdin.
+ */
+async function pumpInput(child, input, settled) {
+  if (!child.stdin) return { failure: null };
+  // Permanent guards so a destroyed pipe/source can never surface an
+  // unhandled 'error' after the pump detached.
   child.stdin.on('error', () => {});
   if (input === undefined || input === null) {
     child.stdin.end();
-    return;
+    return { failure: null };
   }
   if (typeof input === 'string' || Buffer.isBuffer(input)) {
     child.stdin.end(input);
-    return;
+    return { failure: null };
   }
-  // Readable stream: pipe with backpressure so multi-gigabyte inputs are
-  // never buffered. A source read failure destroys the child's stdin, which
-  // surfaces as a nonzero exit (or stderr tail) instead of an uncaught
-  // rejection on the stream. When the child dies or drops the pipe, the
-  // source is destroyed too so no pending open/read can surface a late
-  // ENOENT/EPIPE as an uncaught exception.
-  input.on('error', () => child.stdin.destroy());
-  child.stdin.on('error', () => input.destroy());
-  input.pipe(child.stdin);
+  input.on('error', () => {});
+  const fail = (err) => {
+    settled.failure = settled.failure ?? err;
+    if (!child.stdin.destroyed) child.stdin.destroy();
+    if (!settled.childClosed) child.kill('SIGKILL');
+  };
+  try {
+    for await (const chunk of input) {
+      if (settled.childClosed) break;
+      try {
+        await writeWithBackpressure(child.stdin, chunk);
+      } catch (err) {
+        const benign =
+          err?.code === 'EPIPE' || err?.code === 'ERR_STREAM_DESTROYED' || settled.childClosed;
+        if (!benign) fail(err);
+        break;
+      }
+    }
+    if (!settled.failure && !settled.childClosed && !child.stdin.destroyed) {
+      try {
+        child.stdin.end();
+      } catch {
+        // the child may have exited between the loop and the end call; its
+        // exit status is authoritative then
+      }
+    }
+  } catch (err) {
+    fail(err);
+  }
+  return { failure: settled.failure ?? null };
 }
 
 /** Resolve an executable by name from PATH. */

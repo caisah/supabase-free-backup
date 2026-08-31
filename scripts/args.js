@@ -18,13 +18,15 @@ export const BACKUP_USAGE =
 export const COMMIT_WEEKLY_USAGE =
   'usage: vp run commit:weekly --staging-dir <path> [--repo-root <path>]';
 export const HOSTED_RESTORE_USAGE =
-  'usage: vp run restore:development|restore:production --source <r2|repo> --backup <latest|snapshot-id>';
+  'usage: vp run restore:development|restore:production --source <r2|repo|local> --backup <latest|snapshot-id>';
 export const LOCAL_RESTORE_USAGE =
   'usage: vp run restore:local --environment <development|production> --source <r2|repo> --backup <latest|snapshot-id>';
 export const LOCAL_BACKUP_USAGE =
   'usage: vp run backup:local --environment <development|production>';
 
 const SOURCES = ['r2', 'repo'];
+// Hosted restores additionally read the private local snapshot store.
+const HOSTED_RESTORE_SOURCES = ['r2', 'repo', 'local'];
 
 /** Map a restore result to its CLI exit code: 0 success/help, 2 declined. */
 export function exitCodeForResult(result) {
@@ -141,8 +143,8 @@ export function parseHostedRestoreArgs(argv) {
   const values = parsed.values;
   if (values.help) return { help: true };
   const source = values.source;
-  if (source === undefined || !SOURCES.includes(source)) {
-    throw new Error('restore requires --source r2|repo');
+  if (source === undefined || !HOSTED_RESTORE_SOURCES.includes(source)) {
+    throw new Error('restore requires --source r2|repo|local');
   }
   if (values.backup === undefined) {
     throw new Error('restore requires --backup latest|<snapshot-id>');

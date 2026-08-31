@@ -1,9 +1,9 @@
 name: Backup
 
-# Daily logical backups of the development and production Supabase databases
-# at 03:17 UTC; the Sunday expression additionally triggers the weekly
-# staged-snapshot commit. Repository must stay private; scheduled workflows
-# require master to be the default branch.
+# Daily logical backups for both Fragtrack databases at 03:17 UTC; the Sunday
+# expression additionally triggers the weekly staged-snapshot commit. Repository
+# must stay private; scheduled workflows require master to be the default
+# branch.
 on:
   schedule:
     - cron: '17 3 * * 1-6'

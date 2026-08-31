@@ -1,7 +1,12 @@
 /**
  * Snapshot contract: strict version-1 manifests, safe private path handling,
- * packaging (fingerprint -> gzip -> age -> 90 MiB parts -> manifest last),
- * and full verification/unpacking for restore preparation.
+ * packaging (fingerprint -> gzip -> row-data codec -> 90 MiB parts ->
+ * manifest last), and full verification/unpacking for restore preparation.
+ *
+ * Row-data storage is a CODEC chosen at package time and declared in the
+ * manifest: `age-x25519` (encrypted) or `none` (plaintext). Part names, part
+ * ordering, and the `encrypted` flag are validated from the codec derived
+ * from `manifest.encryption.format` — callers never branch on provenance.
  *
  * Package directories and manifests are ALWAYS treated as untrusted input —
  * even when read from this repository.
@@ -17,10 +22,16 @@ import { z } from 'zod';
 import { ENVIRONMENTS, REPOSITORY_ROOT } from './config.js';
 import {
   ENCRYPTION_FORMAT,
+  PLAINTEXT_FORMAT,
+  DEFAULT_FORMAT,
   PART_SIZE,
   PART_PREFIX,
+  PLAINTEXT_PART_PREFIX,
   partName,
   partIndex,
+  partNameFor,
+  rowDataCodec,
+  partIndexFor,
   gzipFile,
   gunzipFile,
   encryptFile,
@@ -30,6 +41,9 @@ import {
   ensurePrivateDir,
   removeFiles,
 } from './encryption.js';
+
+// Canonical part-name formatting lives in encryption.js; nothing here
+// re-derives the codec patterns.
 import {
   formatSnapshotId,
   parseSnapshotId,
@@ -37,7 +51,7 @@ import {
   computeAggregateFingerprint,
 } from './fingerprint.js';
 
-export { PART_SIZE, PART_PREFIX, partName, partIndex };
+export { PART_SIZE, PART_PREFIX, PLAINTEXT_PART_PREFIX, partName, partIndex, rowDataCodec };
 
 export const MANIFEST_NAME = 'manifest.json';
 export const PLAINTEXT_ARTIFACTS = [
@@ -69,7 +83,6 @@ export class SnapshotError extends Error {
 }
 
 const FILE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
-const PART_NAME_RE = /^data\.sql\.gz\.age\.part-\d{3}$/;
 
 /**
  * Resolve a stored filename inside a private root. Rejects absolute paths,
@@ -112,6 +125,10 @@ export function buildManifest({
   files,
   dataParts,
 }) {
+  // Resolving through the codec rejects unknown formats here instead of
+  // silently emitting a bare `recipient: undefined` for them.
+  const format = encryption.format ?? DEFAULT_FORMAT;
+  const codec = rowDataCodec(format);
   return {
     formatVersion: 1,
     environment,
@@ -121,32 +138,49 @@ export function buildManifest({
     supabaseCliVersion,
     postgresMajorVersion,
     contentSha256,
-    encryption: { format: ENCRYPTION_FORMAT, recipient: encryption.recipient },
+    encryption: codec.encrypted
+      ? { format, recipient: encryption.recipient }
+      : { format: PLAINTEXT_FORMAT },
     files,
     dataParts,
   };
 }
 
 /**
- * True only when both logical content and the encryption recipient match.
- * Absent or partial inputs never compare equal: a missing recipient or a
- * missing/empty content hash is a partial contract and must not silently
- * produce an "unchanged" decision. Shared by the hosted R2 change detector,
- * the weekly repository planner, and the local store.
+ * Shared format normalization: a missing `encryption.format` means
+ * age-x25519. NOTE: this deliberately diverges from `rowDataCodec`, which
+ * THROWS on unrecognized formats — `formatOf` must keep defaulting so the
+ * hosted RHS partial object `{ contentSha256, encryption: { recipient } }`
+ * (pre-format manifests) keeps comparing equal. A third format must update
+ * both paths together.
  */
-export function sameEncryptedContent(leftManifest, rightManifest) {
+function formatOf(m) {
+  return m.encryption?.format === PLAINTEXT_FORMAT ? PLAINTEXT_FORMAT : ENCRYPTION_FORMAT;
+}
+
+/**
+ * True only when both logical content AND the stored row-data codec match.
+ * Absent or partial inputs never compare equal. For non-`none` formats both
+ * recipients must be present, non-empty strings and equal; for `none`
+ * content equality is sufficient. A missing `encryption.format` is treated
+ * as `age-x25519`, so the hosted RHS partial object
+ * `{ contentSha256, encryption: { recipient } }` keeps working. Shared by
+ * the hosted R2 change detector, the weekly repository planner, and the
+ * local store.
+ */
+export function sameSnapshotContent(leftManifest, rightManifest) {
   if (!leftManifest || !rightManifest) return false;
+  if (leftManifest.contentSha256 !== rightManifest.contentSha256) return false;
+  const leftFormat = formatOf(leftManifest);
+  const rightFormat = formatOf(rightManifest);
+  if (leftFormat !== rightFormat) return false;
+  if (leftFormat === PLAINTEXT_FORMAT) return true;
   const leftRecipient = leftManifest.encryption?.recipient;
   const rightRecipient = rightManifest.encryption?.recipient;
-  const leftHash = leftManifest.contentSha256;
-  const rightHash = rightManifest.contentSha256;
   return (
     typeof leftRecipient === 'string' &&
     leftRecipient.length > 0 &&
-    leftRecipient === rightRecipient &&
-    typeof leftHash === 'string' &&
-    leftHash.length > 0 &&
-    leftHash === rightHash
+    leftRecipient === rightRecipient
   );
 }
 
@@ -170,17 +204,18 @@ function snapshotIdEquivalenceIssues(m) {
 /** Required and allowlisted stored files, duplicates, and plaintext data.sql. */
 function storedFileListIssues(m) {
   const issues = [];
+  const codec = rowDataCodec(m.encryption.format);
   const names = m.files.map((f) => f.name);
   for (const artifact of PLAINTEXT_ARTIFACTS) {
     if (!names.includes(artifact)) issues.push(`MISSING stored file ${artifact}`);
   }
   if (names.includes(ROW_DATA_FILE)) {
-    issues.push('INVALID stored file data.sql (row data must live only in encrypted parts)');
+    issues.push('INVALID stored file data.sql (row data must live only in row-data parts)');
   }
   const duplicates = names.filter((n, i) => names.indexOf(n) !== i);
   if (duplicates.length > 0) issues.push(`INVALID duplicate stored file ${duplicates[0]}`);
   for (const name of names) {
-    if (!PLAINTEXT_ARTIFACTS.includes(name) && !PART_NAME_RE.test(name)) {
+    if (!PLAINTEXT_ARTIFACTS.includes(name) && !codec.partRe.test(name)) {
       issues.push(`INVALID stored file ${name}`);
     }
   }
@@ -202,19 +237,21 @@ function artifactFlagIssues(m) {
 /** Contiguous dataParts, matching file entries, and part-size limits. */
 function dataPartIssues(m) {
   const issues = [];
+  const codec = rowDataCodec(m.encryption.format);
   m.dataParts.forEach((part, position) => {
-    const index = partIndex(part);
+    const index = partIndexFor(m.encryption.format, part);
     if (index === null) issues.push(`INVALID data part name ${part}`);
-    else if (index !== position) issues.push(`INVALID data part order at ${partName(position)}`);
+    else if (index !== position)
+      issues.push(`INVALID data part order at ${partNameFor(m.encryption.format, position)}`);
     const entries = m.files.filter((f) => f.name === part);
-    if (entries.length !== 1 || !entries[0].encrypted) {
+    if (entries.length !== 1 || entries[0].encrypted !== codec.encrypted) {
       issues.push(`INVALID data part entry ${part}`);
     }
     if (entries[0] && entries[0].size > LIMITS.maxPartBytes)
       issues.push(`OVERSIZED data part ${part}`);
   });
   for (const file of m.files) {
-    if (PART_NAME_RE.test(file.name) && !m.dataParts.includes(file.name)) {
+    if (codec.partRe.test(file.name) && !m.dataParts.includes(file.name)) {
       issues.push(`INVALID data part not listed in dataParts: ${file.name}`);
     }
   }
@@ -252,12 +289,15 @@ const MANIFEST_BASE_SCHEMA = z
     supabaseCliVersion: z.string().regex(/^\d+\.\d+\.\d+$/),
     postgresMajorVersion: z.literal(POSTGRES_MAJOR_VERSION),
     contentSha256: sha256Hex,
-    encryption: z
-      .object({
-        format: z.literal(ENCRYPTION_FORMAT),
-        recipient: z.string().regex(/^age1[a-z0-9]{38,65}$/),
-      })
-      .strict(),
+    encryption: z.discriminatedUnion('format', [
+      z
+        .object({
+          format: z.literal(ENCRYPTION_FORMAT),
+          recipient: z.string().regex(/^age1[a-z0-9]{38,65}$/),
+        })
+        .strict(),
+      z.object({ format: z.literal(PLAINTEXT_FORMAT) }).strict(),
+    ]),
     files: z.array(FILE_ENTRY_SCHEMA),
     dataParts: z.array(z.string()).min(1),
   })
@@ -473,29 +513,40 @@ function logicalFingerprintFiles({ sourceDir, dataSql }) {
   ];
 }
 
-/** gzip -> age encrypt -> parts (parts live directly in partsDir). */
-async function gzipEncryptAndSplit(opts, { tmpDir, partsDir, dataSql, onProgress }) {
+/** gzip -> (encrypt | plaintext) -> parts (parts live directly in partsDir). */
+async function compressAndSplitRowData(opts, { tmpDir, partsDir, dataSql, onProgress }) {
+  const codec = rowDataCodec(opts.format);
   const gzPath = path.join(tmpDir, `${ROW_DATA_FILE}.gz`);
-  const agePath_ = path.join(tmpDir, `${ROW_DATA_FILE}.gz.age`);
   onProgress?.('starting row-data compression');
   await gzipFile({ input: dataSql, output: gzPath });
   onProgress?.('completed row-data compression');
-  onProgress?.('starting row-data encryption');
-  await encryptFile({
-    recipient: opts.ageRecipient,
-    input: gzPath,
-    output: agePath_,
-    agePath: opts.agePath,
-    run: opts.run,
-    signal: opts.signal,
-  });
-  onProgress?.('completed row-data encryption');
-  onProgress?.('starting encrypted-part splitting');
-  const partNames = await splitIntoParts({ input: agePath_, outputDir: partsDir });
-  if (partNames.length === 0) {
-    throw new SnapshotError(['encrypted row data produced no parts']);
+  let input = gzPath;
+  if (codec.encrypted) {
+    const agePath_ = path.join(tmpDir, `${ROW_DATA_FILE}.gz.age`);
+    onProgress?.('starting row-data encryption');
+    await encryptFile({
+      recipient: opts.ageRecipient,
+      input: gzPath,
+      output: agePath_,
+      agePath: opts.agePath,
+      run: opts.run,
+      signal: opts.signal,
+    });
+    onProgress?.('completed row-data encryption');
+    input = agePath_;
+    onProgress?.('starting encrypted-part splitting');
+  } else {
+    onProgress?.('starting row-data split (plaintext format)');
   }
-  onProgress?.('completed encrypted-part splitting');
+  const partNames = await splitIntoParts({ input, outputDir: partsDir, prefix: codec.partPrefix });
+  if (partNames.length === 0) {
+    throw new SnapshotError(['row data produced no parts']);
+  }
+  onProgress?.(
+    codec.encrypted
+      ? 'completed encrypted-part splitting'
+      : 'completed row-data split (plaintext format)',
+  );
   return partNames;
 }
 
@@ -514,11 +565,11 @@ async function copyPlaintextArtifacts({ sourceDir, destDir, onProgress }) {
 }
 
 /** Hash and size every stored file (plaintext artifacts + parts). */
-async function collectStoredFileSizes({ destDir, partNames, onProgress }) {
+async function collectStoredFileSizes({ destDir, partNames, codec, onProgress }) {
   const files = [];
   const stored = [
     ...PLAINTEXT_ARTIFACTS.map((name) => ({ name, encrypted: false })),
-    ...partNames.map((name) => ({ name, encrypted: true })),
+    ...partNames.map((name) => ({ name, encrypted: codec.encrypted })),
   ];
   const total = stored.length;
   for (let i = 0; i < total; i++) {
@@ -547,6 +598,8 @@ async function collectStoredFileSizes({ destDir, partNames, onProgress }) {
  * @param {string} opts.supabaseCliVersion
  * @param {string} opts.ageRecipient
  * @param {string} [opts.agePath]
+ * @param {'age-x25519'|'none'} [opts.format] row-data codec; defaults to
+ *   `age-x25519` (hosted behavior)
  * @param {Function} [opts.run] passed through to the encryption helpers,
  *   each of which defaults to `runCommand`
  * @param {AbortSignal} [opts.signal]
@@ -556,6 +609,8 @@ async function collectStoredFileSizes({ destDir, partNames, onProgress }) {
 export async function packageSnapshot(opts) {
   const lim = { ...LIMITS, ...(opts.limits ?? {}) };
   const onProgress = opts.onProgress;
+  const format = opts.format ?? DEFAULT_FORMAT;
+  const codec = rowDataCodec(format);
   onProgress?.('starting source validation');
   validateSourceFiles({ sourceDir: opts.sourceDir, lim });
   onProgress?.('completed source validation');
@@ -578,8 +633,13 @@ export async function packageSnapshot(opts) {
     });
     onProgress?.('completed content fingerprinting');
 
-    // 3. gzip -> age encrypt -> split into parts.
-    const partNames = await gzipEncryptAndSplit(opts, { tmpDir, partsDir, dataSql, onProgress });
+    // 3. gzip -> (age encrypt | plaintext) -> split into parts.
+    const partNames = await compressAndSplitRowData(opts, {
+      tmpDir,
+      partsDir,
+      dataSql,
+      onProgress,
+    });
 
     // 4. Copy plaintext artifacts into the packaged directory (mode 0600).
     await copyPlaintextArtifacts({
@@ -592,6 +652,7 @@ export async function packageSnapshot(opts) {
     const files = await collectStoredFileSizes({
       destDir: opts.destDir,
       partNames,
+      codec,
       onProgress,
     });
 
@@ -604,7 +665,7 @@ export async function packageSnapshot(opts) {
       createdAt,
       supabaseCliVersion: opts.supabaseCliVersion,
       contentSha256: aggregate.hex,
-      encryption: { recipient: opts.ageRecipient },
+      encryption: { format, recipient: opts.ageRecipient },
       files,
       dataParts: partNames,
     });
@@ -673,8 +734,8 @@ async function copyVerifiedPlaintext({ sourceDir, destDir }) {
   );
 }
 
-/** Reassemble the parts, decrypt, and gunzip into the prepared data file. */
-async function decryptRowData({
+/** Reassemble the parts, decrypt (age formats only), and gunzip into data.sql. */
+async function restoreRowData({
   sourceDir,
   destDir,
   tmpDir,
@@ -683,16 +744,37 @@ async function decryptRowData({
   agePath,
   run,
   signal,
+  lim,
 }) {
-  const assembled = path.join(tmpDir, `${ROW_DATA_FILE}.gz.age`);
+  const codec = rowDataCodec(manifest.encryption.format);
   const gunzipped = path.join(tmpDir, `${ROW_DATA_FILE}.gz`);
+  // Reassembly output and decrypt output are the SAME path for plaintext
+  // codecs (decrypt is skipped): plaintext parts are gunzipped in place.
+  const assembled = path.join(
+    tmpDir,
+    codec.encrypted ? `${ROW_DATA_FILE}.gz.age` : `${ROW_DATA_FILE}.gz`,
+  );
   const dataPath = path.join(destDir, ROW_DATA_FILE);
   await reassembleParts({
     parts: manifest.dataParts.map((p) => path.join(sourceDir, p)),
     output: assembled,
   });
-  await decryptFile({ identityFile, input: assembled, output: gunzipped, agePath, run, signal });
-  await gunzipFile({ input: gunzipped, output: dataPath });
+  if (codec.encrypted) {
+    if (!identityFile) {
+      throw new SnapshotError([
+        'snapshot is age-encrypted but no identity file was provided (DECRYPT_KEY required)',
+      ]);
+    }
+    await decryptFile({ identityFile, input: assembled, output: gunzipped, agePath, run, signal });
+  }
+  // The decompressed bound is the combined row-data inputs (each source file
+  // is individually capped at maxPlaintextBytes when packaged), so a tiny
+  // high-ratio gzip part can never exhaust the temp filesystem on restore.
+  await gunzipFile({
+    input: codec.encrypted ? gunzipped : assembled,
+    output: dataPath,
+    maxBytes: ROW_DATA_INPUTS.length * lim.maxPlaintextBytes,
+  });
   return dataPath;
 }
 
@@ -708,11 +790,12 @@ async function verifyAggregateFingerprint({ destDir, dataPath, contentSha256 }) 
 }
 
 export async function unpackAndVerify(opts) {
+  const lim = { ...LIMITS, ...(opts.limits ?? {}) };
   const { manifest } = await validatePackagedDirectory(opts.sourceDir, {
     expectedEnvironment: opts.expectedEnvironment,
     expectedSnapshotId: opts.expectedSnapshotId,
     expectedProjectRef: opts.expectedProjectRef,
-    limits: opts.limits,
+    limits: lim,
   });
 
   if (fs.existsSync(opts.destDir)) {
@@ -726,8 +809,8 @@ export async function unpackAndVerify(opts) {
     // Copy verified plaintext artifacts + manifest into the prepared dir.
     await copyVerifiedPlaintext({ sourceDir: opts.sourceDir, destDir: opts.destDir });
 
-    // Reassemble, decrypt, gunzip.
-    const dataPath = await decryptRowData({
+    // Reassemble, decrypt (age formats only), gunzip.
+    const dataPath = await restoreRowData({
       sourceDir: opts.sourceDir,
       destDir: opts.destDir,
       tmpDir,
@@ -736,6 +819,7 @@ export async function unpackAndVerify(opts) {
       agePath: opts.agePath,
       run: opts.run,
       signal: opts.signal,
+      lim,
     });
 
     // Recompute the complete normalized aggregate fingerprint.

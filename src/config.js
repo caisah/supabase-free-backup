@@ -236,8 +236,8 @@ function conflictScopedNames(requirements) {
   if (requirements.accountId) names.push(CLOUDFLARE_ACCOUNT_ID);
   if (requirements.r2) names.push('R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET');
   if (requirements.ageRecipient) names.push('ENCRYPT_KEY');
-  if (requirements.ageIdentity) names.push('DECRYPT_KEY');
-  if (requirements.projectWorkdir) names.push('PROJECT_WORKDIR');
+  if (requirements.ageIdentity || requirements.optionalAgeIdentity) names.push('DECRYPT_KEY');
+  if (requirements.fragtrackWorkdir) names.push('PROJECT_WORKDIR');
   return new Set(names);
 }
 
@@ -298,9 +298,6 @@ function collectRequirementProblems({ requirements, resolved }) {
   if (requirements.ageIdentity && !resolved.DECRYPT_KEY) {
     problems.push('MISSING DECRYPT_KEY');
   }
-  if (requirements.projectWorkdir && !resolved.PROJECT_WORKDIR) {
-    problems.push('MISSING PROJECT_WORKDIR');
-  }
   return problems;
 }
 
@@ -321,12 +318,17 @@ function collectCrossFieldProblems({ environment, requirements, resolved }) {
   return problems;
 }
 
-/** Resolve PROJECT_WORKDIR against the repository root; never defaults it. */
-function resolveProjectWorkdir({ resolved, root }) {
-  if (!resolved.PROJECT_WORKDIR) return undefined;
-  return path.isAbsolute(resolved.PROJECT_WORKDIR)
-    ? resolved.PROJECT_WORKDIR
-    : path.resolve(root, resolved.PROJECT_WORKDIR);
+/** Resolve BACKUP_ENVIRONMENT / PROJECT_WORKDIR against the repository root. */
+function resolveFragtrackWorkdir({ resolved, requirements, root }) {
+  if (resolved.PROJECT_WORKDIR) {
+    return path.isAbsolute(resolved.PROJECT_WORKDIR)
+      ? resolved.PROJECT_WORKDIR
+      : path.resolve(root, resolved.PROJECT_WORKDIR);
+  }
+  if (requirements.fragtrackWorkdir) {
+    return path.resolve(root, '..', 'fragtrack');
+  }
+  return undefined;
 }
 
 /** Select the fields this operation is allowed to resolve. */
@@ -347,7 +349,7 @@ function resolveConfigFields({ vars, fileValues, fieldNames }) {
 }
 
 /** Build the stable public config shape from validated fields. */
-function buildOperationConfig({ environment, requirements, resolved, projectWorkdir }) {
+function buildOperationConfig({ environment, requirements, resolved, fragtrackWorkdir }) {
   const config = {
     environment,
     projectRef: resolved.SUPABASE_PROJECT_REF,
@@ -358,7 +360,7 @@ function buildOperationConfig({ environment, requirements, resolved, projectWork
     secretAccessKey: resolved.R2_SECRET_ACCESS_KEY,
     ageRecipient: resolved.ENCRYPT_KEY,
     ageIdentity: resolved.DECRYPT_KEY,
-    projectWorkdir,
+    fragtrackWorkdir,
     r2Endpoint: resolved.CLOUDFLARE_ACCOUNT_ID
       ? `https://${resolved.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`
       : undefined,
@@ -378,8 +380,15 @@ function buildOperationConfig({ environment, requirements, resolved, projectWork
     scoped.secretAccessKey = config.secretAccessKey;
   }
   if (requirements.ageRecipient) scoped.ageRecipient = config.ageRecipient;
-  if (requirements.ageIdentity) scoped.ageIdentity = config.ageIdentity;
-  if (requirements.projectWorkdir) scoped.projectWorkdir = projectWorkdir;
+  // `optionalAgeIdentity` resolves DECRYPT_KEY when configured (legacy
+  // encrypted local snapshots) without ever requiring it (plaintext ones).
+  if (
+    (requirements.ageIdentity || requirements.optionalAgeIdentity) &&
+    config.ageIdentity !== undefined
+  ) {
+    scoped.ageIdentity = config.ageIdentity;
+  }
+  if (requirements.fragtrackWorkdir) scoped.fragtrackWorkdir = fragtrackWorkdir;
   return scoped;
 }
 
@@ -391,22 +400,26 @@ const BACKUP_REQUIREMENTS = {
   ageRecipient: true,
 };
 
-/** Local backup: target metadata + recipient + workdir, never the hosted path. */
+/** Local backup: target metadata + workdir only, never age or the hosted path. */
 const LOCAL_BACKUP_REQUIREMENTS = {
   projectRef: true,
-  ageRecipient: true,
-  projectWorkdir: true,
+  fragtrackWorkdir: true,
   consumedOnly: true,
 };
 
 const HOSTED_RESTORE_REQUIREMENTS = {
   r2: { ...BACKUP_REQUIREMENTS, ageIdentity: true },
   repo: { projectRef: true, dbUrl: true, ageRecipient: true, ageIdentity: true },
+  // Plaintext local-store snapshots need target URL + ref only. DECRYPT_KEY
+  // is OPTIONALLY consumed: it is resolved and conflict-checked when present
+  // (a legacy age-encrypted snapshot still found in the store then restores),
+  // but never required — `format: "none"` snapshots need no identity.
+  local: { projectRef: true, dbUrl: true, consumedOnly: true, optionalAgeIdentity: true },
 };
 
 const LOCAL_RESTORE_REQUIREMENTS = {
-  r2: { accountId: true, r2: true, ageRecipient: true, ageIdentity: true, projectWorkdir: true },
-  repo: { ageRecipient: true, ageIdentity: true, projectWorkdir: true },
+  r2: { accountId: true, r2: true, ageRecipient: true, ageIdentity: true, fragtrackWorkdir: true },
+  repo: { ageRecipient: true, ageIdentity: true, fragtrackWorkdir: true },
 };
 
 function loadDotenvValues(filePath) {
@@ -495,7 +508,7 @@ export function loadOperationConfig({
     environment,
     requirements,
     resolved,
-    projectWorkdir: resolveProjectWorkdir({ resolved, root }),
+    fragtrackWorkdir: resolveFragtrackWorkdir({ resolved, requirements, root }),
   });
 }
 
@@ -504,7 +517,7 @@ export function loadBackupConfig(opts) {
   return loadOperationConfig({ ...opts, requirements: BACKUP_REQUIREMENTS });
 }
 
-/** Local backup: consumes only matching env, target ref, recipient, and workdir. */
+/** Local backup: consumes only matching env, target ref, and workdir. */
 export function loadLocalBackupConfig(opts) {
   return loadOperationConfig({ ...opts, requirements: LOCAL_BACKUP_REQUIREMENTS });
 }
@@ -513,12 +526,12 @@ export function loadLocalBackupConfig(opts) {
 export function loadHostedRestoreConfig({ source, ...opts }) {
   const requirements = HOSTED_RESTORE_REQUIREMENTS[source];
   if (!requirements) {
-    throw new ConfigError(['source must be one of: r2, repo']);
+    throw new ConfigError(['source must be one of: r2, repo, local']);
   }
   return loadOperationConfig({ ...opts, requirements });
 }
 
-/** Local project restore. Requires the age identity and workdir. */
+/** Local Fragtrack restore. Requires the age identity and workdir. */
 export function loadLocalRestoreConfig({ source, ...opts }) {
   const requirements = LOCAL_RESTORE_REQUIREMENTS[source];
   if (!requirements) {

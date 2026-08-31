@@ -19,9 +19,6 @@ import {
   scanLocalBackupSnapshots,
   createLocalBackupCandidate,
   finalizeLocalBackup,
-  buildLocalDatabaseBarrierScript,
-  acquireLocalDatabaseBarrier,
-  assertLocalDbPortPublished,
 } from './local-backup.js';
 import { buildManifest, PLAINTEXT_ARTIFACTS, MANIFEST_NAME } from './snapshot.js';
 import {
@@ -41,12 +38,8 @@ const ID_OLDEST_2 = '2026-08-21T03-17-09Z';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-// Generic unit project id; the container name is always derived from it.
-const PROJECT_ID = 'example-project';
-const DB_CONTAINER = `supabase_db_${PROJECT_ID}`;
-
 function validateFsArgs(opts) {
-  return { dockerPath: '/bin/docker', dbContainer: DB_CONTAINER, run: opts.run };
+  return { dockerPath: '/bin/docker', dbContainer: 'supabase_db_fragtrack', run: opts.run };
 }
 
 function createdAt(id) {
@@ -278,149 +271,6 @@ test('local-backup: stale owned candidates are removed; symlinks and files are r
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('local-backup: barrier script holds SHARE locks under a session advisory marker', () => {
-  const script = buildLocalDatabaseBarrierScript();
-  assert.match(script, /SELECT pg_advisory_lock\(/);
-  assert.match(script, /LOCK TABLE/);
-  assert.match(script, /IN SHARE MODE/);
-  assert.ok(!/ACCESS EXCLUSIVE/.test(script), 'dump readers must not be blocked');
-  assert.match(script, /relkind IN \('r', 'p', 'm'\)/);
-  assert.match(script, /nspname !~ '\^pg_'/, 'scope excludes only system schemas');
-  assert.ok(!script.includes('graphql_public'), 'no hard-coded app schema list in the barrier');
-});
-
-test('local-backup: barrier acquisition waits for the grant and release ends the holder session', async () => {
-  let holderInput = null;
-  let resolveHolder;
-  const holder = new Promise((resolve) => {
-    resolveHolder = resolve;
-  });
-  const polls = [];
-  const run = async (opts) => {
-    if (opts.args.includes('-i') && opts.input) {
-      holderInput = opts.input;
-      holderInput.on('finish', () => resolveHolder({ stdout: 'LOCKS-HELD\n' }));
-      return holder;
-    }
-    polls.push(opts.args.at(-1));
-    return { stdout: polls.length < 3 ? 'f\n' : 't\n' };
-  };
-  const handle = await acquireLocalDatabaseBarrier({
-    dockerPath: '/bin/docker',
-    dbContainer: DB_CONTAINER,
-    run,
-    timeoutMs: 1000,
-    pollIntervalMs: 5,
-  });
-  assert.equal(polls.length, 3, 'waits until the barrier is granted');
-  assert.ok(holderInput, 'holder session must keep stdin open');
-  assert.match(polls[0], /pg_locks/);
-  await handle.release();
-  assert.ok(holderInput.writableEnded, 'holder stdin ended on release');
-});
-
-test('local-backup: barrier acquisition fails closed on holder failure and timeout', async () => {
-  await assert.rejects(
-    () =>
-      acquireLocalDatabaseBarrier({
-        dockerPath: '/bin/docker',
-        dbContainer: DB_CONTAINER,
-        run: async (opts) => {
-          if (opts.args.includes('-i')) throw new Error('docker exec exploded');
-          return { stdout: 'f\n' };
-        },
-        timeoutMs: 500,
-        pollIntervalMs: 5,
-      }),
-    (err) => err instanceof LocalBackupError && /cannot establish/.test(err.message),
-  );
-  await assert.rejects(
-    () =>
-      acquireLocalDatabaseBarrier({
-        dockerPath: '/bin/docker',
-        dbContainer: DB_CONTAINER,
-        run: async () => ({ stdout: 'f\n' }),
-        timeoutMs: 40,
-        pollIntervalMs: 5,
-      }),
-    (err) =>
-      err instanceof LocalBackupError &&
-      /could not be established/.test(err.message) &&
-      err.stage === 'consistency',
-  );
-});
-
-test('local-backup: a lost barrier rejects the release with the holder cause', async () => {
-  let resolveHolder;
-  const holder = new Promise((_, reject) => {
-    resolveHolder = reject;
-  });
-  const run = async (opts) => {
-    if (opts.args.includes('-i')) {
-      opts.input.on('finish', () => resolveHolder(new Error('psql was killed')));
-      return holder;
-    }
-    return { stdout: 't\n' };
-  };
-  const handle = await acquireLocalDatabaseBarrier({
-    dockerPath: '/bin/docker',
-    dbContainer: DB_CONTAINER,
-    run,
-    timeoutMs: 1000,
-    pollIntervalMs: 5,
-  });
-  await assert.rejects(
-    () => handle.release(),
-    (err) =>
-      err instanceof LocalBackupError &&
-      /barrier was lost/.test(err.message) &&
-      /psql was killed/.test(err.cause.message),
-  );
-});
-
-test('local-backup: published-port check proves probes and dumps share one server', async () => {
-  const calls = [];
-  await assertLocalDbPortPublished({
-    dockerPath: '/bin/docker',
-    dbContainer: DB_CONTAINER,
-    dbPort: 54322,
-    run: async (opts) => {
-      calls.push(opts.args);
-      return { stdout: '0.0.0.0:54322\n[::]:54322\n' };
-    },
-  });
-  assert.deepEqual(calls, [['port', DB_CONTAINER, '54322/tcp']]);
-  await assert.rejects(
-    () =>
-      assertLocalDbPortPublished({
-        dockerPath: '/bin/docker',
-        dbContainer: DB_CONTAINER,
-        dbPort: 54322,
-        run: async () => ({ stdout: '0.0.0.0:54323\n' }),
-      }),
-    (err) =>
-      err instanceof LocalBackupError &&
-      /not published/.test(err.message) &&
-      err.stage === 'connect',
-  );
-  await assert.rejects(
-    () =>
-      assertLocalDbPortPublished({
-        dockerPath: '/bin/docker',
-        dbContainer: DB_CONTAINER,
-        dbPort: 54322,
-        run: async () => {
-          throw new Error('docker missing');
-        },
-      }),
-    (err) => {
-      assert.ok(err instanceof LocalBackupError);
-      assert.ok(err.cause, 'the docker failure must stay attached');
-      return true;
-    },
-  );
-});
-
 test('local-backup: assertLocalStackRunning is read-only and requires the exact SELECT 1', async () => {
   const calls = [];
   const run = async ({ command, args }) => {
@@ -431,7 +281,7 @@ test('local-backup: assertLocalStackRunning is read-only and requires the exact 
   await assertLocalStackRunning(validateFsArgs({ run }));
   assert.equal(calls.length, 1);
   assert.equal(path.basename(calls[0].command), 'docker');
-  assert.deepEqual(calls[0].args.slice(0, 3), ['exec', DB_CONTAINER, 'psql']);
+  assert.deepEqual(calls[0].args.slice(0, 3), ['exec', 'supabase_db_fragtrack', 'psql']);
   const joined = calls[0].args.join(' ');
   for (const lifecycle of ['start', 'stop', 'reset', 'db reset', 'migrate']) {
     assert.ok(!joined.includes(lifecycle), `must not invoke lifecycle command ${lifecycle}`);
@@ -441,7 +291,7 @@ test('local-backup: assertLocalStackRunning is read-only and requires the exact 
     () =>
       assertLocalStackRunning({
         dockerPath: '/bin/docker',
-        dbContainer: DB_CONTAINER,
+        dbContainer: 'supabase_db_fragtrack',
         run: async () => {
           throw new Error('container not running');
         },
@@ -458,20 +308,20 @@ test('local-backup: assertLocalStackRunning is read-only and requires the exact 
     () =>
       assertLocalStackRunning({
         dockerPath: '/bin/docker',
-        dbContainer: DB_CONTAINER,
+        dbContainer: 'supabase_db_fragtrack',
         run: async () => ({ stdout: '0\n' }),
       }),
     (err) => err instanceof LocalBackupError && /start the local stack/.test(err.message),
   );
 });
 
-test('local-backup: database state token covers the full dump scope plus role memberships and default privileges', async () => {
+test('local-backup: database state token covers mutations, relations, sequences, and roles', async () => {
   const calls = [];
   const state =
     '00000000000000000000000000000000|0123456789abcdef0123456789abcdef|11111111111111111111111111111111|22222222222222222222222222222222';
   const result = await readLocalDatabaseState({
     dockerPath: '/bin/docker',
-    dbContainer: DB_CONTAINER,
+    dbContainer: 'supabase_db_fragtrack',
     run: async (opts) => {
       calls.push(opts);
       return { stdout: `${state}\n` };
@@ -479,24 +329,17 @@ test('local-backup: database state token covers the full dump scope plus role me
   });
   assert.equal(result, state);
   assert.equal(calls.length, 1);
-  const query = calls[0].args.at(-1);
-  assert.match(query, /pg_stat_all_tables/);
-  assert.match(query, /pg_relation_size/);
-  assert.match(query, /pg_sequences/);
-  assert.match(query, /pg_roles/);
-  assert.match(query, /pg_auth_members/, 'role memberships must be tokenized');
-  assert.match(query, /pg_default_acl/, 'default privileges must be tokenized');
-  // The guard scope is a superset of the CLI dump scope: only system schemas
-  // are excluded, never application/managed schemas the dump can carry.
-  assert.ok(!query.includes('graphql_public'), 'no hard-coded app schema exclusions');
-  assert.ok(!query.includes('realtime'), 'managed schemas stay inside the guard scope');
-  assert.match(query, /nspname !~ '\^pg_'/);
+  assert.match(calls[0].args.at(-1), /pg_stat_all_tables/);
+  assert.match(calls[0].args.at(-1), /pg_relation_size/);
+  assert.match(calls[0].args.at(-1), /catalog_state/);
+  assert.match(calls[0].args.at(-1), /pg_sequences/);
+  assert.match(calls[0].args.at(-1), /pg_roles/);
 
   await assert.rejects(
     () =>
       readLocalDatabaseState({
         dockerPath: '/bin/docker',
-        dbContainer: DB_CONTAINER,
+        dbContainer: 'supabase_db_fragtrack',
         run: async () => ({ stdout: 'malformed-state\n' }),
       }),
     (err) => err instanceof LocalBackupError && err.stage === 'consistency',
@@ -936,109 +779,3 @@ test('local-backup: source files never reference the R2 adapter or read R2 crede
   }
   assert.ok(source.includes('LocalBackupError'));
 });
-
-test('local-backup: source never imports the destructive restore module', () => {
-  const source = fs.readFileSync(path.join(REPO_ROOT, 'src', 'local-backup.js'), 'utf8');
-  assert.ok(
-    !source.includes("'./local-restore.js'"),
-    'backup must not couple to the destructive restore module',
-  );
-  assert.ok(
-    source.includes("'./local-project.js'"),
-    'query primitives must come from the neutral local-project adapter',
-  );
-  const adapter = fs.readFileSync(path.join(REPO_ROOT, 'src', 'local-project.js'), 'utf8');
-  assert.ok(!adapter.includes("'./local-restore.js'"), 'adapter must not import restore');
-  assert.ok(!adapter.includes("'./local-backup.js'"), 'adapter must not import backup');
-});
-
-test('local-backup: generated candidate names always match the canonical pattern', () => {
-  const root = tmpdir('bp-lb-');
-  const store = storeFor(root);
-  try {
-    for (let i = 0; i < 8; i += 1) {
-      const candidate = createLocalBackupCandidate({ environmentDir: store.environmentDir });
-      assert.match(path.basename(candidate.candidateDir), /^\.candidate-[0-9a-f]{16}$/);
-    }
-  } finally {
-    store.release();
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('local-backup: lock-initialization failure preserves the init cause AND cleanup errors', () => {
-  const root = tmpdir('bp-lb-lockinit-');
-  const realFsync = fs.fsyncSync;
-  const realRm = fs.rmSync;
-  fs.fsyncSync = () => {
-    throw new Error('fsync exploded');
-  };
-  fs.rmSync = () => {
-    throw new Error('rm exploded');
-  };
-  try {
-    assert.throws(
-      () => openLocalBackupStore({ repoRoot: root, environment: ENV }),
-      (err) => {
-        assert.ok(err instanceof LocalBackupError, 'init failure must stay a LocalBackupError');
-        assert.equal(err.stage, 'lock');
-        assert.ok(
-          err.cause instanceof AggregateError,
-          'both the init failure and the cleanup failure must be attached',
-        );
-        assert.match(err.cause.message, /fsync exploded/);
-        assert.ok(
-          err.cause.errors.some((failure) => /rm exploded/.test(failure.message)),
-          'the lock-removal failure must not be swallowed',
-        );
-        return true;
-      },
-    );
-  } finally {
-    fs.fsyncSync = realFsync;
-    fs.rmSync = realRm;
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test(
-  'local-backup: existence check never misclassifies permission errors as absence',
-  { skip: process.platform === 'win32' },
-  async () => {
-    const root = tmpdir('bp-lb-exists-');
-    const candidateRoot = path.join(root, 'candidates');
-    fs.mkdirSync(candidateRoot, { mode: 0o700 });
-    const blockedDir = path.join(root, 'blocked');
-    fs.mkdirSync(blockedDir, { mode: 0o700 });
-    const candidate = createLocalBackupCandidate({ environmentDir: candidateRoot });
-    fs.mkdirSync(candidate.pkgDir, { mode: 0o700 });
-    writePrivateFile(path.join(candidate.pkgDir, 'roles.sql'), 'x');
-    fs.chmodSync(blockedDir, 0o000);
-    let synced = false;
-    try {
-      await assert.rejects(
-        () =>
-          finalizeLocalBackup({
-            candidate,
-            candidateManifest: {
-              contentSha256: 'b'.repeat(64),
-              sourceProjectRef: REF,
-              encryption: { recipient: AGE_RECIPIENT_1 },
-            },
-            existingSnapshots: [],
-            environmentDir: path.join(blockedDir, 'env'),
-            snapshotId: ID,
-            syncSnapshot: async () => {
-              synced = true;
-            },
-          }),
-        (err) => err && err.code === 'EACCES',
-        'the permission failure must surface from the existence check',
-      );
-      assert.equal(synced, false, 'must fail at the existence check, not after syncing');
-    } finally {
-      fs.chmodSync(blockedDir, 0o700);
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  },
-);

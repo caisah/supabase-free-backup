@@ -4,16 +4,21 @@
  * Everything destructive happens ONLY after: full source verification
  * (sub-plan 06), read-only target preflight, and an exact interactive
  * confirmation phrase. Reset cleans the target; the restore then runs as ONE
- * psql transaction with strict ordering: prepared roles, application schema,
- * managed auth/storage delta, migration-history schema, generated cleanup
- * SQL, then decrypted combined data. Never logs URLs, passwords, identities,
- * or SQL contents.
+ * Dockerized psql transaction (single `-f -` script scope: any session state
+ * set in one artifact persists into the next; current dumps contain none)
+ * with strict ordering: prepared roles, application schema, managed
+ * auth/storage delta, migration-history schema, generated cleanup SQL, then
+ * decrypted combined data. Never logs URLs, passwords, identities, or SQL
+ * contents.
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
+import { Readable } from 'node:stream';
 import { urlPassword } from './config.js';
+import { PINNED_SUPABASE_POSTGRES_IMAGE } from './database.js';
+import { POSTGRES_MAJOR_VERSION } from './snapshot.js';
 
 export class HostedRestoreError extends Error {
   constructor(message, { cause, stage } = {}) {
@@ -24,7 +29,21 @@ export class HostedRestoreError extends Error {
   }
 }
 
+export const FRAGTRACK_TRIGGERS = ['create_account_for_new_user', 'cleanup_deleted_user_vouches'];
 export const CREATE_ROLE_LINE = /^\s*CREATE ROLE "((?:[^"]|"")+)"\s*;\s*$/;
+
+/**
+ * Canonical restore ORDER of the plaintext schema artifacts inside the ONE
+ * transactional restore: application schema, managed auth/storage delta,
+ * migration-history schema. Deliberately decoupled from the packaging
+ * artifact list (`PLAINTEXT_ARTIFACTS`) so a packaging reorder or addition
+ * can never silently change the destructive restore stream.
+ */
+export const HOSTED_RESTORE_SCHEMA_ARTIFACTS = Object.freeze([
+  'schema.sql',
+  'managed-schema.sql',
+  'migration-history-schema.sql',
+]);
 
 /**
  * Prepare roles in ONE pass and report how many canonical CREATE ROLE
@@ -33,7 +52,7 @@ export const CREATE_ROLE_LINE = /^\s*CREATE ROLE "((?:[^"]|"")+)"\s*;\s*$/;
 function prepareRolesFileWithCount({
   rolesSql,
   existingRoles = [],
-  marker = '-- already exists on target; skipped by restore',
+  marker = '-- already exists on target; skipped by fragtrack restore',
 }) {
   const existing = new Set(existingRoles);
   const lines = rolesSql.split(/\r?\n/);
@@ -105,29 +124,17 @@ export async function generateCleanupSqlFromFile({ dataPath }) {
 
 /**
  * Shared single-pass COPY-header scanner for the in-memory and streaming
- * cleanup builders; throws HostedRestoreError on malformed input. Each COPY
- * block is validated and its data lines counted per target table so restore
- * verification can assert snapshot-derived row presence.
+ * cleanup builders; throws HostedRestoreError on malformed input.
  */
 function createCleanupScanner() {
   const COPY_HEADER = /^COPY "((?:[^"]|"")+)"\."((?:[^"]|"")+)"(?: \(.*\))? FROM stdin;$/;
   const seen = new Set();
   const truncates = [];
-  const tableByKey = new Map();
-  const tables = [];
   let inCopyData = false;
-  let current = null;
   return {
     push(line) {
       if (inCopyData) {
-        if (line === '\\.') {
-          inCopyData = false;
-          current = null;
-        } else if (current) {
-          // COPY text format escapes embedded newlines, so every physical
-          // line before the terminator is exactly one row.
-          current.rows += 1;
-        }
+        if (line === '\\.') inCopyData = false;
         return;
       }
       if (!line.startsWith('COPY ')) return;
@@ -140,14 +147,6 @@ function createCleanupScanner() {
       inCopyData = true;
       const schema = match[1].replaceAll('""', '"');
       const table = match[2].replaceAll('""', '"');
-      const key = `${schema}\u0000${table}`;
-      let tracked = tableByKey.get(key);
-      if (!tracked) {
-        tracked = { schema, table, rows: 0 };
-        tableByKey.set(key, tracked);
-        tables.push(tracked);
-      }
-      current = tracked;
       // Public-schema tables are freshly replaced by the clean step in both
       // hosted (db reset) and local (DROP SCHEMA public) restores; TRUNCATE
       // has no IF EXISTS, so they are excluded from the truncate list.
@@ -167,59 +166,105 @@ function createCleanupScanner() {
       }
       return `${truncates.join('\n')}\n`;
     },
-    content() {
-      return { tables };
-    },
   };
 }
 
+/** One hardening argument (and its value, when it has one) for the client. */
+export const DOCKER_HARDENING_FLAGS = Object.freeze([
+  '--read-only',
+  '--cap-drop=ALL',
+  '--security-opt=no-new-privileges',
+  '--user=postgres',
+  // Writable scratch for psql while the container rootfs stays read-only: a
+  // multi-gigabyte stdin stream must never fail because psql needed a temp
+  // file. tmpfs lives in memory, is wiped with the container, and offers no
+  // host or image filesystem reach.
+  '--tmpfs',
+  '/tmp',
+  '--entrypoint=psql',
+]);
+
 /**
- * Stream the decrypted data dump and report every COPY target with its row
- * count in first-seen order: `{ tables: [{ schema, table, rows }] }`. Used by
- * restore verification so the row-data checks are derived from the snapshot
- * content instead of hard-coded object names.
+ * Pure Docker argv builder for the ephemeral pinned psql 17 client. Docker
+ * flags come before the image, psql flags after it; `--interactive` is only
+ * added when SQL is streamed to the container's stdin. The target is a
+ * remote Supabase host reachable over TLS, so default bridge networking is
+ * used: host networking (—network=host) is never requested because it would
+ * widen a compromised client's reach to host services and is unsupported on
+ * parts of Docker Desktop.
  */
-export async function scanDataSqlContent({ dataPath }) {
-  const scanner = createCleanupScanner();
-  const lines = readline.createInterface({
-    input: fs.createReadStream(dataPath),
-    crlfDelay: Infinity,
-  });
+export function buildDockerPsqlArgs({
+  postgresImage = PINNED_SUPABASE_POSTGRES_IMAGE,
+  psqlArgs,
+  interactive = false,
+}) {
+  const dockerFlags = [
+    'run',
+    '--rm',
+    ...(interactive ? ['--interactive'] : []),
+    ...DOCKER_HARDENING_FLAGS,
+  ];
+  return [...dockerFlags, postgresImage, ...psqlArgs];
+}
+
+/** Parse the canonical `psql (PostgreSQL) N` version text; returns the major or null. */
+export function parsePsqlMajorVersion(versionText) {
+  const match = /^psql \(PostgreSQL\) (\d+)/.exec(String(versionText ?? '').trim());
+  return match ? Number(match[1]) : null;
+}
+
+/**
+ * Run `psql --version` in the pinned ephemeral image, require the configured
+ * Postgres major, and return the trimmed canonical version text. Any launch,
+ * image, or daemon failure is bounded to a static preflight message that
+ * never reproduces command arguments.
+ */
+export async function preflightDockerPsql({
+  dockerPath,
+  postgresImage = PINNED_SUPABASE_POSTGRES_IMAGE,
+  run,
+  signal,
+}) {
+  let version;
   try {
-    for await (const line of lines) scanner.push(line);
-  } finally {
-    lines.close();
+    const res = await run({
+      command: dockerPath,
+      args: buildDockerPsqlArgs({ postgresImage, psqlArgs: ['--version'] }),
+      stdout: 'collect',
+      stderr: 'collect',
+      signal,
+    });
+    version = (res.stdout ?? '').trim();
+  } catch (err) {
+    throw new HostedRestoreError('Dockerized PostgreSQL client preflight failed', {
+      cause: err,
+      stage: 'preflight',
+    });
   }
-  return scanner.content();
-}
-
-/**
- * Count user-table CREATE statements in a pg_dump schema file. Only plain
- * and UNLOGGED tables count: foreign tables never appear in pg_tables, so
- * including them would make the restored-table lower bound unsound.
- */
-export function countCreateTables(schemaSql) {
-  const matches = schemaSql.match(/^CREATE (?:UNLOGGED )?TABLE\b/gm);
-  return matches ? matches.length : 0;
-}
-
-/**
- * Row-presence probe for one snapshot table: `LIMIT n` proves the restored
- * database holds AT LEAST n rows without a full-table count. Table/schema
- * names come from the verified snapshot and are re-quoted like the cleanup
- * SQL builder; only the row count is numeric.
- */
-export function rowPresenceQuery({ schema, table, rows }) {
-  const quotedSchema = schema.replaceAll('"', '""');
-  const quotedTable = table.replaceAll('"', '""');
-  return `SELECT count(*) FROM (SELECT 1 FROM "${quotedSchema}"."${quotedTable}" LIMIT ${rows}) x`;
+  if (parsePsqlMajorVersion(version) !== POSTGRES_MAJOR_VERSION) {
+    throw new HostedRestoreError(
+      `Dockerized psql must report PostgreSQL ${POSTGRES_MAJOR_VERSION}; refusing to touch the target`,
+      { stage: 'preflight' },
+    );
+  }
+  return version;
 }
 
 /** Read-only psql query; returns trimmed stdout lines. */
-export async function psqlQuery({ psqlPath, dbUrl, query, run, signal }) {
+export async function psqlQuery({
+  dockerPath,
+  postgresImage = PINNED_SUPABASE_POSTGRES_IMAGE,
+  dbUrl,
+  query,
+  run,
+  signal,
+}) {
   const res = await run({
-    command: psqlPath,
-    args: ['-X', '-q', '-t', '-A', '-c', query, dbUrl],
+    command: dockerPath,
+    args: buildDockerPsqlArgs({
+      postgresImage,
+      psqlArgs: ['-X', '-q', '-t', '-A', '-c', query, dbUrl],
+    }),
     secretArgs: [dbUrl, urlPassword(dbUrl)].filter(Boolean),
     stdout: 'collect',
     stderr: 'collect',
@@ -231,9 +276,23 @@ export async function psqlQuery({ psqlPath, dbUrl, query, run, signal }) {
     .filter(Boolean);
 }
 
-/** Read-only connectivity preflight against the hosted target. */
-export async function readOnlyPreflight({ psqlPath, dbUrl, run, signal }) {
-  const lines = await psqlQuery({ psqlPath, dbUrl, query: 'SELECT 1', run, signal });
+/** Read-only connectivity preflight: image/version, then a live target. */
+export async function readOnlyPreflight({
+  dockerPath,
+  postgresImage = PINNED_SUPABASE_POSTGRES_IMAGE,
+  dbUrl,
+  run,
+  signal,
+}) {
+  await preflightDockerPsql({ dockerPath, postgresImage, run, signal });
+  const lines = await psqlQuery({
+    dockerPath,
+    postgresImage,
+    dbUrl,
+    query: 'SELECT 1',
+    run,
+    signal,
+  });
   if (!lines.includes('1')) {
     throw new HostedRestoreError('target database did not answer the read-only preflight', {
       stage: 'preflight',
@@ -287,90 +346,123 @@ async function resetHostedDatabase({ supabasePath, repoRoot, dbUrl, secretArgs, 
 }
 
 /**
- * One transactional psql restore in the documented order. The prepared roles
- * file (existing roles commented) leads; rollback wording is contract.
+ * Lazy restore stdin stream: one file at a time, chunked with backpressure,
+ * each file closed before a single newline separator advances the sequence.
+ * The multi-gigabyte data file is never buffered in full and nothing is ever
+ * bind-mounted into the client container.
  */
-async function applyHostedRestore({ psqlPath, dbUrl, secretArgs, aux, prepared, run, signal }) {
-  const restoreArgs = [
-    '-X',
-    '-v',
-    'ON_ERROR_STOP=1',
-    '--single-transaction',
-    '-f',
+export function createRestoreInputStream(filePaths) {
+  return Readable.from(restoreFileGenerator(filePaths));
+}
+
+async function* restoreFileGenerator(filePaths) {
+  for (const filePath of filePaths) {
+    const file = fs.createReadStream(filePath);
+    try {
+      for await (const chunk of file) yield chunk;
+    } finally {
+      file.destroy();
+    }
+    yield Buffer.from('\n');
+  }
+}
+
+/**
+ * One transactional psql restore in the documented order: prepared roles
+ * (existing roles commented), the three canonical schema artifacts, the
+ * generated cleanup SQL, then decrypted row data. All SQL crosses the
+ * host/container boundary via stdin only (no bind mounts). The rollback
+ * wording distinguishes "SQL was delivered and the transaction rolled back"
+ * from "the transaction never started" (e.g. the container could not even
+ * launch); both leave the target CLEAN because reset ran first.
+ */
+async function applyHostedRestore({
+  dockerPath,
+  postgresImage,
+  dbUrl,
+  secretArgs,
+  aux,
+  prepared,
+  run,
+  signal,
+}) {
+  const input = createRestoreInputStream([
     aux.rolesFile,
-    '-f',
-    path.join(prepared.dir, 'schema.sql'),
-    '-f',
-    path.join(prepared.dir, 'managed-schema.sql'),
-    '-f',
-    path.join(prepared.dir, 'migration-history-schema.sql'),
-    '-f',
+    ...HOSTED_RESTORE_SCHEMA_ARTIFACTS.map((name) => path.join(prepared.dir, name)),
     aux.cleanupFile,
-    '-f',
     prepared.dataPath,
-    dbUrl,
-  ];
+  ]);
+  const delivery = trackInputDelivery(input);
   try {
     await run({
-      command: psqlPath,
-      args: restoreArgs,
+      command: dockerPath,
+      args: buildDockerPsqlArgs({
+        postgresImage,
+        interactive: true,
+        psqlArgs: ['-X', '-v', 'ON_ERROR_STOP=1', '--single-transaction', '-f', '-', dbUrl],
+      }),
       secretArgs,
+      input: delivery.stream,
       stdout: 'inherit',
       stderr: 'collect',
       signal,
     });
   } catch (err) {
     throw new HostedRestoreError(
-      'restore transaction failed and was rolled back; the target is CLEAN after reset — retry from the same verified snapshot',
+      delivery.state.started
+        ? 'restore transaction failed and was rolled back; the target is CLEAN after reset — retry from the same verified snapshot'
+        : 'restore failed before the transaction started; the target is CLEAN after reset — retry from the same verified snapshot',
       { cause: err, stage: 'restore' },
     );
   }
 }
 
 /**
- * The post-restore structural probes: connectivity, public-schema existence,
- * then snapshot-derived expectations. `prepared` is the verified snapshot
- * workspace: the schema-table lower bound comes from `schema.sql` and the
- * row-data presence probes come from the COPY blocks of the decrypted
- * `data.sql`, so the verification always checks what this snapshot actually
- * contains.
+ * Wrap the lazy restore input so the caller can tell whether ANY SQL was
+ * actually delivered to the child before a failure: docker never launching
+ * must not be reported as "the transaction was rolled back".
  */
-export async function buildHostedProbes({ prepared }) {
-  const probes = [
+function trackInputDelivery(input) {
+  const state = { started: false };
+  const stream = Readable.from(
+    (async function* () {
+      for await (const chunk of input) {
+        state.started = true;
+        yield chunk;
+      }
+    })(),
+  );
+  return { stream, state };
+}
+
+/** The post-restore probes: connectivity, public schema, custom triggers. */
+function buildHostedProbes(triggerNames) {
+  return [
     { label: 'connectivity', query: 'SELECT 1', expect: ['1'] },
     {
       label: 'public schema',
       query: "SELECT count(*) FROM pg_namespace WHERE nspname = 'public'",
       expectGtZero: true,
     },
+    {
+      label: 'custom auth triggers',
+      query: `SELECT tgname FROM pg_trigger WHERE tgname IN (${triggerNames.map((t) => `'${t}'`).join(', ')})`,
+      expect: triggerNames,
+    },
   ];
-  const schemaTables = countCreateTables(
-    fs.readFileSync(path.join(prepared.dir, 'schema.sql'), 'utf8'),
-  );
-  if (schemaTables > 0) {
-    probes.push({
-      label: 'snapshot schema tables',
-      query:
-        "SELECT count(*) FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema')",
-      expectAtLeast: schemaTables,
-    });
-  }
-  const { tables } = await scanDataSqlContent({ dataPath: prepared.dataPath });
-  for (const entry of tables) {
-    if (entry.rows === 0) continue;
-    probes.push({
-      label: `rows in ${entry.schema}.${entry.table}`,
-      query: rowPresenceQuery(entry),
-      expectAtLeast: entry.rows,
-    });
-  }
-  return probes;
 }
 
 /** Run every probe and throw on the first missing expectation. */
-async function verifyHostedRestore({ psqlPath, dbUrl, run, signal, probes }) {
+async function verifyHostedRestore({ dockerPath, postgresImage, dbUrl, run, signal, probes }) {
   for (const probe of probes) {
-    const lines = await psqlQuery({ psqlPath, dbUrl, query: probe.query, run, signal });
+    const lines = await psqlQuery({
+      dockerPath,
+      postgresImage,
+      dbUrl,
+      query: probe.query,
+      run,
+      signal,
+    });
     if (probe.expect) {
       for (const wanted of probe.expect) {
         if (!lines.includes(wanted)) {
@@ -379,13 +471,6 @@ async function verifyHostedRestore({ psqlPath, dbUrl, run, signal, probes }) {
             { stage: 'verify' },
           );
         }
-      }
-    } else if (probe.expectAtLeast !== undefined) {
-      const value = Number(lines[0]);
-      if (!Number.isInteger(value) || value < probe.expectAtLeast) {
-        throw new HostedRestoreError(`post-restore verification failed: ${probe.label}`, {
-          stage: 'verify',
-        });
       }
     } else if (probe.expectGtZero && (lines.length === 0 || lines[0] === '0')) {
       throw new HostedRestoreError(`post-restore verification failed: ${probe.label}`, {
@@ -401,14 +486,15 @@ async function verifyHostedRestore({ psqlPath, dbUrl, run, signal, probes }) {
  * `confirm` was already satisfied by the caller.
  */
 export async function executeHostedRestore({
-  environment: _environment,
   config,
   prepared,
-  psqlPath,
+  dockerPath,
+  postgresImage = PINNED_SUPABASE_POSTGRES_IMAGE,
   supabasePath,
   run,
   logger,
   signal,
+  triggerNames = FRAGTRACK_TRIGGERS,
   writeFile = fs.writeFileSync,
 }) {
   const { dbUrl } = config;
@@ -417,7 +503,8 @@ export async function executeHostedRestore({
 
   // 1. Duplicate-role preparation against the live target (read-only query).
   const recentRoles = await psqlQuery({
-    psqlPath,
+    dockerPath,
+    postgresImage,
     dbUrl,
     query: 'SELECT rolname FROM pg_roles',
     run,
@@ -428,21 +515,30 @@ export async function executeHostedRestore({
   // 2. Clean the target (`db reset` from this repository's minimal workdir).
   await resetHostedDatabase({ supabasePath, repoRoot, dbUrl, secretArgs, run, signal });
 
-  // 3. One transactional psql restore in the documented order.
-  await applyHostedRestore({ psqlPath, dbUrl, secretArgs, aux, prepared, run, signal });
+  // 3. One transactional Dockerized psql restore in the documented order.
+  await applyHostedRestore({
+    dockerPath,
+    postgresImage,
+    dbUrl,
+    secretArgs,
+    aux,
+    prepared,
+    run,
+    signal,
+  });
 
-  // 4. Post-restore structural verification (connectivity, public schema)
-  //    plus snapshot-derived schema and row-data presence checks.
+  // 4. Post-restore verification.
   await verifyHostedRestore({
-    psqlPath,
+    dockerPath,
+    postgresImage,
     dbUrl,
     run,
     signal,
-    probes: await buildHostedProbes({ prepared }),
+    probes: buildHostedProbes(triggerNames),
   });
 
   logger.status(
-    `restored ${config.environment}: snapshot verified, reset applied, single-transaction restore committed, post-checks and snapshot row-data presence passed`,
+    `restored ${config.environment}: snapshot verified, reset applied, single-transaction restore committed, post-checks passed`,
   );
   return {
     rolesSkipped: aux.rolesSkipped,

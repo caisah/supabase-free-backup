@@ -2,57 +2,43 @@
  * Private local snapshot store for `backup:local`.
  *
  * Owns the fixed `local-backups/<environment>/` tree, a per-environment
- * lock, read-only local-stack connectivity/state checks (backed by a held
- * PostgreSQL write barrier during the dump window), the validated
+ * lock, read-only local-stack connectivity/state checks, the validated
  * existing-snapshot scan, and publish-before-retention finalization. The
- * local stack is READ-ONLY outside the dump window: nothing starts, stops,
- * resets, or migrates it, and no R2 adapter or hosted DB connection is
- * imported.
+ * local stack is READ-ONLY here: nothing starts, stops, resets, or migrates
+ * it, and no R2 adapter or hosted DB connection is imported.
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { PassThrough } from 'node:stream';
 import { isValidSnapshotId } from './fingerprint.js';
-import { MANIFEST_NAME, validatePackagedDirectory, sameEncryptedContent } from './snapshot.js';
-import { localPsqlQuery } from './local-project.js';
+import { MANIFEST_NAME, validatePackagedDirectory, sameSnapshotContent } from './snapshot.js';
+import { localPsqlQuery } from './local-restore.js';
+import {
+  LOCAL_BACKUP_DIRECTORY_NAME,
+  PRIVATE_DIRECTORY_MODE,
+  PRIVATE_FILE_MODE,
+  privateDirectoryProblem,
+  privateSnapshotProblem,
+} from './local-store.js';
 
-export const LOCAL_BACKUP_DIRECTORY_NAME = 'local-backups';
+export { LOCAL_BACKUP_DIRECTORY_NAME };
 
-const PRIVATE_DIRECTORY_MODE = 0o700;
-const PRIVATE_FILE_MODE = 0o600;
 const CANDIDATE_PREFIX = '.candidate-';
-const CANDIDATE_SUFFIX_LENGTH = 16;
-const CANDIDATE_NAME_PATTERN = new RegExp(
-  `^${CANDIDATE_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[0-9a-f]{${CANDIDATE_SUFFIX_LENGTH}}$`,
-);
+const CANDIDATE_NAME_PATTERN = /^\.candidate-[0-9a-f]{16}$/;
 const DATABASE_STATE_PATTERN = /^[0-9a-f]{32}\|[0-9a-f]{32}\|[0-9a-f]{32}\|[0-9a-f]{32}$/;
-
-/**
- * The single declaration of the local consistency-guard scope: every
- * non-system schema. The CLI dumps every user schema (data dump excludes
- * only two storage tables), so a guard that excludes any application or
- * managed schema would silently stop watching dump content; declaring the
- * scope as a superset here makes drift from the dump commands impossible.
- */
-const USER_NAMESPACE_PREDICATE = "nspname !~ '^pg_' AND nspname <> 'information_schema'";
-
-/** Session-scoped advisory key proving the barrier holder is alive. */
-const BARRIER_ADVISORY_LOCK = Object.freeze({ classid: 1900701, objid: 424201 });
-/**
- * State token over the FULL consistency-guard scope (all non-system
- * schemas): per-relation mutation counters, catalog row xmins, sequence
- * values, roles, role memberships, default privileges, and per-database role
- * settings. It is a backstop to the SHARE-mode write barrier: the barrier
- * blocks row writes during the dump window, and this token rejects the
- * candidate if any sequence/catalog/role state moves anyway.
- */
 const LOCAL_DATABASE_STATE_QUERY = `
 WITH relevant_namespaces AS (
   SELECT oid, nspname, xmin::text AS row_xmin
   FROM pg_namespace
-  WHERE ${USER_NAMESPACE_PREDICATE}
+  WHERE nspname !~ '^pg_'
+    AND nspname NOT IN (
+      'information_schema', 'graphql', 'graphql_public', 'pgsodium', 'pgsodium_masks',
+      'pgtle', 'repack', 'tiger', 'tiger_data', 'topology', 'vault', 'etl',
+      'extensions', 'pgbouncer', 'realtime', '_analytics', '_realtime', '_supavisor'
+    )
+    AND nspname NOT LIKE 'timescaledb_%'
+    AND nspname NOT LIKE '_timescaledb_%'
 ), relation_state AS (
   SELECT md5(COALESCE(
     string_agg(to_jsonb(relation_row)::text, E'\\n' ORDER BY schema_name, relation_name),
@@ -169,28 +155,6 @@ WITH relevant_namespaces AS (
       ) AS role_row
     ), '') || E'\\n' ||
     COALESCE((
-      SELECT string_agg(to_jsonb(member_row)::text, E'\\n' ORDER BY roleid, member)
-      FROM (
-        SELECT roleid,
-               member,
-               grantor,
-               admin_option,
-               inherit_option,
-               set_option
-        FROM pg_auth_members
-      ) AS member_row
-    ), '') || E'\\n' ||
-    COALESCE((
-      SELECT string_agg(to_jsonb(acl_row)::text, E'\\n' ORDER BY defaclrole, defaclnamespace, defaclobjtype)
-      FROM (
-        SELECT defaclrole,
-               defaclnamespace,
-               defaclobjtype,
-               defaclacl
-        FROM pg_default_acl
-      ) AS acl_row
-    ), '') || E'\\n' ||
-    COALESCE((
       SELECT string_agg(to_jsonb(setting_row)::text, E'\\n' ORDER BY setdatabase, setrole)
       FROM (
         SELECT setdatabase, setrole, setconfig
@@ -203,60 +167,8 @@ SELECT relation_state.token || '|' || catalog_state.token || '|' ||
        sequence_state.token || '|' || role_state.token
 FROM relation_state, catalog_state, sequence_state, role_state`;
 
-/**
- * True only when the barrier is fully ready: the holder's advisory marker is
- * granted (holder alive and script started) AND no SHARE-mode relation lock
- * is still waiting. A pending SHARE request means an in-flight writer holds
- * a conflicting lock, so the dumps must not start yet; once granted, every
- * pre-existing writer has committed and is part of all six dumps.
- */
-const LOCAL_DATABASE_BARRIER_READY_QUERY = `
-SELECT
-  (SELECT NOT bool_or(NOT granted)
-     FROM pg_locks
-    WHERE locktype = 'advisory'
-      AND classid = ${BARRIER_ADVISORY_LOCK.classid}
-      AND objid = ${BARRIER_ADVISORY_LOCK.objid}
-      AND pid <> pg_backend_pid()) = 't'
-  AND NOT EXISTS (
-    SELECT 1 FROM pg_locks
-    WHERE locktype = 'relation' AND mode = 'ShareLock' AND NOT granted
-  )
-`;
-
-/** psql script fed to the held-open barrier session (block writers, allow readers). */
-export function buildLocalDatabaseBarrierScript() {
-  return [
-    'BEGIN;',
-    `SELECT pg_advisory_lock(${BARRIER_ADVISORY_LOCK.classid}, ${BARRIER_ADVISORY_LOCK.objid});`,
-    'DO $block$',
-    'DECLARE',
-    '  lock_sql text;',
-    'BEGIN',
-    "  SELECT 'LOCK TABLE ' || string_agg(format('%I.%I', ns.nspname, c.relname), ', ') || ' IN SHARE MODE'",
-    '    INTO lock_sql',
-    '    FROM pg_class AS c',
-    `    JOIN (SELECT oid, nspname FROM pg_namespace WHERE ${USER_NAMESPACE_PREDICATE}) AS ns`,
-    '      ON ns.oid = c.relnamespace',
-    "   WHERE c.relkind IN ('r', 'p', 'm');",
-    '  IF lock_sql IS NOT NULL THEN',
-    '    EXECUTE lock_sql;',
-    '  END IF;',
-    'END',
-    '$block$;',
-    '\\echo LOCKS-HELD',
-    '',
-  ].join('\n');
-}
-
 export const LOCAL_DATABASE_CHANGED_MESSAGE =
   'local database changed while the backup was being dumped; no snapshot was published; retry when local writes are quiesced';
-
-export const LOCAL_DB_PORT_MISMATCH_MESSAGE =
-  'the local database port from supabase/config.toml is not published by the derived container; the dump would target a different server than the one probed; start the stack with the config.toml port and retry';
-
-export const LOCAL_DATABASE_BARRIER_FAILED_MESSAGE =
-  'cannot establish the local database write barrier; no snapshot was published';
 
 export class LocalBackupError extends Error {
   constructor(message, { cause, stage } = {}) {
@@ -269,7 +181,7 @@ export class LocalBackupError extends Error {
 
 /** Static offline guidance; never echoes addresses or credentials. */
 export const LOCAL_STACK_OFFLINE_MESSAGE =
-  'local stack is not reachable; start the local stack in the project workdir (supabase start) and retry';
+  'local stack is not reachable; start the local stack in the Fragtrack workdir (supabase start) and retry';
 
 /**
  * Read-only connectivity gate: require the already-running local stack to
@@ -289,154 +201,11 @@ export async function assertLocalStackRunning({ dockerPath, dbContainer, run, si
 }
 
 /**
- * Verify the container derived from `project_id` actually publishes the
- * config.toml `[db] port` on the host. The connectivity/state probes run
- * inside the container (`docker exec`) while the six dumps connect to
- * `127.0.0.1:<port>`, so the publication mapping is what proves both routes
- * reach the SAME database server. Fails closed before any state probe or
- * dump when the mapping is missing or points at a different port.
- */
-export async function assertLocalDbPortPublished({ dockerPath, dbContainer, dbPort, run }) {
-  let stdout;
-  try {
-    const res = await run({
-      command: dockerPath,
-      args: ['port', dbContainer, `${dbPort}/tcp`],
-      stdout: 'collect',
-      stderr: 'collect',
-    });
-    stdout = res.stdout ?? '';
-  } catch (err) {
-    throw new LocalBackupError(LOCAL_DB_PORT_MISMATCH_MESSAGE, { cause: err, stage: 'connect' });
-  }
-  const published = stdout
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (!published.some((line) => line.endsWith(`:${dbPort}`))) {
-    throw new LocalBackupError(LOCAL_DB_PORT_MISMATCH_MESSAGE, { stage: 'connect' });
-  }
-  return published;
-}
-
-/**
- * Hold a PostgreSQL write barrier for the dump window.
- *
- * A held-open `docker exec -i` psql session runs `buildLocalDatabaseBarrierScript`:
- * a transactional SHARE lock on every user table (SHARE blocks INSERT/UPDATE/
- * DELETE/TRUNCATE/DROP while remaining compatible with the ACCESS SHARE locks
- * pg_dump takes) plus a session advisory marker. Row writes cannot commit
- * between the six dumps anymore; the state token remains as the backstop for
- * sequences, catalog changes, and role state. Returns an idempotent
- * `release()` that ends the session (EOF) and surfaces a lost barrier as an
- * error so no mixed-state candidate can be published.
- */
-export async function acquireLocalDatabaseBarrier({
-  dockerPath,
-  dbContainer,
-  run,
-  signal,
-  timeoutMs = 30_000,
-  pollIntervalMs = 250,
-}) {
-  const input = new PassThrough();
-  let holderFailure = null;
-  const holder = run({
-    command: dockerPath,
-    args: [
-      'exec',
-      '-i',
-      dbContainer,
-      'psql',
-      '-U',
-      'postgres',
-      '-d',
-      'postgres',
-      '-v',
-      'ON_ERROR_STOP=1',
-    ],
-    input,
-    stdout: 'collect',
-    stderr: 'collect',
-    signal,
-  });
-  holder.catch((err) => {
-    holderFailure = err;
-  });
-  const deadline = Date.now() + timeoutMs;
-  try {
-    while (true) {
-      if (holderFailure) {
-        throw new LocalBackupError(LOCAL_DATABASE_BARRIER_FAILED_MESSAGE, {
-          cause: holderFailure,
-          stage: 'consistency',
-        });
-      }
-      if (signal?.aborted) {
-        throw new LocalBackupError(LOCAL_DATABASE_BARRIER_FAILED_MESSAGE, {
-          stage: 'consistency',
-        });
-      }
-      const lines = await localPsqlQuery({
-        dockerPath,
-        dbContainer,
-        query: LOCAL_DATABASE_BARRIER_READY_QUERY,
-        run,
-        signal,
-      });
-      if (lines[0] === 't') {
-        return {
-          release: makeBarrierRelease({ input, holder }),
-        };
-      }
-      if (Date.now() >= deadline) {
-        throw new LocalBackupError(
-          'the local database write barrier could not be established before the timeout; no snapshot was published',
-          { stage: 'consistency' },
-        );
-      }
-      await delay(pollIntervalMs);
-    }
-  } catch (err) {
-    // The holder exits when its stdin closes; never await it here so the
-    // failure path cannot hang (its rejection is already observed above).
-    input.end();
-    if (err instanceof LocalBackupError) throw err;
-    throw new LocalBackupError(LOCAL_DATABASE_BARRIER_FAILED_MESSAGE, {
-      cause: err,
-      stage: 'consistency',
-    });
-  }
-}
-
-/** Idempotent release: EOF the holder session and require a clean exit. */
-function makeBarrierRelease({ input, holder }) {
-  let released = false;
-  return async () => {
-    if (released) return;
-    released = true;
-    input.end();
-    try {
-      await holder;
-    } catch (err) {
-      throw new LocalBackupError(
-        'the local database write barrier was lost while the backup ran; no snapshot was published',
-        { cause: err, stage: 'consistency' },
-      );
-    }
-  };
-}
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * Capture the state token around the six dumps as the backstop to the write
- * barrier: relation mutation counters plus relation/catalog, sequence, role,
- * role-membership, and default-privilege digests over every non-system
- * schema. Any movement rejects the candidate rather than publishing
- * mixed-state files.
+ * Capture a conservative, database-local state token around the six dumps.
+ * It combines relevant-table mutation counters with relation/catalog,
+ * sequence, role, and role-setting digests. This avoids cluster-wide false positives
+ * while covering ordinary MVCC writes and dump-relevant non-row state. Any
+ * change rejects the candidate rather than publishing mixed-state files.
  */
 export async function readLocalDatabaseState({ dockerPath, dbContainer, run, signal }) {
   let lines;
@@ -471,27 +240,9 @@ export function assertLocalDatabaseStateUnchanged(before, after) {
 
 /** Reject a path that is a symlink or not a directory. */
 function assertRealDirectory(dir, label) {
-  let stat;
-  try {
-    stat = fs.lstatSync(dir);
-  } catch {
-    throw new LocalBackupError(`${label} is not a directory: ${dir}`);
-  }
-  if (stat.isSymbolicLink() || !stat.isDirectory()) {
-    throw new LocalBackupError(`${label} must be a real directory, not a symlink or file: ${dir}`);
-  }
-  return stat;
-}
-
-/** Require the documented private directory mode on POSIX. */
-function assertPrivateDirectoryMode(stat, label) {
-  if (process.platform !== 'win32' && (stat.mode & 0o777) !== PRIVATE_DIRECTORY_MODE) {
-    throw new LocalBackupError(
-      `${label} has unsafe permissions; require mode 0700 before running backup:local`,
-      { stage: 'permissions' },
-    );
-  }
-  return stat;
+  const problem = privateDirectoryProblem(dir, label);
+  if (problem) throw new LocalBackupError(problem);
+  return fs.lstatSync(dir);
 }
 
 /** Create the directory privately only when it does not exist yet. */
@@ -507,7 +258,7 @@ function ensureRealDirectory(dir, label) {
     fs.mkdirSync(dir, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
     fs.chmodSync(dir, PRIVATE_DIRECTORY_MODE);
   }
-  return assertPrivateDirectoryMode(assertRealDirectory(dir, label), label);
+  return assertRealDirectory(dir, label);
 }
 
 /**
@@ -578,26 +329,14 @@ export function openLocalBackupStore({ repoRoot, environment }) {
     fs.fsyncSync(lockFd);
     lockIdentity = fs.fstatSync(lockFd);
   } catch (err) {
-    // Preserve the ORIGINAL initialization error even when the cleanup of
-    // the half-initialized lock also fails: losing either the close or the
-    // removal error would hide a real filesystem failure behind the init
-    // fault (or vice versa).
-    const cleanupFailures = [];
     try {
       fs.closeSync(lockFd);
-    } catch (closeErr) {
-      cleanupFailures.push(closeErr);
-    }
-    lockFd = null;
-    try {
+    } finally {
+      lockFd = null;
       fs.rmSync(lockPath, { force: true });
-    } catch (rmErr) {
-      cleanupFailures.push(rmErr);
     }
-    const cause =
-      cleanupFailures.length > 0 ? new AggregateError([err, ...cleanupFailures], err.message) : err;
     throw new LocalBackupError('cannot initialize the local backup lock', {
-      cause,
+      cause: err,
       stage: 'lock',
     });
   }
@@ -685,17 +424,11 @@ export function openLocalBackupStore({ repoRoot, environment }) {
 
 /** Require private modes for every retained local snapshot path. */
 function assertPrivateSnapshotModes(dir, manifest) {
-  if (process.platform === 'win32') return;
-  assertPrivateDirectoryMode(fs.lstatSync(dir), 'completed local snapshot directory');
-  for (const name of [...manifest.files.map((file) => file.name), MANIFEST_NAME]) {
-    const stat = fs.lstatSync(path.join(dir, name));
-    if ((stat.mode & 0o777) !== PRIVATE_FILE_MODE) {
-      throw new LocalBackupError(
-        `completed local snapshot file has unsafe permissions: ${name}; require mode 0600`,
-        { stage: 'permissions' },
-      );
-    }
-  }
+  const problem = privateSnapshotProblem(dir, [
+    ...manifest.files.map((file) => file.name),
+    MANIFEST_NAME,
+  ]);
+  if (problem) throw new LocalBackupError(problem, { stage: 'permissions' });
 }
 
 /**
@@ -750,10 +483,7 @@ export async function scanLocalBackupSnapshots({ environmentDir, environment }) 
 export function createLocalBackupCandidate({ environmentDir }) {
   let candidateDir = null;
   for (let attempt = 0; attempt < 8; attempt++) {
-    // One declared format: the prefix constant, the 16-hex suffix length,
-    // and the canonical pattern are all derived from the same literals so a
-    // format change can never desynchronize the generator and the validator.
-    const name = `${CANDIDATE_PREFIX}${randomUUID().replaceAll('-', '').slice(0, CANDIDATE_SUFFIX_LENGTH)}`;
+    const name = `${CANDIDATE_PREFIX}${randomUUID().replaceAll('-', '').slice(0, 16)}`;
     const dir = path.join(environmentDir, name);
     try {
       fs.mkdirSync(dir, { mode: PRIVATE_DIRECTORY_MODE });
@@ -875,21 +605,17 @@ export async function finalizeLocalBackup({
 
 function sameContentAndRef(leftManifest, rightManifest) {
   return (
-    sameEncryptedContent(leftManifest, rightManifest) &&
+    sameSnapshotContent(leftManifest, rightManifest) &&
     leftManifest.sourceProjectRef === rightManifest.sourceProjectRef
   );
 }
 
-/** lstat-based existence that also sees dangling symlinks; only absence hides. */
+/** lstat-based existence that also sees dangling symlinks. */
 function pathExists(filePath) {
   try {
     fs.lstatSync(filePath);
     return true;
-  } catch (err) {
-    // A permission or I/O failure is NOT "absent": rethrow so the caller's
-    // "refusing to overwrite" path never misreports a broken destination as
-    // a free one.
-    if (err.code === 'ENOENT') return false;
-    throw err;
+  } catch {
+    return false;
   }
 }

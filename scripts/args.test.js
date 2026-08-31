@@ -124,6 +124,43 @@ test('args: hosted restore help forms do not require a target', () => {
   assert.deepEqual(parseHostedRestoreArgs(['-h']), { help: true });
 });
 
+test('args: hosted restore accepts the local store source', () => {
+  assert.deepEqual(
+    parseHostedRestoreArgs(['development', '--source', 'local', '--backup', 'latest']),
+    { target: 'development', source: 'local', backup: 'latest' },
+  );
+  assert.deepEqual(parseHostedRestoreArgs(['production', '--source', 'local', '--backup', ID]), {
+    target: 'production',
+    source: 'local',
+    backup: ID,
+  });
+});
+
+test('args: hosted restore rejects untrusted source values', () => {
+  for (const source of ['s3', 'LOCAL', 'r2 repo', '', 'local/']) {
+    assert.throws(
+      () => parseHostedRestoreArgs(['development', '--source', source, '--backup', 'latest']),
+      /r2\|repo\|local/,
+      source,
+    );
+  }
+});
+
+test('args: local restore still rejects the local source', () => {
+  assert.throws(
+    () =>
+      parseLocalRestoreArgs([
+        '--environment',
+        'development',
+        '--source',
+        'local',
+        '--backup',
+        'latest',
+      ]),
+    /r2\|repo/,
+  );
+});
+
 test('args: hosted restore rejects missing, invalid, or duplicated targets', () => {
   assert.throws(() => parseHostedRestoreArgs([]), /development\|production/);
   assert.throws(

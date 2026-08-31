@@ -9,12 +9,18 @@ import {
   readOnlyPreflight,
   executeHostedRestore,
   psqlQuery,
+  buildDockerPsqlArgs,
+  preflightDockerPsql,
+  createRestoreInputStream,
   confirmationSummary,
   HostedRestoreError,
-  buildHostedProbes,
-  scanDataSqlContent,
-  countCreateTables,
+  FRAGTRACK_TRIGGERS,
+  HOSTED_RESTORE_SCHEMA_ARTIFACTS,
+  parsePsqlMajorVersion,
 } from './hosted-restore.js';
+import { PINNED_SUPABASE_POSTGRES_IMAGE } from './database.js';
+import { PLAINTEXT_ARTIFACTS } from './snapshot.js';
+import { runCommand } from './process.js';
 import { tmpdir, writePrivateFile } from './test-fixtures.js';
 import { confirmExactPhrase } from './hosted-restore.js';
 
@@ -25,10 +31,219 @@ const ROLES_SQL = [
   'SET statement_timeout = 0;',
   'CREATE ROLE "anon";',
   'ALTER ROLE "anon" WITH NOLOGIN;',
-  'CREATE ROLE "application_user";',
-  'ALTER ROLE "application_user" WITH LOGIN;',
+  'CREATE ROLE "fragtrack_custom";',
+  'ALTER ROLE "fragtrack_custom" WITH LOGIN;',
   'GRANT USAGE ON SCHEMA "public" TO "anon";',
 ].join('\n');
+
+test('hosted: a restore input read failure rejects through the real process runner', async () => {
+  // End-to-end through the PRODUCTION process seam (runCommand), not a mock
+  // run: the child is a psql-like process that commits (exits 0) when its
+  // stdin reaches EOF, and the data file vanishes before the lazy generator
+  // opens it. A partial SQL prefix must never be reported as success.
+  const root = tmpdir('bp-hosted-');
+  const prepared = {
+    dir: path.join(root, 'prepared'),
+    dataPath: path.join(root, 'prepared', 'data.sql'),
+  };
+  fs.mkdirSync(prepared.dir, { mode: 0o700 });
+  // The fake "docker" is an executable psql-like child: it ignores the
+  // docker argv and behaves like `psql --single-transaction -f -` (commit
+  // and exit 0 on stdin EOF).
+  const fakeDocker = path.join(root, 'fake-docker');
+  fs.writeFileSync(
+    fakeDocker,
+    '#!/usr/bin/env node\nprocess.stdin.resume();\nprocess.stdin.on("end", () => process.exit(0));\n',
+    { mode: 0o755 },
+  );
+  // The fake "supabase" deletes the data file when `db reset` runs, i.e.
+  // AFTER cleanup generation but BEFORE the lazy restore stream opens it.
+  const fakeSupabase = path.join(root, 'fake-supabase');
+  fs.writeFileSync(
+    fakeSupabase,
+    `#!/usr/bin/env node\nrequire('fs').rmSync(${JSON.stringify(prepared.dataPath)});\nprocess.exit(0);\n`,
+    { mode: 0o755 },
+  );
+  writePrivateFile(path.join(prepared.dir, 'roles.sql'), ROLES_SQL);
+  writePrivateFile(path.join(prepared.dir, 'schema.sql'), 'CREATE TABLE public.t();\n');
+  writePrivateFile(path.join(prepared.dir, 'managed-schema.sql'), '-- triggers\n');
+  writePrivateFile(path.join(prepared.dir, 'migration-history-schema.sql'), '-- history\n');
+  writePrivateFile(prepared.dataPath, 'COPY "public"."t" FROM stdin;\n1\n\\.\n');
+  await assert.rejects(
+    () =>
+      executeHostedRestore({
+        environment: 'development',
+        config: { dbUrl: DB_URL, environment: 'development', repoRoot: root },
+        prepared,
+        dockerPath: fakeDocker,
+        supabasePath: fakeSupabase,
+        run: runCommand,
+        logger: {
+          status: () => {},
+          warn: () => {},
+          error: () => {},
+          addSecret: () => {},
+          redact: (t) => t,
+        },
+      }),
+    (err) =>
+      err instanceof HostedRestoreError &&
+      /rolled back/.test(err.message) &&
+      /CLEAN/.test(err.message),
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('hosted: restore-order artifacts are explicit and independent of the packaging list', () => {
+  assert.deepEqual(HOSTED_RESTORE_SCHEMA_ARTIFACTS, [
+    'schema.sql',
+    'managed-schema.sql',
+    'migration-history-schema.sql',
+  ]);
+  // Today the two lists coincide after the leading roles.sql; the hosted
+  // restore order must NEVER silently follow packaging reorders, so the
+  // contract is pinned here.
+  assert.deepEqual(HOSTED_RESTORE_SCHEMA_ARTIFACTS, PLAINTEXT_ARTIFACTS.slice(1));
+});
+
+test('hosted: restore order is decoupled from PLAINTEXT_ARTIFACTS', async () => {
+  const root = tmpdir('bp-hosted-');
+  const prepared = {
+    dir: path.join(root, 'prepared'),
+    dataPath: path.join(root, 'prepared', 'data.sql'),
+  };
+  fs.mkdirSync(prepared.dir, { mode: 0o700 });
+  writePrivateFile(path.join(prepared.dir, 'roles.sql'), ROLES_SQL);
+  writePrivateFile(path.join(prepared.dir, 'schema.sql'), 'CREATE TABLE public.t();\n');
+  writePrivateFile(path.join(prepared.dir, 'managed-schema.sql'), '-- triggers\n');
+  writePrivateFile(path.join(prepared.dir, 'migration-history-schema.sql'), '-- history\n');
+  writePrivateFile(prepared.dataPath, 'COPY "public"."t" FROM stdin;\n1\n\\.\n');
+  // Simulate packaging drift: an extra plaintext artifact must NOT be
+  // injected into the transactional restore stream.
+  writePrivateFile(path.join(prepared.dir, 'drift.sql'), '-- DRIFT_MARKER\n');
+  PLAINTEXT_ARTIFACTS.push('drift.sql');
+  const streamed = [];
+  try {
+    async function run(opts) {
+      if (opts.input) {
+        let all = '';
+        for await (const chunk of opts.input) all += chunk.toString();
+        streamed.push(all);
+      }
+      if (opts.args[1] === 'reset') return { stdout: '' };
+      if (opts.args.includes('--single-transaction')) return { stdout: '' };
+      const cIdx = opts.args.indexOf('-c');
+      const query = cIdx !== -1 ? opts.args[cIdx + 1] : null;
+      if (query === 'SELECT 1') return { stdout: '1\n' };
+      if (query?.startsWith('SELECT rolname')) return { stdout: 'postgres\n' };
+      if (query?.includes('pg_namespace')) return { stdout: '1\n' };
+      if (query?.includes('pg_trigger'))
+        return { stdout: 'create_account_for_new_user\ncleanup_deleted_user_vouches\n' };
+      return { stdout: '' };
+    }
+    await executeHostedRestore({
+      environment: 'development',
+      config: { dbUrl: DB_URL, environment: 'development', repoRoot: root },
+      prepared,
+      dockerPath: '/docker',
+      supabasePath: '/supabase',
+      run,
+      logger: {
+        status: () => {},
+        warn: () => {},
+        error: () => {},
+        addSecret: () => {},
+        redact: (t) => t,
+      },
+    });
+  } finally {
+    PLAINTEXT_ARTIFACTS.pop();
+  }
+  assert.equal(streamed.length, 1, 'exactly one streamed restore input');
+  assert.ok(
+    !streamed[0].includes('DRIFT_MARKER'),
+    'a packaging-list addition must never change the restore stream',
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('hosted: the ephemeral client uses default networking and a writable /tmp scratch', () => {
+  for (const args of [
+    buildDockerPsqlArgs({ psqlArgs: ['--version'] }),
+    buildDockerPsqlArgs({
+      psqlArgs: ['-X', '-f', '-', 'dburl'],
+      interactive: true,
+    }),
+  ]) {
+    assert.ok(
+      !args.includes('--network=host'),
+      'host networking must never be requested: default bridge networking already reaches the remote target',
+    );
+    const tmpIdx = args.indexOf('--tmpfs');
+    assert.ok(tmpIdx !== -1 && args[tmpIdx + 1] === '/tmp', 'writable /tmp scratch required');
+  }
+});
+
+test('hosted: restore input stream yields only Buffer chunks', async () => {
+  const root = tmpdir('bp-hosted-');
+  const file = path.join(root, 'a.sql');
+  writePrivateFile(file, 'AAA');
+  const input = createRestoreInputStream([file]);
+  for await (const chunk of input) {
+    assert.ok(Buffer.isBuffer(chunk), 'every chunk must be a Buffer (no mixed string chunks)');
+  }
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('hosted: parsePsqlMajorVersion parses canonical version text and rejects garbage', () => {
+  assert.equal(parsePsqlMajorVersion('psql (PostgreSQL) 17.6\n'), 17);
+  assert.equal(parsePsqlMajorVersion('psql (PostgreSQL) 16.4'), 16);
+  assert.equal(parsePsqlMajorVersion('not psql output'), null);
+  assert.equal(parsePsqlMajorVersion(''), null);
+});
+
+test('hosted: a Docker launch failure before any SQL is delivered is not reported as a rollback', async () => {
+  const root = tmpdir('bp-hosted-');
+  const prepared = { dir: root, dataPath: path.join(root, 'data.sql') };
+  writePrivateFile(path.join(prepared.dir, 'roles.sql'), ROLES_SQL);
+  writePrivateFile(path.join(prepared.dir, 'schema.sql'), '');
+  writePrivateFile(path.join(prepared.dir, 'managed-schema.sql'), '');
+  writePrivateFile(path.join(prepared.dir, 'migration-history-schema.sql'), '');
+  writePrivateFile(prepared.dataPath, '');
+  async function run(opts) {
+    if (opts.args[1] === 'reset') return { stdout: '' };
+    // The container never launches (daemon unreachable): the restore input
+    // stream is never even consumed, so no transaction could have started.
+    if (opts.args.includes('--single-transaction')) {
+      throw new Error('docker daemon unreachable');
+    }
+    return { stdout: '' };
+  }
+  await assert.rejects(
+    () =>
+      executeHostedRestore({
+        environment: 'development',
+        config: { dbUrl: DB_URL, environment: 'development', repoRoot: root },
+        prepared,
+        dockerPath: '/docker',
+        supabasePath: '/supabase',
+        run,
+        logger: {
+          status: () => {},
+          warn: () => {},
+          error: () => {},
+          addSecret: () => {},
+          redact: (t) => t,
+        },
+      }),
+    (err) =>
+      err instanceof HostedRestoreError &&
+      /before the transaction started/.test(err.message) &&
+      !/rolled back/.test(err.message) &&
+      /CLEAN/.test(err.message),
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
 
 test('hosted: duplicate roles are commented narrowly, others untouched', () => {
   const out = prepareRolesFile({ rolesSql: ROLES_SQL, existingRoles: ['anon'] });
@@ -40,11 +255,11 @@ test('hosted: duplicate roles are commented narrowly, others untouched', () => {
     'ALTER preserved',
   );
   assert.ok(
-    lines.some((l) => !l.startsWith('--') && l.includes('CREATE ROLE "application_user"')),
+    lines.some((l) => !l.startsWith('--') && l.includes('CREATE ROLE "fragtrack_custom"')),
     'new role kept active',
   );
   assert.ok(
-    lines.some((l) => l.includes('ALTER ROLE "application_user" WITH LOGIN')),
+    lines.some((l) => l.includes('ALTER ROLE "fragtrack_custom" WITH LOGIN')),
     'its ALTER preserved',
   );
   assert.ok(
@@ -70,11 +285,11 @@ test('hosted: unexpected role creation syntax fails instead of broad replacement
 
 test('hosted: cleanup SQL parses quoted COPY targets, decodes, dedupes', () => {
   const dataSql = [
-    'COPY "public"."records" ("id", "value") FROM stdin;',
-    '1\talpha\n\\.',
+    'COPY "public"."perfumes" ("id", "name") FROM stdin;',
+    '1\tRose\n\\.',
     'COPY "auth"."users" ("id") FROM stdin;',
     '\\.',
-    'COPY "public"."records" ("id", "value") FROM stdin;',
+    'COPY "public"."perfumes" ("id", "name") FROM stdin;',
     '\\.',
     'COPY "storage"."buckets" FROM stdin;',
     '\\.',
@@ -91,7 +306,7 @@ test('hosted: cleanup SQL handles escaped quotes and rejects injection', () => {
   const sql = generateCleanupSql({ dataSql: 'COPY "we""ird"."ta""ble" FROM stdin;\n\\.\n' });
   assert.ok(sql.includes('"we""ird"."ta""ble"'));
   assert.throws(
-    () => generateCleanupSql({ dataSql: 'COPY public.records FROM stdin;\n' }),
+    () => generateCleanupSql({ dataSql: 'COPY public.perfumes FROM stdin;\n' }),
     (err) => err instanceof HostedRestoreError && /malformed COPY/.test(err.message),
   );
   assert.throws(
@@ -148,103 +363,6 @@ test('hosted: a wrong phrase prints the expected phrase as immediate feedback', 
   );
 });
 
-test('hosted: snapshot row-data scan counts every COPY block table', async () => {
-  const root = tmpdir('bp-hosted-');
-  const dataPath = path.join(root, 'data.sql');
-  writePrivateFile(
-    dataPath,
-    [
-      'COPY "public"."records" ("id") FROM stdin;',
-      '1',
-      '2',
-      '3',
-      '\\.',
-      'COPY "auth"."users" FROM stdin;',
-      '\\.',
-      'COPY "public"."records" ("id") FROM stdin;',
-      '4',
-      '\\.',
-    ].join('\n'),
-  );
-  const { tables } = await scanDataSqlContent({ dataPath });
-  assert.deepEqual(tables, [
-    { schema: 'public', table: 'records', rows: 4 },
-    { schema: 'auth', table: 'users', rows: 0 },
-  ]);
-  fs.rmSync(root, { recursive: true, force: true });
-});
-
-test('hosted: CREATE TABLE counting covers plain and unlogged tables only', () => {
-  const sql = [
-    'CREATE TABLE public.a (id int);',
-    'CREATE UNLOGGED TABLE public.b (id int);',
-    'CREATE FOREIGN TABLE public.c (id int) SERVER s;',
-    'CREATE VIEW public.v AS SELECT 1;',
-  ].join('\n');
-  assert.equal(countCreateTables(sql), 2);
-  assert.equal(countCreateTables('-- CREATE TABLE comment\n'), 0);
-  assert.equal(countCreateTables(''), 0);
-});
-
-test('hosted: post-restore probes derive schema and row-data expectations from snapshot content', async () => {
-  const root = tmpdir('bp-hosted-');
-  const prepared = {
-    dir: path.join(root, 'prepared'),
-    dataPath: path.join(root, 'prepared', 'data.sql'),
-  };
-  fs.mkdirSync(prepared.dir, { mode: 0o700 });
-  writePrivateFile(
-    path.join(prepared.dir, 'schema.sql'),
-    'CREATE TABLE public.a (id int);\nCREATE TABLE public.b (id int);\n',
-  );
-  writePrivateFile(
-    prepared.dataPath,
-    'COPY "public"."a" FROM stdin;\n1\n2\n\\.\nCOPY "auth"."users" FROM stdin;\n3\n\\.\n',
-  );
-  const probes = await buildHostedProbes({ prepared });
-  assert.deepEqual(
-    probes.map((p) => p.label),
-    [
-      'connectivity',
-      'public schema',
-      'snapshot schema tables',
-      'rows in public.a',
-      'rows in auth.users',
-    ],
-  );
-  const schemaProbe = probes[2];
-  assert.equal(schemaProbe.expectAtLeast, 2);
-  assert.match(schemaProbe.query, /pg_tables/);
-  assert.match(
-    schemaProbe.query,
-    /NOT IN \('pg_catalog','information_schema'\)/,
-    'system schemas excluded from the count',
-  );
-  const rowProbe = probes[3];
-  assert.equal(rowProbe.expectAtLeast, 2);
-  assert.match(rowProbe.query, /FROM "public"\."a" LIMIT 2/);
-  const usersProbe = probes[4];
-  assert.equal(usersProbe.expectAtLeast, 1);
-  fs.rmSync(root, { recursive: true, force: true });
-});
-
-test('hosted: empty snapshots keep only the baseline probes', async () => {
-  const root = tmpdir('bp-hosted-');
-  const prepared = {
-    dir: path.join(root, 'prepared'),
-    dataPath: path.join(root, 'prepared', 'data.sql'),
-  };
-  fs.mkdirSync(prepared.dir, { mode: 0o700 });
-  writePrivateFile(path.join(prepared.dir, 'schema.sql'), '');
-  writePrivateFile(prepared.dataPath, '');
-  const probes = await buildHostedProbes({ prepared });
-  assert.deepEqual(
-    probes.map((p) => p.label),
-    ['connectivity', 'public schema'],
-  );
-  fs.rmSync(root, { recursive: true, force: true });
-});
-
 test('hosted: cleanup SQL streams from the data file with identical semantics', async () => {
   const root = tmpdir('bp-hosted-');
   const dataPath = path.join(root, 'data.sql');
@@ -253,8 +371,8 @@ test('hosted: cleanup SQL streams from the data file with identical semantics', 
     [
       'COPY "auth"."users" ("id") FROM stdin;',
       '\\.',
-      'COPY "public"."records" FROM stdin;',
-      '1\talpha',
+      'COPY "public"."perfumes" FROM stdin;',
+      '1\tRose',
       '\\.',
     ].join('\n'),
   );
@@ -273,17 +391,182 @@ test('hosted: cleanup SQL streams from the data file with identical semantics', 
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('hosted: read-only preflight requires a live target', async () => {
-  const run = async ({ secretArgs }) => {
-    assert.ok(secretArgs.includes(DB_URL), 'url must be secret');
+test('hosted: buildDockerPsqlArgs yields a hardened ephemeral psql command', () => {
+  const cases = [
+    {
+      name: 'query form omits --interactive',
+      input: { psqlArgs: ['-X', '-q', '-t', '-A', '-c', 'SELECT 1', 'dburl'], interactive: false },
+      expects: { interactive: 0 },
+    },
+    {
+      name: 'restore form adds exactly one --interactive before the image',
+      input: {
+        psqlArgs: ['-X', '-v', 'ON_ERROR_STOP=1', '--single-transaction', '-f', '-', 'dburl'],
+        interactive: true,
+      },
+      expects: { interactive: 1 },
+    },
+  ];
+  const HARDENING = [
+    '--read-only',
+    '--cap-drop=ALL',
+    '--security-opt=no-new-privileges',
+    '--user=postgres',
+    '--tmpfs',
+    '/tmp',
+    '--entrypoint=psql',
+  ];
+  for (const { name, input, expects } of cases) {
+    const args = buildDockerPsqlArgs(input);
+    assert.equal(args[0], 'run', `${name}: docker subcommand`);
+    assert.equal(args.filter((a) => a === '--rm' && a).length, 1, `${name}: exactly one --rm`);
+    assert.ok(!args.includes('--network=host'), `${name}: host networking must never be requested`);
+    const interactiveIdx = args.indexOf('--interactive');
+    assert.equal(
+      args.filter((a) => a === '--interactive').length,
+      expects.interactive,
+      `${name}: --interactive count`,
+    );
+    if (expects.interactive === 1) {
+      const imageIdx = args.indexOf(PINNED_SUPABASE_POSTGRES_IMAGE);
+      assert.ok(
+        interactiveIdx !== -1 && imageIdx !== -1 && interactiveIdx < imageIdx,
+        `${name}: --interactive must precede the image`,
+      );
+    }
+    for (const flag of HARDENING) {
+      assert.equal(
+        args.filter((a) => a === flag).length,
+        1,
+        `${name}: hardening flag ${flag} exactly once`,
+      );
+    }
+    assert.equal(args.filter((a) => a === 'docker').length, 0, 'no docker binary prefix');
+    assert.equal(
+      args.includes(PINNED_SUPABASE_POSTGRES_IMAGE),
+      true,
+      `${name}: pinned image present`,
+    );
+    // No mount/container/shell/file-path leakage from the builder. The
+    // container-side scratch `/tmp` is the only path argument and is not a
+    // host path.
+    const imageIdx = args.indexOf(PINNED_SUPABASE_POSTGRES_IMAGE);
+    const dockerFlags = args.slice(1, imageIdx);
+    for (const bad of ['--mount', '~', '/', 'docker exec', '&&', 'supabase_db']) {
+      assert.ok(
+        !dockerFlags.some((a) => a.includes(bad) && a !== '/tmp'),
+        `${name}: docker flags must not contain ${bad}`,
+      );
+    }
+    assert.ok(
+      args.slice(imageIdx + 1).every((a) => !a.includes('~') || a.startsWith('-')),
+      `${name}: psql args carry no host path`,
+    );
+  }
+});
+
+test('hosted: buildDockerPsqlArgs defaults to the pinned image and non-interactive', () => {
+  const args = buildDockerPsqlArgs({ psqlArgs: ['--version'] });
+  assert.equal(args.includes('--interactive'), false);
+  assert.ok(args.includes(PINNED_SUPABASE_POSTGRES_IMAGE));
+  assert.deepEqual(args.slice(-1), ['--version']);
+});
+
+test('hosted: preflightDockerPsql runs the pinned image and returns psql 17 version text', async () => {
+  const calls = [];
+  const run = async (opts) => {
+    calls.push(opts);
+    return { stdout: 'psql (PostgreSQL) 17.6\n' };
+  };
+  const version = await preflightDockerPsql({ dockerPath: '/docker', run });
+  assert.equal(version, 'psql (PostgreSQL) 17.6');
+  assert.deepEqual(calls[0].args.slice(0, 2), ['run', '--rm']);
+  assert.ok(calls[0].args.includes(PINNED_SUPABASE_POSTGRES_IMAGE));
+  assert.ok(calls[0].args.includes('--entrypoint=psql'));
+  assert.ok(calls[0].args.includes('--version'));
+  assert.ok(
+    !calls[0].secretArgs || calls[0].secretArgs.length === 0,
+    'version probe has no secrets',
+  );
+});
+
+test('hosted: preflightDockerPsql rejects non-17 or malformed version output before target contact', async () => {
+  for (const stdout of ['psql (PostgreSQL) 16.4\n', 'not psql output\n', '\n']) {
+    await assert.rejects(
+      () => preflightDockerPsql({ dockerPath: '/docker', run: async () => ({ stdout }) }),
+      (err) => err instanceof HostedRestoreError && err.stage === 'preflight',
+    );
+  }
+});
+
+test('hosted: preflightDockerPsql wraps launch/image/daemon failures with a static message', async () => {
+  await assert.rejects(
+    () =>
+      preflightDockerPsql({
+        dockerPath: '/docker',
+        run: async () => {
+          throw new Error('docker: image not found');
+        },
+      }),
+    (err) =>
+      err instanceof HostedRestoreError &&
+      err.stage === 'preflight' &&
+      !/image not found/.test(err.message),
+  );
+});
+
+test('hosted: read-only preflight preflights the pinned image then requires a live target', async () => {
+  const calls = [];
+  const run = async (opts) => {
+    calls.push(opts);
+    if (opts.args.includes('--version')) return { stdout: 'psql (PostgreSQL) 17.6\n' };
     return { stdout: '1\n' };
   };
-  await readOnlyPreflight({ psqlPath: '/psql', dbUrl: DB_URL, run });
-  const failing = async () => ({ stdout: '' });
+  await readOnlyPreflight({ dockerPath: '/docker', dbUrl: DB_URL, run });
+  assert.ok(calls[0].args.includes('--version'), 'version preflight runs first');
+  assert.ok(calls[0].args.includes(PINNED_SUPABASE_POSTGRES_IMAGE));
+  const selectCall = calls.find((c) => c.args.includes('-c'));
+  assert.ok(selectCall, 'SELECT 1 query must run');
+  assert.ok(selectCall.args.includes('SELECT 1'));
+  assert.ok(selectCall.secretArgs.includes(DB_URL), 'target query marks url secret');
+  assert.ok(calls.indexOf(selectCall) > 0, 'target query follows the version preflight');
+  const failing = async (opts) => {
+    if (opts.args.includes('--version')) return { stdout: 'psql (PostgreSQL) 17.6\n' };
+    return { stdout: '' };
+  };
   await assert.rejects(
-    () => readOnlyPreflight({ psqlPath: '/psql', dbUrl: DB_URL, run: failing }),
-    (err) => err instanceof HostedRestoreError,
+    () => readOnlyPreflight({ dockerPath: '/docker', dbUrl: DB_URL, run: failing }),
+    (err) => err instanceof HostedRestoreError && err.stage === 'preflight',
   );
+});
+
+test('hosted: psqlQuery runs Dockerized psql and never prints the URL or password', async () => {
+  const run = async ({ args, secretArgs }) => {
+    assert.ok(args.includes(DB_URL));
+    assert.ok(args.includes('--entrypoint=psql'));
+    assert.ok(args.includes(PINNED_SUPABASE_POSTGRES_IMAGE));
+    assert.ok(secretArgs.includes(DB_URL));
+    assert.ok(secretArgs.includes('the-password'));
+    return { stdout: 'a\nb\n' };
+  };
+  const lines = await psqlQuery({ dockerPath: '/docker', dbUrl: DB_URL, query: 'SELECT 1', run });
+  assert.deepEqual(lines, ['a', 'b']);
+});
+
+test('hosted: psqlQuery forwards the abort signal to the Dockerized client', async () => {
+  const signal = new AbortController().signal;
+  let forwarded = false;
+  await psqlQuery({
+    dockerPath: '/docker',
+    dbUrl: DB_URL,
+    query: 'SELECT 1',
+    run: async (opts) => {
+      forwarded = opts.signal === signal;
+      return { stdout: '1\n' };
+    },
+    signal,
+  });
+  assert.equal(forwarded, true);
 });
 
 test('hosted: psqlQuery never prints the URL or password', async () => {
@@ -292,11 +575,11 @@ test('hosted: psqlQuery never prints the URL or password', async () => {
     assert.ok(secretArgs.includes(DB_URL));
     return { stdout: 'a\nb\n' };
   };
-  const lines = await psqlQuery({ psqlPath: '/psql', dbUrl: DB_URL, query: 'SELECT 1', run });
+  const lines = await psqlQuery({ dockerPath: '/docker', dbUrl: DB_URL, query: 'SELECT 1', run });
   assert.deepEqual(lines, ['a', 'b']);
 });
 
-test('hosted: executeHostedRestore resets only after confirmation and restores in one transaction with exact file order', async () => {
+test('hosted: executeHostedRestore restores in one Dockerized transaction streaming the exact ordered files', async () => {
   const root = tmpdir('bp-hosted-');
   const prepared = {
     dir: path.join(root, 'prepared'),
@@ -304,23 +587,32 @@ test('hosted: executeHostedRestore resets only after confirmation and restores i
   };
   fs.mkdirSync(prepared.dir, { mode: 0o700 });
   writePrivateFile(path.join(prepared.dir, 'roles.sql'), ROLES_SQL);
-  writePrivateFile(path.join(prepared.dir, 'schema.sql'), 'CREATE TABLE public.t();\n');
-  writePrivateFile(path.join(prepared.dir, 'managed-schema.sql'), '-- triggers\n');
-  writePrivateFile(path.join(prepared.dir, 'migration-history-schema.sql'), '-- history\n');
-  writePrivateFile(prepared.dataPath, 'COPY "public"."t" FROM stdin;\n1\n\\.\n');
+  writePrivateFile(
+    path.join(prepared.dir, 'schema.sql'),
+    '-- SCHEMA_MARKER\nCREATE TABLE public.t();\n',
+  );
+  writePrivateFile(path.join(prepared.dir, 'managed-schema.sql'), '-- MANAGED_MARKER\n');
+  writePrivateFile(path.join(prepared.dir, 'migration-history-schema.sql'), '-- HISTORY_MARKER\n');
+  writePrivateFile(prepared.dataPath, '-- DATA_MARKER\nCOPY "public"."t" FROM stdin;\n1\n\\.\n');
 
   const calls = [];
+  const streamed = [];
   async function run(opts) {
     calls.push(opts);
+    if (opts.input) {
+      let all = '';
+      for await (const chunk of opts.input) all += chunk.toString();
+      streamed.push(all);
+    }
     if (opts.args[0] === '--version') return { stdout: '2.114.0\n' };
     const cIdx = opts.args.indexOf('-c');
     const query = cIdx !== -1 ? opts.args[cIdx + 1] : null;
     if (query === 'SELECT 1') return { stdout: '1\n' };
     if (query?.startsWith('SELECT rolname'))
-      return { stdout: 'postgres\nanon\napplication_user\n' };
+      return { stdout: 'postgres\nanon\nfragtrack_custom\n' };
     if (query?.includes('pg_namespace')) return { stdout: '1\n' };
-    if (query?.includes('pg_tables')) return { stdout: '1\n' };
-    if (query?.includes('FROM "public"."t"')) return { stdout: '1\n' };
+    if (query?.includes('pg_trigger'))
+      return { stdout: 'create_account_for_new_user\ncleanup_deleted_user_vouches\n' };
     return { stdout: '' };
   }
 
@@ -328,7 +620,7 @@ test('hosted: executeHostedRestore resets only after confirmation and restores i
     environment: 'development',
     config: { dbUrl: DB_URL, environment: 'development', repoRoot: root },
     prepared,
-    psqlPath: '/psql',
+    dockerPath: '/docker',
     supabasePath: '/supabase',
     run,
     logger: {
@@ -340,57 +632,47 @@ test('hosted: executeHostedRestore resets only after confirmation and restores i
     },
   });
 
-  // Structural verification: role discovery precedes reset; the
-  // post-restore probes are connectivity, the public-schema existence query,
-  // then snapshot-derived schema/row-data expectations; no named-trigger
-  // query may ever run.
-  const resetIdx = calls.findIndex((c) => c.args[1] === 'reset');
-  const qIdx = (match) =>
-    calls.findIndex((c) => {
-      const i = c.args.indexOf('-c');
-      return i !== -1 && match(c.args[i + 1]);
-    });
-  const rolesIdx = qIdx((q) => q.startsWith('SELECT rolname'));
-  const selectOneIdx = qIdx((q) => q === 'SELECT 1');
-  const schemaIdx = qIdx((q) => q.includes('pg_namespace'));
-  const snapshotTablesIdx = qIdx((q) => q.includes('pg_tables'));
-  const rowPresenceIdx = qIdx((q) => q.includes('FROM "public"."t"'));
-  const triggerQuery = calls.find((c) => {
-    const i = c.args.indexOf('-c');
-    return i !== -1 && c.args[i + 1].includes('pg_trigger');
-  });
-  assert.ok(rolesIdx !== -1, 'role discovery must run');
-  assert.ok(rolesIdx < resetIdx, 'role discovery must precede the reset');
-  assert.ok(selectOneIdx > resetIdx, 'post-restore connectivity probe must run');
-  assert.ok(schemaIdx > resetIdx, 'post-restore public-schema probe must run');
-  assert.ok(snapshotTablesIdx > resetIdx, 'snapshot schema-table probe must run');
-  assert.ok(rowPresenceIdx > resetIdx, 'snapshot row-data probe must run');
-  assert.ok(!triggerQuery, 'no named-trigger query may run');
-
   const resetCall = calls.find((c) => c.args[1] === 'reset');
   assert.ok(resetCall, 'db reset must run');
   assert.deepEqual(resetCall.args, ['db', 'reset', '--db-url', DB_URL, '--no-seed', '--yes']);
   assert.ok(resetCall.secretArgs.includes(DB_URL));
 
-  const psqlCalls = calls.filter(
-    (c) => c.command === '/psql' && c.args.includes('--single-transaction'),
+  const restoreCalls = calls.filter(
+    (c) => c.command === '/docker' && c.args.includes('--single-transaction'),
   );
-  assert.equal(psqlCalls.length, 1, 'restore must be a single psql invocation');
-  const restore = psqlCalls[0];
+  assert.equal(restoreCalls.length, 1, 'restore must be a single Dockerized invocation');
+  const restore = restoreCalls[0];
   assert.ok(restore.args.includes('ON_ERROR_STOP=1'));
-  const files = restore.args.filter((a, i) => restore.args[i - 1] === '-f');
-  assert.deepEqual(
-    files.map((f) => path.basename(f)),
-    [
-      'roles.prepared.sql',
-      'schema.sql',
-      'managed-schema.sql',
-      'migration-history-schema.sql',
-      'cleanup.sql',
-      'data.sql',
-    ],
-    'cleanup must run after schema files and before data; roles must be the prepared file',
+  assert.ok(
+    restore.args.includes('--interactive'),
+    'stdin restore must attach the container stdin',
   );
+  assert.ok(restore.input, 'the ordered files must be streamed as stdin input');
+  const fIdx = restore.args.indexOf('-f');
+  assert.deepEqual(restore.args.slice(fIdx, fIdx + 2), ['-f', '-'], 'SQL must come from stdin');
+  assert.equal(restore.args.filter((a) => a === '-f').length, 1);
+  assert.ok(
+    !restore.args.some((a) => a.includes('.sql') || a.endsWith('data.sql')),
+    'no host file path may appear in Docker argv',
+  );
+  assert.ok(!restore.args.some((a) => a === '--mount' || a.startsWith('--volume')), 'no mounts');
+  assert.equal(streamed.length, 1, 'exactly one streamed restore input');
+  const stream = streamed[0];
+  const positions = ['SCHEMA_MARKER', 'MANAGED_MARKER', 'HISTORY_MARKER', 'DATA_MARKER'].map((m) =>
+    stream.indexOf(m),
+  );
+  for (const pos of positions) assert.ok(pos !== -1, 'every restore file must be streamed');
+  for (let i = 1; i < positions.length; i++) {
+    assert.ok(
+      positions[i] > positions[i - 1],
+      'schema, managed, history, and data must stream in the exact required order',
+    );
+  }
+  assert.ok(
+    stream.indexOf('-- already exists on target') < positions[0],
+    'the prepared roles file (with commented duplicates) must lead the stream',
+  );
+
   // The prepared roles file comments only existing CREATE ROLE statements and
   // keeps ALTER/GRANT lines; the auxiliary files are private (0600).
   const rolesPrepared = fs.readFileSync(
@@ -400,8 +682,8 @@ test('hosted: executeHostedRestore resets only after confirmation and restores i
   const lines = rolesPrepared.split('\n');
   const anonCreate = lines.findIndex((l) => l.includes('CREATE ROLE "anon"'));
   assert.ok(lines[anonCreate - 1].startsWith('-- '), 'existing canonical CREATE ROLE commented');
-  assert.ok(lines.find((l) => l.includes('CREATE ROLE "application_user"')));
-  assert.ok(lines.find((l) => l.includes('ALTER ROLE "application_user" WITH LOGIN')));
+  assert.ok(lines.find((l) => l.includes('CREATE ROLE "fragtrack_custom"')));
+  assert.ok(lines.find((l) => l.includes('ALTER ROLE "fragtrack_custom" WITH LOGIN')));
   assert.ok(lines.find((l) => l.includes('GRANT USAGE')));
   for (const name of ['roles.prepared.sql', 'cleanup.sql']) {
     assert.equal(
@@ -410,6 +692,91 @@ test('hosted: executeHostedRestore resets only after confirmation and restores i
       name,
     );
   }
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('hosted: restore input stream yields files in order, one open at a time, newline separated', async () => {
+  const root = tmpdir('bp-hosted-');
+  const files = ['a.sql', 'b.sql', 'c.sql'].map((n) => path.join(root, n));
+  writePrivateFile(files[0], 'AAA');
+  writePrivateFile(files[1], 'BBB');
+  writePrivateFile(files[2], 'CCC');
+  const input = createRestoreInputStream(files);
+  let all = '';
+  for await (const chunk of input) all += chunk.toString();
+  assert.equal(all, 'AAA\nBBB\nCCC\n', 'each file is followed by one newline separator');
+  assert.equal(input.destroyed, true, 'a fully consumed stream releases its file handles');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('hosted: restore input stream read failure propagates, closes open files, and rejects', async () => {
+  const root = tmpdir('bp-hosted-');
+  const good = path.join(root, 'good.sql');
+  const missing = path.join(root, 'missing.sql');
+  writePrivateFile(good, 'GOOD');
+  const input = createRestoreInputStream([good, missing]);
+  let all = '';
+  await assert.rejects(
+    (async () => {
+      for await (const chunk of input) all += chunk.toString();
+    })(),
+    (err) => err.code === 'ENOENT',
+  );
+  assert.equal(all, 'GOOD\n', 'content before the failure is delivered, then the stream rejects');
+  assert.equal(input.destroyed, true, 'the input pipeline is destroyed after a read failure');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('hosted: a restore stream read failure rejects and never reports success', async () => {
+  const root = tmpdir('bp-hosted-');
+  const prepared = {
+    dir: path.join(root, 'prepared'),
+    dataPath: path.join(root, 'prepared', 'data.sql'),
+  };
+  fs.mkdirSync(prepared.dir, { mode: 0o700 });
+  writePrivateFile(path.join(prepared.dir, 'roles.sql'), ROLES_SQL);
+  writePrivateFile(path.join(prepared.dir, 'schema.sql'), 'CREATE TABLE public.t();\n');
+  writePrivateFile(path.join(prepared.dir, 'managed-schema.sql'), '-- triggers\n');
+  writePrivateFile(path.join(prepared.dir, 'migration-history-schema.sql'), '-- history\n');
+  writePrivateFile(prepared.dataPath, 'COPY "public"."t" FROM stdin;\n1\n\\.\n');
+  let restoreInput = null;
+  async function run(opts) {
+    if (opts.args[1] === 'reset') return { stdout: '' };
+    if (opts.args.includes('--single-transaction')) {
+      restoreInput = opts.input;
+      // Simulate the container failing when its stdin pipe breaks: the mock
+      // drains the lazy stream; a missing data file surfaces here.
+      fs.rmSync(prepared.dataPath); // remove the data file before it is opened
+      let drained = 0;
+      for await (const chunk of restoreInput) drained += chunk.length;
+      assert.ok(drained > 0, 'the streamed files must reach the container before the failure');
+      return { stdout: '' };
+    }
+    return { stdout: '' };
+  }
+  await assert.rejects(
+    () =>
+      executeHostedRestore({
+        environment: 'development',
+        config: { dbUrl: DB_URL, environment: 'development', repoRoot: root },
+        prepared,
+        dockerPath: '/docker',
+        supabasePath: '/supabase',
+        run,
+        logger: {
+          status: () => {},
+          warn: () => {},
+          error: () => {},
+          addSecret: () => {},
+          redact: (t) => t,
+        },
+      }),
+    (err) =>
+      err instanceof HostedRestoreError &&
+      /rolled back/.test(err.message) &&
+      /CLEAN/.test(err.message),
+  );
+  assert.ok(restoreInput, 'the restore container must have started');
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -445,19 +812,19 @@ test('hosted: rolesSkipped counts only roles that were actually prepared away', 
     const query = cIdx !== -1 ? opts.args[cIdx + 1] : null;
     if (query === 'SELECT 1') return { stdout: '1\n' };
     if (query?.startsWith('SELECT rolname')) {
-      // Only 'anon' already exists; application_user does not yet exist.
+      // Only 'anon' already exists; fragtrack_custom does not yet exist.
       return { stdout: 'postgres\nanon\n' };
     }
     if (query?.includes('pg_namespace')) return { stdout: '1\n' };
-    if (query?.includes('pg_tables')) return { stdout: '1\n' };
-    if (query?.includes('FROM "public"."t"')) return { stdout: '1\n' };
+    if (query?.includes('pg_trigger'))
+      return { stdout: 'create_account_for_new_user\ncleanup_deleted_user_vouches\n' };
     return { stdout: '' };
   }
   const result = await executeHostedRestore({
     environment: 'development',
     config: { dbUrl: DB_URL, environment: 'development', repoRoot: root },
     prepared,
-    psqlPath: '/psql',
+    dockerPath: '/docker',
     supabasePath: '/supabase',
     run,
     logger: {
@@ -496,7 +863,7 @@ test('hosted: restore transaction failure is reported with clean-target semantic
         environment: 'development',
         config: { dbUrl: DB_URL, environment: 'development', repoRoot: root },
         prepared,
-        psqlPath: '/psql',
+        dockerPath: '/docker',
         supabasePath: '/supabase',
         run,
         logger: {
@@ -509,7 +876,8 @@ test('hosted: restore transaction failure is reported with clean-target semantic
       }),
     (err) =>
       err instanceof HostedRestoreError &&
-      /rolled back/.test(err.message) &&
+      /before the transaction started/.test(err.message) &&
+      !/rolled back/.test(err.message) &&
       /CLEAN/.test(err.message),
   );
   assert.equal(failures, 1);
@@ -540,7 +908,7 @@ test('hosted: post-restore verification failures propagate', async () => {
         environment: 'development',
         config: { dbUrl: DB_URL, environment: 'development', repoRoot: root },
         prepared,
-        psqlPath: '/psql',
+        dockerPath: '/docker',
         supabasePath: '/supabase',
         run,
         logger: {
@@ -552,56 +920,6 @@ test('hosted: post-restore verification failures propagate', async () => {
         },
       }),
     (err) => err instanceof HostedRestoreError && /verification failed/.test(err.message),
-  );
-  fs.rmSync(root, { recursive: true, force: true });
-});
-
-test('hosted: post-restore verification fails when restored row data falls short of the snapshot', async () => {
-  const root = tmpdir('bp-hosted-');
-  const prepared = {
-    dir: path.join(root, 'prepared'),
-    dataPath: path.join(root, 'prepared', 'data.sql'),
-  };
-  fs.mkdirSync(prepared.dir, { mode: 0o700 });
-  writePrivateFile(path.join(prepared.dir, 'roles.sql'), ROLES_SQL);
-  writePrivateFile(path.join(prepared.dir, 'schema.sql'), 'CREATE TABLE public.t (id int);\n');
-  writePrivateFile(path.join(prepared.dir, 'managed-schema.sql'), '-- triggers\n');
-  writePrivateFile(path.join(prepared.dir, 'migration-history-schema.sql'), '-- history\n');
-  // The snapshot contains TWO rows for public.t.
-  writePrivateFile(prepared.dataPath, 'COPY "public"."t" FROM stdin;\n1\n2\n\\.\n');
-  async function run(opts) {
-    if (opts.args[1] === 'reset') return { stdout: '' };
-    if (opts.args.includes('--single-transaction')) return { stdout: '' };
-    const cIdx = opts.args.indexOf('-c');
-    const query = cIdx !== -1 ? opts.args[cIdx + 1] : null;
-    if (query === 'SELECT 1') return { stdout: '1\n' };
-    if (query?.startsWith('SELECT rolname')) return { stdout: 'postgres\n' };
-    if (query?.includes('pg_namespace')) return { stdout: '1\n' };
-    if (query?.includes('pg_tables')) return { stdout: '1\n' };
-    // Only ONE of the two snapshot rows is present in the restored database.
-    if (query?.includes('FROM "public"."t"')) return { stdout: '1\n' };
-    return { stdout: '' };
-  }
-  await assert.rejects(
-    () =>
-      executeHostedRestore({
-        environment: 'development',
-        config: { dbUrl: DB_URL, environment: 'development', repoRoot: root },
-        prepared,
-        psqlPath: '/psql',
-        supabasePath: '/supabase',
-        run,
-        logger: {
-          status: () => {},
-          warn: () => {},
-          error: () => {},
-          addSecret: () => {},
-          redact: (t) => t,
-        },
-      }),
-    (err) =>
-      err instanceof HostedRestoreError &&
-      /verification failed: rows in public\.t/.test(err.message),
   );
   fs.rmSync(root, { recursive: true, force: true });
 });
@@ -632,7 +950,7 @@ test('hosted: a zero-count public schema fails post-restore verification', async
         environment: 'development',
         config: { dbUrl: DB_URL, environment: 'development', repoRoot: root },
         prepared,
-        psqlPath: '/psql',
+        dockerPath: '/docker',
         supabasePath: '/supabase',
         run,
         logger: {
@@ -670,15 +988,15 @@ test('hosted: the isolated db URL password is registered as a secret for every c
     if (query === 'SELECT 1') return { stdout: '1\n' };
     if (query?.startsWith('SELECT rolname')) return { stdout: 'postgres\n' };
     if (query?.includes('pg_namespace')) return { stdout: '1\n' };
-    if (query?.includes('pg_tables')) return { stdout: '1\n' };
-    if (query?.includes('FROM "public"."t"')) return { stdout: '1\n' };
+    if (query?.includes('pg_trigger'))
+      return { stdout: 'create_account_for_new_user\ncleanup_deleted_user_vouches\n' };
     return { stdout: '' };
   }
   await executeHostedRestore({
     environment: 'development',
     config: { dbUrl: DB_URL, environment: 'development', repoRoot: root },
     prepared,
-    psqlPath: '/psql',
+    dockerPath: '/docker',
     supabasePath: '/supabase',
     run,
     logger: {
@@ -710,6 +1028,13 @@ test('hosted: confirmation summary masks the project ref and warns about data lo
   assert.ok(summary.includes('a1b2****c9d0'));
   assert.ok(!summary.includes('a1b2c3d4e5f6a7b8c9d0'));
   assert.ok(summary.includes('DATA-LOSS'));
+});
+
+test('hosted: trigger names default to the Fragtrack triggers', () => {
+  assert.deepEqual(FRAGTRACK_TRIGGERS, [
+    'create_account_for_new_user',
+    'cleanup_deleted_user_vouches',
+  ]);
 });
 
 test('hosted: exact confirmation requires a TTY and the exact phrase', async () => {
@@ -759,11 +1084,4 @@ test('hosted: exact confirmation requires a TTY and the exact phrase', async () 
     }),
     false,
   );
-});
-
-test('hosted: the duplicate-role skip marker has the canonical shape', () => {
-  const out = prepareRolesFile({ rolesSql: ROLES_SQL, existingRoles: ['anon'] });
-  const lines = out.split('\n');
-  const anonCreate = lines.findIndex((l) => l.includes('CREATE ROLE "anon"'));
-  assert.match(lines[anonCreate - 1], /^-- .*skipped by restore$/);
 });

@@ -4,7 +4,7 @@
 # and managed auth/storage changes are captured as a diff, never applied.
 # For configuration reference: https://supabase.com/docs/guides/local-development/cli/config
 
-project_id = "supabase-db-backup"
+project_id = "fragtrack-backup"
 
 [api]
 enabled = true

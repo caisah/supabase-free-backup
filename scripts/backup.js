@@ -34,7 +34,7 @@ import {
 import {
   packageSnapshot,
   verifyStoredFile,
-  sameEncryptedContent,
+  sameSnapshotContent,
   MANIFEST_NAME,
   LIMITS,
 } from '../src/snapshot.js';
@@ -140,7 +140,7 @@ export async function emitStagedSnapshot({
 /** True when content hash or the encryption recipient differs from the newest valid snapshot. */
 function snapshotHasChanged({ newest, contentSha256, recipient }) {
   if (!newest) return true;
-  return !sameEncryptedContent(newest.manifest, { contentSha256, encryption: { recipient } });
+  return !sameSnapshotContent(newest.manifest, { contentSha256, encryption: { recipient } });
 }
 
 /** Combine valid snapshots and incomplete canonical prefixes for retention. */

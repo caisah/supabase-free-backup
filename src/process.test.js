@@ -63,6 +63,73 @@ test('process runner: stream stdin input does not hang when the child exits earl
   assert.equal(res.stdout, '');
 });
 
+test('process runner: an input stream read failure rejects even when the child exits zero', async () => {
+  const { Readable } = await import('node:stream');
+  // The child behaves like `psql --single-transaction -f -`: it treats
+  // stdin EOF as "commit and succeed". A source read failure must therefore
+  // NEVER resolve the command, or a partial SQL prefix would be committed
+  // and reported as a successful restore.
+  const input = new Readable({
+    read() {
+      this.push(Buffer.from('partial-sql'));
+      this.destroy(new Error('input stream exploded'));
+    },
+  });
+  await assert.rejects(
+    () =>
+      runCommand({
+        command: node,
+        args: [
+          '-e',
+          'process.stdin.resume();process.stdin.on("end",()=>{process.stdout.write("COMMITTED");process.exit(0)})',
+        ],
+        stdout: 'collect',
+        input,
+      }),
+    (err) =>
+      err instanceof ProcessError &&
+      err.cause instanceof Error &&
+      /input stream exploded/.test(err.cause.message),
+  );
+});
+
+test('process runner: an input stream read failure terminates a live child before it can commit', async () => {
+  const { Readable } = await import('node:stream');
+  const dir = tmpdir();
+  const marker = path.join(dir, 'committed');
+  // A psql-like child: on stdin EOF it "commits" (writes the marker) after a
+  // short delay and exits 0; without the runner's kill it would commit a
+  // partial input and report success. The delay gives the kill an
+  // unreachable-to-lose head start: SIGKILL is delivered immediately, the
+  // 1s commit timer can only fire in a child that was never killed.
+  const childScript =
+    'process.stdin.resume();' +
+    `process.stdin.on('end',()=>setTimeout(()=>{require('fs').writeFileSync(process.argv[1],'COMMITTED');process.exit(0)},1000));` +
+    'setTimeout(()=>process.exit(0),30000);';
+  const input = new Readable({
+    read() {
+      this.push(Buffer.from('partial-sql'));
+      this.destroy(new Error('input stream exploded'));
+    },
+  });
+  await assert.rejects(
+    () =>
+      runCommand({
+        command: node,
+        args: ['-e', childScript, marker],
+        input,
+      }),
+    (err) => err instanceof ProcessError && /input stream exploded/.test(err.cause?.message ?? ''),
+  );
+  // The child must have been terminated before it could write the marker.
+  const deadline = Date.now() + 2500;
+  while (Date.now() < deadline) {
+    assert.equal(fs.existsSync(marker), false, 'a killed child can never commit the partial input');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('process runner: propagates nonzero exit codes with code', async () => {
   await assert.rejects(
     () => runCommand({ command: node, args: ['-e', 'process.exit(3)'] }),

@@ -12,7 +12,7 @@ import {
   validatePackagedDirectory,
   MANIFEST_NAME,
   resolvePrivatePath,
-  sameEncryptedContent,
+  sameSnapshotContent,
 } from './snapshot.js';
 import { isValidSnapshotId } from './fingerprint.js';
 import { removeFiles } from './encryption.js';
@@ -94,7 +94,7 @@ export function planWeekly({ existing, staged }) {
         reason: 'staged snapshot older than the newest committed snapshot',
       };
     }
-    const sameContent = sameEncryptedContent(existing.manifest, staged.manifest);
+    const sameContent = sameSnapshotContent(existing.manifest, staged.manifest);
     if (sameContent) {
       return { action: 'skip', reason: 'identical content and recipient' };
     }

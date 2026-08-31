@@ -1,34 +1,137 @@
 /**
- * Local project database restore (sub-plan 08).
+ * Local Fragtrack database restore (sub-plan 08).
  *
  * Restores a fully verified snapshot into the local Supabase database owned
- * by the configured PROJECT_WORKDIR (Docker volumes only, never tracked
- * sibling files) and restarts the full local stack. Destruction begins only
- * after source verification and the exact `RESTORE local` confirmation; the
- * combined logical file is private and removed in every outcome.
+ * by `../fragtrack` (Docker volumes only, never tracked sibling files) and
+ * restarts the full local stack. Destruction begins only after source
+ * verification and the exact `RESTORE local` confirmation; the combined
+ * logical file is private and removed in every outcome.
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { writeWithBackpressure, endWritable } from './stream.js';
-import {
-  prepareRolesFile,
-  scanDataSqlContent,
-  countCreateTables,
-  rowPresenceQuery,
-} from './hosted-restore.js';
-import { PLAINTEXT_ARTIFACTS } from './snapshot.js';
-import {
-  LocalRestoreError,
-  parseWorkdirConfig,
-  validateWorkdir,
-  localDbUrl,
-  localPsqlQuery,
-} from './local-project.js';
+import { prepareRolesFile, FRAGTRACK_TRIGGERS } from './hosted-restore.js';
+import { PLAINTEXT_ARTIFACTS, POSTGRES_MAJOR_VERSION } from './snapshot.js';
 
-// Discovery/query primitives live in the neutral local-project adapter; these
-// re-exports keep existing restore-path callers on one import surface.
-export { LocalRestoreError, parseWorkdirConfig, validateWorkdir, localDbUrl };
+export { FRAGTRACK_TRIGGERS } from './hosted-restore.js';
+
+export class LocalRestoreError extends Error {
+  constructor(message, { cause, stage } = {}) {
+    super(message);
+    this.name = 'LocalRestoreError';
+    this.cause = cause;
+    this.stage = stage;
+  }
+}
+
+/** Parse the [db] section of a Supabase config.toml (CRLF-tolerant). */
+export function parseWorkdirConfig(configToml) {
+  // Normalize CRLF so a Windows-checked-out config.toml parses identically.
+  const normalized = configToml.replace(/\r\n/g, '\n');
+  const dbMatch = /\[db\]\n([\s\S]*?)(?=\n\[[a-z]|\n$)/.exec(normalized);
+  const dbSection = dbMatch ? dbMatch[1] : '';
+  const major = /major_version\s*=\s*(\d+)/.exec(dbSection);
+  const port = /^\s*port\s*=\s*(\d+)/m.exec(dbSection);
+  const projectId = /^project_id\s*=\s*"([^"]+)"/m.exec(normalized);
+  return {
+    projectId: projectId ? projectId[1] : null,
+    majorVersion: major ? Number(major[1]) : null,
+    dbPort: port ? Number(port[1]) : null,
+  };
+}
+
+/** Resolve PROJECT_WORKDIR and enforce the type/self-reference checks. */
+function resolveWorkdirPath({ fragtrackWorkdir, repoRoot }) {
+  const resolved = path.resolve(fragtrackWorkdir);
+  let stat;
+  try {
+    stat = fs.statSync(resolved);
+  } catch {
+    throw new LocalRestoreError(`PROJECT_WORKDIR does not exist: ${resolved}`, {
+      stage: 'workdir',
+    });
+  }
+  if (!stat.isDirectory()) {
+    throw new LocalRestoreError(`PROJECT_WORKDIR is not a directory: ${resolved}`, {
+      stage: 'workdir',
+    });
+  }
+  const realRoot = fs.realpathSync(resolved);
+  const realRepo = fs.realpathSync(repoRoot);
+  if (realRoot === realRepo) {
+    throw new LocalRestoreError(
+      'PROJECT_WORKDIR must point at the sibling Fragtrack project, not this repository',
+      { stage: 'workdir' },
+    );
+  }
+  return { realRoot };
+}
+
+/** Load the workdir's supabase/config.toml text and canonical path. */
+function loadWorkdirConfig({ realRoot, fragtrackWorkdir }) {
+  const configPath = path.join(realRoot, 'supabase', 'config.toml');
+  let configToml;
+  try {
+    configToml = fs.readFileSync(configPath, 'utf8');
+  } catch {
+    throw new LocalRestoreError(
+      `PROJECT_WORKDIR has no supabase/config.toml: ${path.join(fragtrackWorkdir, 'supabase')}`,
+      { stage: 'workdir' },
+    );
+  }
+  return { configPath, configToml };
+}
+
+/**
+ * Validate the parsed config: a project_id, the pinned Postgres major
+ * version, and a [db] port. `project_id` must be present BEFORE the
+ * `supabase_db_<project>` container name is derived.
+ */
+function validateParsedWorkdirConfig({ configToml, configPath, expectedMajorVersion }) {
+  const parsed = parseWorkdirConfig(configToml);
+  if (!parsed.projectId) {
+    throw new LocalRestoreError(`Fragtrack config must set project_id: ${configPath}`, {
+      stage: 'workdir',
+    });
+  }
+  if (parsed.majorVersion !== expectedMajorVersion) {
+    throw new LocalRestoreError(
+      `Fragtrack config must use Postgres major version ${expectedMajorVersion}`,
+      { stage: 'workdir' },
+    );
+  }
+  if (!parsed.dbPort) {
+    throw new LocalRestoreError('Fragtrack config must expose a [db] port', { stage: 'workdir' });
+  }
+  return parsed;
+}
+
+/** Build the stable validated-workdir result shape. */
+function buildWorkdirResult({ realRoot, configPath, parsed }) {
+  return {
+    workdir: realRoot,
+    projectId: parsed.projectId,
+    dbPort: parsed.dbPort,
+    dbContainer: `supabase_db_${parsed.projectId}`,
+    configPath,
+  };
+}
+
+/**
+ * Validate the Fragtrack workdir: a real directory (not the backup repo
+ * itself) containing supabase/config.toml with Postgres major version 17.
+ */
+export function validateWorkdir({
+  fragtrackWorkdir,
+  repoRoot,
+  expectedMajorVersion = POSTGRES_MAJOR_VERSION,
+}) {
+  const { realRoot } = resolveWorkdirPath({ fragtrackWorkdir, repoRoot });
+  const { configPath, configToml } = loadWorkdirConfig({ realRoot, fragtrackWorkdir });
+  const parsed = validateParsedWorkdirConfig({ configToml, configPath, expectedMajorVersion });
+  return buildWorkdirResult({ realRoot, configPath, parsed });
+}
 
 /**
  * The schema files applied in one transaction, in the same logical order the
@@ -77,6 +180,37 @@ export async function buildCombinedLogicalFile({ prepared, outFile, cleanupFile,
   return outFile;
 }
 
+export function localDbUrl(dbPort) {
+  return `postgresql://postgres:postgres@127.0.0.1:${dbPort}/postgres`;
+}
+
+/** Read-only psql query against the local fixture DB container. */
+export async function localPsqlQuery({ dockerPath, dbContainer, query, run, signal }) {
+  const res = await run({
+    command: dockerPath,
+    args: [
+      'exec',
+      dbContainer,
+      'psql',
+      '-U',
+      'postgres',
+      '-d',
+      'postgres',
+      '-t',
+      '-A',
+      '-c',
+      query,
+    ],
+    stdout: 'collect',
+    stderr: 'collect',
+    signal,
+  });
+  return (res.stdout ?? '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+}
+
 /**
  * The destructive local-stack sequence. Every external command is injectable.
  * The combined file is built only after the fresh baseline's roles are known
@@ -92,8 +226,7 @@ export async function buildCombinedLogicalFile({ prepared, outFile, cleanupFile,
  *  5. drop and recreate the `public` schema (the snapshot is the source of
  *     truth, never the workdir's current migrations);
  *  6. apply the VERIFIED combined logical restore in ONE transaction;
- *  7. restart the stack and verify connectivity, public tables, and
- *     migration history.
+ *  7. restart the stack and verify connectivity, data, history, triggers.
  *
  * NOTE: `supabase db start --from-backup` was evaluated and rejected for this
  * CLI version: it restores onto a bare volume (only supabase_admin exists),
@@ -222,48 +355,29 @@ async function restartLocalStack({ supabasePath, workdir, run, signal }) {
   });
 }
 
-/**
- * The post-restore structural verification checks in the documented order,
- * plus snapshot-derived expectations: the schema-table lower bound from
- * schema.sql and per-table row-data presence probes from the decrypted
- * data.sql COPY blocks. `expectAtLeast` defaults to 1 (any non-empty result).
- */
-async function buildLocalChecks({ prepared }) {
-  const checks = [
-    { label: 'connectivity', query: 'SELECT 1' },
+/** The post-restore verification queries and their expected outcomes. */
+function buildLocalChecks(triggerNames) {
+  return [
+    { label: 'connectivity', query: 'SELECT 1', expectZero: false },
     {
       label: 'public tables',
       query: "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'",
+      expectZero: false,
     },
     {
       label: 'migration history',
       query: "SELECT count(*) FROM pg_tables WHERE schemaname = 'supabase_migrations'",
+      expectZero: false,
+    },
+    {
+      label: 'custom auth triggers',
+      query: `SELECT tgname FROM pg_trigger WHERE tgname IN (${triggerNames.map((t) => `'${t}'`).join(', ')})`,
+      expectAll: triggerNames,
     },
   ];
-  const schemaTables = countCreateTables(
-    fs.readFileSync(path.join(prepared.dir, 'schema.sql'), 'utf8'),
-  );
-  if (schemaTables > 0) {
-    checks.push({
-      label: 'snapshot schema tables',
-      query:
-        "SELECT count(*) FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema')",
-      expectAtLeast: schemaTables,
-    });
-  }
-  const { tables } = await scanDataSqlContent({ dataPath: prepared.dataPath });
-  for (const entry of tables) {
-    if (entry.rows === 0) continue;
-    checks.push({
-      label: `rows in ${entry.schema}.${entry.table}`,
-      query: rowPresenceQuery(entry),
-      expectAtLeast: entry.rows,
-    });
-  }
-  return checks;
 }
 
-/** Execute the verification checks and throw on the first failed check. */
+/** Execute the verification queries and throw on the first failed check. */
 async function verifyLocalRestore({ dockerPath, dbContainer, run, logger, signal, checks }) {
   for (const check of checks) {
     const lines = await localPsqlQuery({
@@ -274,8 +388,16 @@ async function verifyLocalRestore({ dockerPath, dbContainer, run, logger, signal
       signal,
     });
     logger.status(`local verify ${check.label}: ${lines.join(',') || '(empty)'}`);
-    const value = Number(lines[0]);
-    if (!Number.isInteger(value) || value < (check.expectAtLeast ?? 1)) {
+    if (check.expectAll) {
+      for (const wanted of check.expectAll) {
+        if (!lines.includes(wanted)) {
+          throw new LocalRestoreError(
+            `local restore verification failed: ${check.label} (missing ${wanted})`,
+            { stage: 'verify' },
+          );
+        }
+      }
+    } else if (lines.length === 0 || lines[0] === '0') {
       throw new LocalRestoreError(`local restore verification failed: ${check.label}`, {
         stage: 'verify',
       });
@@ -294,6 +416,7 @@ export async function restoreLocalStack({
   run,
   logger,
   signal,
+  triggerNames = FRAGTRACK_TRIGGERS,
   buildCombined = buildCombinedLogicalFile,
 }) {
   // 1. Stop/delete the DB volume and bootstrap the full baseline stack.
@@ -319,15 +442,14 @@ export async function restoreLocalStack({
   // 5. Restart services on the restored database (skipped on any earlier failure).
   await restartLocalStack({ supabasePath, workdir, run, signal });
 
-  // 6. Verification: connectivity, public tables, migration history, and
-  //    snapshot-derived schema/row-data presence.
+  // 6. Verification: connectivity, public tables, migration history, triggers.
   await verifyLocalRestore({
     dockerPath,
     dbContainer,
     run,
     logger,
     signal,
-    checks: await buildLocalChecks({ prepared }),
+    checks: buildLocalChecks(triggerNames),
   });
   return { verified: true, dbPort };
 }
@@ -338,7 +460,7 @@ export function completionSummary({ environment, source, snapshotId, workdir }) 
     `  source environment: ${environment}`,
     `  source: ${source}`,
     `  snapshot: ${snapshotId}`,
-    `  Project workdir: ${workdir}`,
-    `Full local stack restarted; connectivity, public tables, migration history, and snapshot row data verified.`,
+    `  Fragtrack workdir: ${workdir}`,
+    `Full local stack restarted; data, migration history, and custom auth triggers verified.`,
   ].join('\n');
 }

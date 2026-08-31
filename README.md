@@ -1,8 +1,8 @@
-# Supabase database backup and restore
+# Fragtrack database backup and restore
 
-Encrypted logical backups of the **development** and **production** Supabase
-databases, stored in Cloudflare R2 (7-day rolling window) and in this Git
-repository (permanent, dated), with verified restore commands for hosted
+Encrypted logical backups of the **development** and **production** Fragtrack
+Supabase databases, stored in Cloudflare R2 (7-day rolling window) and in this
+Git repository (permanent, dated), with verified restore commands for hosted
 and local targets.
 
 > This backs up the _databases_, not the whole Supabase project: no Storage
@@ -38,28 +38,28 @@ flowchart TD
 
 ## Core implementation
 
-| Module (`src/`)                                      | Responsibility                                                                                      |
-| ---------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `config.js`                                          | dotenv + process env loading, validation (session-pooler URL, bucket/env match)                     |
-| `database.js`                                        | Supabase CLI dump/diff, `psql`/`supabase db reset` execution                                        |
-| `backup.js`                                          | Shared dump/package mechanics: executable preflight, private workspace, dump-then-package           |
-| `snapshot.js`                                        | Snapshot packaging and the `manifest.json` written last (marks completion)                          |
-| `encryption.js`                                      | age (X25519) encryption of gzipped row data, 90 MiB part splitting                                  |
-| `fingerprint.js`                                     | Deterministic hash over normalized logical SQL (the change detector)                                |
-| `r2.js`                                              | S3 upload/list/delete against the per-environment R2 bucket                                         |
-| `repository.js`                                      | Reading/writing dated snapshot dirs in Git                                                          |
-| `restore.js`                                         | Shared verification: manifest schema, sizes, SHA-256, part order, decryption, aggregate fingerprint |
-| `hosted-restore.js`                                  | Hosted restore: reset target, apply verified snapshot in one transaction                            |
-| `local-restore.js`                                   | Local restore: stop stack, recreate DB volume, apply, restart                                       |
-| `local-backup.js`                                    | Local store: private tree/lock, read-only stability guard, crash-durable publish-before-retention   |
-| `runtime.js`, `stream.js`, `process.js`, `logger.js` | Node runtime gate, streaming, subprocess, logging utilities                                         |
+| Module (`src/`)                                      | Responsibility                                                                                                                                                                            |
+| ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `config.js`                                          | dotenv + process env loading, validation (session-pooler URL, bucket/env match)                                                                                                           |
+| `database.js`                                        | Pinned Supabase CLI dump/diff, `supabase db reset` execution                                                                                                                              |
+| `backup.js`                                          | Shared dump/package mechanics: executable preflight, private workspace, dump-then-package                                                                                                 |
+| `snapshot.js`                                        | Snapshot packaging (encrypted or plaintext row-data codec) and the `manifest.json` written last (marks completion)                                                                        |
+| `encryption.js`                                      | Row-data codecs: age (X25519) encryption of gzipped row data or plaintext, 90 MiB part splitting                                                                                          |
+| `fingerprint.js`                                     | Deterministic hash over normalized logical SQL (the change detector)                                                                                                                      |
+| `r2.js`                                              | S3 upload/list/delete against the per-environment R2 bucket                                                                                                                               |
+| `repository.js`                                      | Reading/writing dated snapshot dirs in Git                                                                                                                                                |
+| `restore.js`                                         | Shared verification: manifest schema, sizes, SHA-256, part order, codec-aware row-data restore (decryption only for age snapshots), aggregate fingerprint; sources: repo, R2, local store |
+| `hosted-restore.js`                                  | Hosted restore: Dockerized psql client (pinned ephemeral image), reset target, apply verified snapshot in one transaction                                                                 |
+| `local-restore.js`                                   | Local restore: stop stack, recreate DB volume, apply, restart                                                                                                                             |
+| `local-backup.js`                                    | Local store: private tree/lock, read-only stability guard, crash-durable publish-before-retention                                                                                         |
+| `runtime.js`, `stream.js`, `process.js`, `logger.js` | Node runtime gate, streaming, subprocess, logging utilities                                                                                                                               |
 
 ## Backup scope
 
 **Included:** custom roles (no passwords), application schema, custom
-`auth`/`storage` changes (e.g. custom functions and triggers in managed
-schemas, restored as a managed delta), migration history, supported row
-data (incl. Auth/Storage metadata).
+`auth`/`storage` changes (e.g. the `create_account_for_new_user` and
+`cleanup_deleted_user_vouches` triggers, restored as a managed delta),
+migration history, supported row data (incl. Auth/Storage metadata).
 
 **Excluded:** Storage object bytes, Edge Functions, dashboard/Auth provider
 settings and API keys, Vault/pgsodium root key, `storage.buckets_vectors` /
@@ -89,9 +89,18 @@ Git repository (backups/<environment>/):
 - **Vite+ `0.3.0`** and **Node.js exactly the release pinned in `.node-version`**
   (the preflight refuses any other version; npm `12.0.2` stays the package
   manager via `devEngines`).
-- **Docker**, **age** (`brew install age`), **psql** (PostgreSQL 17 client),
-  and — only for local commands — a configured local Supabase project
-  (set via `PROJECT_WORKDIR`).
+- **Docker** and **age** (`brew install age`): hosted restores run `psql` 17.6
+  from the pinned ephemeral Supabase Postgres image — the image is referenced
+  by its immutable manifest **digest**
+  (`public.ecr.aws/supabase/postgres@sha256:99b1729aeb0bac314445024fc149fbd39306170b61dd50800ccf180327ab3459`,
+  reviewed tag `17.6.1.158`), never a mutable tag — no host PostgreSQL client
+  is ever installed, discovered, or executed, and Docker may pull that exact
+  image when it is absent (the read-only preflight launches `docker run …
+psql --version`, so an unreachable registry/daemon now fails the preflight
+  before any target contact). `age` stays conditional: only encrypted
+  repo/R2 snapshots (and legacy encrypted local snapshots) need it.
+- The sibling **`../fragtrack`** project (local backups and local restores
+  only). Hosted restores need **no running local Supabase stack**.
 - **`gh`** (only for `github:configure`).
 
 ## Configuration
@@ -103,17 +112,17 @@ Ignored local files (never commit):
 
 Variables (see `.env.example`):
 
-| Variable                                    | Purpose                                                        | Notes                                                                                       |
-| ------------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `BACKUP_ENVIRONMENT`                        | `development` \| `production`                                  | must match target                                                                           |
-| `SUPABASE_PROJECT_REF`                      | project reference                                              |                                                                                             |
-| `SUPABASE_DB_URL`                           | **session-pooler or matching direct** URL (postgresql://, SSL) | username `postgres.<ref>` (direct: `db.<ref>.supabase.co:5432`)                             |
-| `CLOUDFLARE_ACCOUNT_ID`                     | Cloudflare account id                                          |                                                                                             |
-| `R2_BUCKET`                                 | R2 bucket                                                      | must equal the environment                                                                  |
-| `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 credentials (scoped to the bucket)                          |                                                                                             |
-| `ENCRYPT_KEY`                               | public age recipient (`age1…`)                                 | backup only                                                                                 |
-| `DECRYPT_KEY`                               | private age identity (`AGE-SECRET-KEY-…`)                      | restore only, never uploaded                                                                |
-| `PROJECT_WORKDIR`                           | path to the configured local Supabase project                  | required by `backup:local` and `restore:local`; relative paths resolve from this repository |
+| Variable                                    | Purpose                                                        | Notes                                                                              |
+| ------------------------------------------- | -------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `BACKUP_ENVIRONMENT`                        | `development` \| `production`                                  | must match target                                                                  |
+| `SUPABASE_PROJECT_REF`                      | project reference                                              |                                                                                    |
+| `SUPABASE_DB_URL`                           | **session-pooler or matching direct** URL (postgresql://, SSL) | username `postgres.<ref>` (direct: `db.<ref>.supabase.co:5432`)                    |
+| `CLOUDFLARE_ACCOUNT_ID`                     | Cloudflare account id                                          |                                                                                    |
+| `R2_BUCKET`                                 | R2 bucket                                                      | must equal the environment                                                         |
+| `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 credentials (scoped to the bucket)                          |                                                                                    |
+| `ENCRYPT_KEY`                               | public age recipient (`age1…`)                                 | backup only (hosted); not consumed by `backup:local` or `restore:* --source local` |
+| `DECRYPT_KEY`                               | private age identity (`AGE-SECRET-KEY-…`)                      | r2/repo restores only (and legacy encrypted local snapshots); never uploaded       |
+| `PROJECT_WORKDIR`                           | path to sibling Fragtrack project                              | local restore; `backup:local` dump source                                          |
 
 `vp run github:configure [OWNER/REPO]` validates both local files and syncs
 both GitHub Environments (creates absent ones, upserts only the approved
@@ -149,20 +158,25 @@ Arguments pass through directly — no `--` separator (`vp run backup --environm
 
 **Backup and restore:**
 
-| Script                                                                                                        | Purpose                                                                                                      |
-| ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `vp run backup --environment development\|production`                                                         | Dump, fingerprint, upload changed snapshot to R2, run retention                                              |
-| `vp run backup:local --environment development\|production`                                                   | Package the ALREADY-RUNNING local Supabase stack configured by `PROJECT_WORKDIR` into `local-backups/<env>/` |
-| `vp run restore:development --source r2\|repo --backup latest\|<snapshot-id>`                                 | Restore into hosted development DB                                                                           |
-| `vp run restore:production --source r2\|repo --backup latest\|<snapshot-id>`                                  | Restore into hosted production DB (maintenance window required)                                              |
-| `vp run restore:local --environment development\|production --source r2\|repo --backup latest\|<snapshot-id>` | Restore either hosted snapshot into the configured local Supabase stack                                      |
-| `vp run github:configure [OWNER/REPO]`                                                                        | Validate local env files, sync GitHub Environments                                                           |
-| `vp run commit:weekly --staging-dir <path> --repo-root .`                                                     | Weekly Git snapshot commit (used by the workflow; runnable locally on `master`)                              |
+| Script                                                                                                        | Purpose                                                                         |
+| ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `vp run backup --environment development\|production`                                                         | Dump, fingerprint, upload changed snapshot to R2, run retention                 |
+| `vp run backup:local --environment development\|production`                                                   | Package the ALREADY-RUNNING local Fragtrack DB into `local-backups/<env>/`      |
+| `vp run restore:development --source r2\|repo\|local --backup latest\|<snapshot-id>`                          | Restore into hosted development DB                                              |
+| `vp run restore:production --source r2\|repo\|local --backup latest\|<snapshot-id>`                           | Restore into hosted production DB (maintenance window required)                 |
+| `vp run restore:local --environment development\|production --source r2\|repo --backup latest\|<snapshot-id>` | Restore either hosted snapshot into the local `../fragtrack` stack              |
+| `vp run github:configure [OWNER/REPO]`                                                                        | Validate local env files, sync GitHub Environments                              |
+| `vp run commit:weekly --staging-dir <path> --repo-root .`                                                     | Weekly Git snapshot commit (used by the workflow; runnable locally on `master`) |
 
 - Restore targets are **cleaned first** (`supabase db reset` / volume
-  recreation), then the verified snapshot applies in **one transaction**
-  (`ON_ERROR_STOP=1`); on failure the target rolls back and stays clean —
-  retry from the same verified snapshot.
+  recreation), then the verified snapshot applies in **one Dockerized psql
+  transaction** streamed over stdin (`ON_ERROR_STOP=1`, `--single-transaction`)
+  from the pinned ephemeral image; on failure the target rolls back and stays
+  clean — retry from the same verified snapshot. The client container uses
+  default bridge networking (no `--network=host`), keeps a read-only rootfs
+  with a writable in-memory `/tmp`, and complete stdin delivery is part of
+  command success: a source read failure terminates the client instead of
+  letting a partial SQL prefix commit and be reported as restored.
 - `--backup` accepts `latest` or one exact canonical snapshot id
   (`YYYY-MM-DDTHH-mm-ssZ`); unavailable ids print the valid choices.
 - Before any repo restore: `git pull --ff-only origin master`.
@@ -170,8 +184,7 @@ Arguments pass through directly — no `--` separator (`vp run backup --environm
   `RESTORE development`; hosted production `RESTORE production <project-ref>`;
   local `RESTORE local`.
 - Local restore: `supabase stop --no-backup` → recreate DB volume → restart
-  stack → apply snapshot → verify connectivity, public tables, migration
-  history, and snapshot-derived schema/row-data presence.
+  stack → apply snapshot → verify connectivity, tables, migrations, triggers.
 
 ### Staging directory (`--staging-dir`)
 
@@ -203,17 +216,14 @@ flowchart LR
 ### Local backup (`backup:local`)
 
 `vp run backup:local --environment <development|production>` packages the
-**already-running local Supabase stack** configured by `PROJECT_WORKDIR`
+**already-running local Supabase stack** owned by the sibling Fragtrack project
 into a private, repository-local store. It reuses the exact dump, fingerprint,
-gzip, age encryption, part splitting, and manifest pipeline as the hosted
-backup, but never touches R2 and never starts, stops, resets, or migrates the
-local stack. The selected
-environment only selects **target metadata and encryption** (`SUPABASE_PROJECT_REF`
-and `ENCRYPT_KEY`); the data source is always the local database.
-
-Source identity is verified before any dump: the stack must answer read-only
-probes inside its container AND publish the `config.toml` `[db]` port on the
-host, so the probes and the dumps cannot silently target different servers.
+gzip + plaintext part splitting, and manifest pipeline as the hosted backup,
+but never encrypts (no age binary, no `ENCRYPT_KEY`), never touches R2, and
+never starts, stops, resets, or migrates the local stack. It uses only
+read-only connectivity and source-state probes. The selected environment only
+selects **target metadata** (`SUPABASE_PROJECT_REF`); the data source is always
+the local database.
 
 ```text
 local-backups/<environment>/<YYYY-MM-DDTHH-mm-ssZ>/
@@ -221,33 +231,30 @@ local-backups/<environment>/<YYYY-MM-DDTHH-mm-ssZ>/
   schema.sql
   managed-schema.sql
   migration-history-schema.sql
-  data.sql.gz.age.part-000 …      # encrypted with the TARGET environment key
-  manifest.json                   # written last; completion marker
+  data.sql.gz.part-000 …      # plaintext (local-only) gzip parts, ≤90 MiB
+  manifest.json               # written last; completion marker, declares
+                              #   "encryption": { "format": "none" }
 ```
 
 - One completed snapshot is retained per environment; development and
   production stores, locks, comparisons, and retention are fully isolated.
-- For the duration of the six sequential dumps the source runs under a
-  **write barrier**: a held session takes `SHARE` locks on every user table,
-  so no row write can commit mid-dump (reads are unaffected). The dumps are
-  additionally bracketed by database-local state probes (mutation counters
-  plus relation, catalog, sequence, role, role-membership, and
-  default-privilege digests over every non-system schema). Any detected
-  change — or any lost/failed barrier — rejects the candidate before
-  packaging or publication; quiesce local writes and retry.
+- The six sequential logical dumps are bracketed by conservative, database-local
+  state probes (tuple-mutation counters plus relation, sequence, and role digests).
+  Any data, schema, role, or sequence change rejects the candidate before packaging
+  or publication; quiesce local writes and retry.
 - An **unchanged** database keeps the existing snapshot ID and path (same
-  logical content, target project ref, and age recipient). A **changed**
-  snapshot is fully validated, its files/directories are fsynced, and it is
-  atomically renamed and parent-fsynced before older snapshots are removed.
-  Retention is parent-fsynced again; unsupported fsync semantics fail closed
-  before old snapshots are deleted. Completed snapshots are never overwritten.
+  logical content and target project ref). A **changed** snapshot is fully
+  validated, its files/directories are fsynced, and it is atomically renamed
+  and parent-fsynced before older snapshots are removed. Retention is
+  parent-fsynced again; unsupported fsync semantics fail closed before old
+  snapshots are deleted. Completed snapshots are never overwritten.
 - On POSIX, existing store/snapshot directories must already be mode `0700`
   and retained files mode `0600`. Every retained file is allowlisted by the
   manifest and size/SHA-256
   verified; plaintext row-data intermediates never survive the run.
-- Do not commit `local-backups/` (gitignored). It is a private, encrypted
-  local artifact ready for a later, separately authorized upload or restore
-  flow — no upload command and no local restore source is added here.
+- Do not commit `local-backups/` (gitignored). The store is restorable via
+  `restore:development|production --source local` (see below) and ready for a
+  later, separately authorized upload flow — no upload command exists here.
 - **Stale-lock recovery:** if a run is interrupted, the environment lock
   `local-backups/.lock-<environment>` may remain. Confirm no matching
   `backup:local` command is active, then remove the lock file and retry. Lock
@@ -255,13 +262,20 @@ local-backups/<environment>/<YYYY-MM-DDTHH-mm-ssZ>/
   Interrupted canonical `.candidate-<16-hex>` directories are cleaned on the
   next run; noncanonical lookalikes are preserved for manual reconciliation.
 
-### Temporary workspaces
+### Restore a local backup to a hosted environment
 
-Backup/restore private temp directories are created under the canonical
-`supabase-db-backup-*` prefix; cleanup owns only directories created by the
-current process. Versions before the generic rename used `fragtrack-*`
-prefixes: after upgrading, remove any leftover `fragtrack-*` temp directories
-manually — they may contain decrypted row data or the age identity.
+`vp run restore:development|restore:production --source local --backup
+latest|<snapshot-id>` restores a snapshot from `local-backups/<target-env>/`
+into the hosted target database. Plaintext snapshots need **no decryption**:
+no `DECRYPT_KEY`, no age binary, no R2 credentials. `DECRYPT_KEY` is
+**optional** for `--source local` — it is only resolved when actually
+configured (and then conflict-checked like any other consumed variable). A
+pre-refactor age-encrypted snapshot still found in the store keeps working
+when `DECRYPT_KEY` and the age binary are configured; if the age binary is
+missing from PATH while `DECRYPT_KEY` is set, the restore fails fast during
+preflight with the install hint. Hosted read-only preflight,
+reset/apply pipeline, and confirmation phrases are unchanged (production still
+requires `RESTORE production <project-ref>`).
 
 ## References
 

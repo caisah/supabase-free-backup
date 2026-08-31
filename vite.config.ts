@@ -44,6 +44,7 @@ export default defineConfig({
       'data.sql',
       'data.sql.gz',
       'data.sql.gz.age',
+      'data.sql.gz.part-*',
       '*.age',
     ],
   },
@@ -82,6 +83,7 @@ export default defineConfig({
       'data.sql',
       'data.sql.gz',
       'data.sql.gz.age',
+      'data.sql.gz.part-*',
       '*.age',
     ],
     rules: {

@@ -6,7 +6,6 @@ import path from 'node:path';
 import { Writable } from 'node:stream';
 import { createHash } from 'node:crypto';
 import { runBackup, emitStagedSnapshot } from './backup.js';
-import { BACKUP_WORKSPACE_PREFIX } from '../src/backup.js';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { buildManifest, PLAINTEXT_ARTIFACTS, MANIFEST_NAME } from '../src/snapshot.js';
@@ -561,7 +560,7 @@ test('backup: plaintext workspace cleanup occurs on every failure', async () => 
   const { deps } = backupDeps({ contentSha256: 'd'.repeat(64), recipient: AGE_RECIPIENT_1 });
   const before = fs
     .readdirSync(os.tmpdir())
-    .filter((n) => n.startsWith(`${BACKUP_WORKSPACE_PREFIX}${process.pid}-`));
+    .filter((n) => n.startsWith(`fragtrack-backup-${process.pid}-`));
   await assert.rejects(
     () =>
       runBackup({
@@ -580,7 +579,7 @@ test('backup: plaintext workspace cleanup occurs on every failure', async () => 
   );
   const after = fs
     .readdirSync(os.tmpdir())
-    .filter((n) => n.startsWith(`${BACKUP_WORKSPACE_PREFIX}${process.pid}-`));
+    .filter((n) => n.startsWith(`fragtrack-backup-${process.pid}-`));
   assert.deepEqual(after, before, 'workspace must be removed after failure');
 });
 

@@ -1,7 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { runRestoreHosted, exitCodeForResult } from './restore-hosted.js';
 import { HostedRestoreError } from '../src/hosted-restore.js';
+import { PINNED_SUPABASE_POSTGRES_IMAGE, PINNED_SUPABASE_CLI_VERSION } from '../src/database.js';
+import { RestoreError } from '../src/restore.js';
+import { tmpdir } from '../src/test-fixtures.js';
 
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -70,7 +75,10 @@ function fakeDeps(overrides = {}) {
     },
     makeAdapter: () => ({}),
     lookup: () => process.execPath, // real existing executable for preflight existence checks
-    run: async () => ({}),
+    run: async (opts) => {
+      if (opts.args.includes('--version')) return { stdout: `${PINNED_SUPABASE_CLI_VERSION}\n` };
+      return {};
+    },
     stdIn: { isTTY: true },
     stdErr: readline,
     stdOut: readline,
@@ -231,6 +239,200 @@ test('restore-hosted: preflight failure prevents everything else', async () => {
   assert.equal(calls.execute, 0);
 });
 
+test('restore-hosted: local source needs no age binary or R2/age config', async () => {
+  const track = { prepare: [], lookups: [], phrase: null };
+  const { deps, calls } = fakeDeps({
+    loadConfig: ({ environment, source }) => ({
+      environment,
+      source,
+      dbUrl: DB_URL,
+      projectRef: REF,
+    }),
+    lookup: (name) => {
+      track.lookups.push(name);
+      if (name === 'age' || name === 'age.exe') return null;
+      return process.execPath;
+    },
+    doPrepare: async (opts) => {
+      track.prepare.push(opts);
+      return {
+        snapshotId: '2026-08-24T03-17-09Z',
+        dir: '/prepared',
+        dataPath: '/prepared/data.sql',
+        manifest: { environment: opts.environment },
+        cleanup: async () => {
+          calls.cleanup += 1;
+        },
+      };
+    },
+    doConfirm: async ({ expected: e }) => {
+      track.phrase = e;
+      return true;
+    },
+  });
+  const result = await runRestoreHosted({
+    options: hostedOptions({ source: 'local' }),
+    env: {},
+    cwd: '/repo',
+    logger: silentLogger,
+    deps,
+  });
+  assert.equal(result.target, 'development');
+  assert.equal(result.source, 'local');
+  assert.equal(result.snapshotId, '2026-08-24T03-17-09Z');
+  assert.equal(calls.preflight, 1, 'psql preflight still runs for local');
+  assert.equal(calls.execute, 1, 'apply pipeline runs after confirmation');
+  assert.equal(calls.cleanup, 1, 'prepared cleanup still runs');
+  assert.equal(track.phrase, 'RESTORE development', 'confirmation phrase uses the target');
+  assert.ok(
+    !track.lookups.includes('age') && !track.lookups.includes('age.exe'),
+    'age must never be resolved for the local source',
+  );
+  assert.equal(track.prepare.length, 1);
+  assert.equal(track.prepare[0].source, 'local');
+  assert.equal(track.prepare[0].selector, 'latest');
+  assert.equal(track.prepare[0].environment, 'development');
+  assert.equal(track.prepare[0].ageIdentity, undefined, 'no age identity for local');
+  assert.equal(track.prepare[0].agePath, undefined, 'no age path for local');
+});
+
+test('restore-hosted: local source with DECRYPT_KEY resolves age and passes identity to prepare', async () => {
+  const track = { prepare: [], lookups: [], phrase: null };
+  const identity = 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ';
+  const { deps, calls } = fakeDeps({
+    loadConfig: ({ environment, source }) => ({
+      environment,
+      source,
+      dbUrl: DB_URL,
+      projectRef: REF,
+      ageIdentity: identity,
+    }),
+    lookup: (name) => {
+      track.lookups.push(name);
+      return process.execPath;
+    },
+    doPrepare: async (opts) => {
+      track.prepare.push(opts);
+      return {
+        snapshotId: '2026-08-24T03-17-09Z',
+        dir: '/prepared',
+        dataPath: '/prepared/data.sql',
+        manifest: { environment: opts.environment },
+        cleanup: async () => {
+          calls.cleanup += 1;
+        },
+      };
+    },
+    doConfirm: async ({ expected: e }) => {
+      track.phrase = e;
+      return true;
+    },
+  });
+  const result = await runRestoreHosted({
+    options: hostedOptions({ source: 'local' }),
+    env: {},
+    cwd: '/repo',
+    logger: silentLogger,
+    deps,
+  });
+  assert.equal(result.source, 'local');
+  assert.equal(result.snapshotId, '2026-08-24T03-17-09Z');
+  assert.ok(
+    track.lookups.includes('age'),
+    'age must be resolved when DECRYPT_KEY is configured for the local source',
+  );
+  assert.equal(track.prepare.length, 1);
+  assert.equal(track.prepare[0].ageIdentity, identity);
+  assert.equal(track.prepare[0].agePath, process.execPath, 'resolved age path reaches prepare');
+});
+
+test('restore-hosted: local source with DECRYPT_KEY but no age binary fails before any target work', async () => {
+  const identity = 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ';
+  const { deps, calls } = fakeDeps({
+    loadConfig: ({ environment, source }) => ({
+      environment,
+      source,
+      dbUrl: DB_URL,
+      projectRef: REF,
+      ageIdentity: identity,
+    }),
+    lookup: (name) => (name === 'age' || name === 'age.exe' ? null : process.execPath),
+  });
+  await assert.rejects(
+    () =>
+      runRestoreHosted({
+        options: hostedOptions({ source: 'local' }),
+        env: {},
+        cwd: '/repo',
+        logger: silentLogger,
+        deps,
+      }),
+    /age executable not found/,
+  );
+  assert.equal(calls.preflight, 0, 'no preflight may run before executable resolution');
+  assert.equal(calls.prepare.length, 0, 'no source work may run');
+  assert.equal(calls.confirm, 0, 'no prompt may appear');
+  assert.equal(calls.execute, 0);
+});
+
+test('restore-hosted: local-source skip warnings are reported before confirmation', async () => {
+  const warned = [];
+  const { deps, calls } = fakeDeps({
+    doPrepare: async (opts) => {
+      calls.prepare.push(opts);
+      return {
+        snapshotId: '2026-08-24T03-17-09Z',
+        dir: '/prepared',
+        dataPath: '/prepared/data.sql',
+        manifest: { environment: opts.environment },
+        warnings: ['skipped local snapshot 2026-08-25T00-00-00Z: INVALID manifest JSON'],
+        cleanup: async () => {
+          calls.cleanup += 1;
+        },
+      };
+    },
+  });
+  await runRestoreHosted({
+    options: hostedOptions({ source: 'local' }),
+    env: {},
+    cwd: '/repo',
+    logger: { ...silentLogger, warn: (m) => warned.push(m) },
+    deps,
+  });
+  assert.deepEqual(warned, ['skipped local snapshot 2026-08-25T00-00-00Z: INVALID manifest JSON']);
+});
+
+test('restore-hosted: a local-source prepare failure surfaces the RestoreError', async () => {
+  const { deps, calls } = fakeDeps({
+    loadConfig: ({ environment, source }) => ({
+      environment,
+      source,
+      dbUrl: DB_URL,
+      projectRef: REF,
+    }),
+    lookup: (name) => (name === 'age' || name === 'age.exe' ? null : process.execPath),
+    doPrepare: async () => {
+      throw new RestoreError('no valid snapshots available for this environment/source');
+    },
+  });
+  await assert.rejects(
+    () =>
+      runRestoreHosted({
+        options: hostedOptions({ source: 'local' }),
+        env: {},
+        cwd: '/repo',
+        logger: silentLogger,
+        deps,
+      }),
+    (err) =>
+      err instanceof RestoreError &&
+      /no valid snapshots available for this environment\/source/.test(err.message),
+  );
+  assert.equal(calls.confirm, 0, 'no prompt after a failed prepare');
+  assert.equal(calls.execute, 0);
+  assert.equal(calls.cleanup, 0, 'preparation failure cleans up after itself');
+});
+
 test('restore-hosted: cleanup runs on every outcome', async () => {
   const { deps, calls } = fakeDeps({
     doExecute: async () => {
@@ -266,6 +468,144 @@ test('restore-hosted: logs never contain the DB URL or password', async () => {
   assert.ok(!portable.includes('the-password'));
 });
 
+test('restore-hosted: no host psql is discovered or required for local, repo, or r2 sources', async () => {
+  for (const source of ['local', 'repo', 'r2']) {
+    const track = { lookups: [] };
+    const { deps, calls } = fakeDeps({
+      lookup: (name) => {
+        track.lookups.push(name);
+        return process.execPath;
+      },
+    });
+    const result = await runRestoreHosted({
+      options: hostedOptions({ source }),
+      env: {},
+      cwd: '/repo',
+      logger: silentLogger,
+      deps,
+    });
+    assert.equal(result.source, source);
+    assert.equal(calls.execute, 1, `restore with source ${source} must succeed without host psql`);
+    assert.ok(
+      !track.lookups.includes('psql') && !track.lookups.includes('psql.exe'),
+      `psql must never be looked up for ${source}`,
+    );
+  }
+});
+
+test('restore-hosted: preflight and execute receive the resolved Docker path and pinned image', async () => {
+  const fakeDockerPath = '/usr/local/bin/docker';
+  const received = { preflight: null, execute: null };
+  const { deps } = fakeDeps({
+    lookup: (name) =>
+      name === 'docker' || name === 'docker.exe' ? fakeDockerPath : process.execPath,
+    doPreflight: async (opts) => {
+      received.preflight = opts;
+    },
+    doExecute: async (opts) => {
+      received.execute = opts;
+    },
+  });
+  await runRestoreHosted({
+    options: hostedOptions(),
+    env: {},
+    cwd: '/repo',
+    logger: silentLogger,
+    deps,
+  });
+  assert.equal(received.preflight.dockerPath, fakeDockerPath);
+  assert.equal(received.preflight.postgresImage, PINNED_SUPABASE_POSTGRES_IMAGE);
+  assert.equal(received.preflight.dbUrl, DB_URL);
+  assert.equal(received.execute.dockerPath, fakeDockerPath);
+  assert.equal(received.execute.postgresImage, PINNED_SUPABASE_POSTGRES_IMAGE);
+  assert.equal(received.execute.supabasePath, process.execPath);
+  const legacyKey = ['psql', 'Path'].join(''); // legacy seam name must not appear as a literal
+  assert.ok(
+    !(legacyKey in received.preflight) && !(legacyKey in received.execute),
+    'the legacy host-psql seam is gone from both preflight and execute',
+  );
+});
+
+test('restore-hosted: postgresImage defaults to the pin and can be overridden through deps', async () => {
+  const received = { preflight: null };
+  const { deps } = fakeDeps({
+    doPreflight: async (opts) => {
+      received.preflight = opts;
+    },
+  });
+  await runRestoreHosted({
+    options: hostedOptions(),
+    env: {},
+    cwd: '/repo',
+    logger: silentLogger,
+    deps,
+  });
+  assert.equal(received.preflight.postgresImage, PINNED_SUPABASE_POSTGRES_IMAGE);
+
+  const overridden = { preflight: null };
+  const alt = { postgresImage: 'registry.example/postgres:17-test' };
+  const { deps: deps2 } = fakeDeps({
+    ...alt,
+    doPreflight: async (opts) => {
+      overridden.preflight = opts;
+    },
+  });
+  await runRestoreHosted({
+    options: hostedOptions(),
+    env: {},
+    cwd: '/repo',
+    logger: silentLogger,
+    deps: deps2,
+  });
+  assert.equal(overridden.preflight.postgresImage, alt.postgresImage);
+  assert.equal(overridden.preflight.dockerPath, process.execPath);
+});
+
+test('restore-hosted: missing Supabase CLI fails before any target or source work', async () => {
+  const { deps, calls } = fakeDeps({
+    lookup: (name) => (name === 'supabase' ? null : process.execPath),
+  });
+  await assert.rejects(
+    () =>
+      runRestoreHosted({
+        options: hostedOptions(),
+        env: {},
+        cwd: '/repo',
+        logger: silentLogger,
+        deps,
+      }),
+    (err) => err instanceof HostedRestoreError && /Supabase CLI/.test(err.message),
+  );
+  assert.equal(calls.preflight, 0, 'no preflight may run before executable resolution');
+  assert.equal(calls.prepare.length, 0, 'no source work may run');
+  assert.equal(calls.confirm, 0, 'no prompt may appear');
+  assert.equal(calls.execute, 0);
+});
+
+test('restore-hosted: missing Docker fails before any target or source work with no psql hint', async () => {
+  const { deps, calls } = fakeDeps({
+    lookup: (name) => (name === 'docker' || name === 'docker.exe' ? null : process.execPath),
+  });
+  await assert.rejects(
+    () =>
+      runRestoreHosted({
+        options: hostedOptions(),
+        env: {},
+        cwd: '/repo',
+        logger: silentLogger,
+        deps,
+      }),
+    (err) =>
+      err instanceof HostedRestoreError &&
+      /Docker is required/.test(err.message) &&
+      !/psql/.test(err.message),
+  );
+  assert.equal(calls.preflight, 0, 'no preflight may run before executable resolution');
+  assert.equal(calls.prepare.length, 0, 'no source work may run');
+  assert.equal(calls.confirm, 0, 'no prompt may appear');
+  assert.equal(calls.execute, 0);
+});
+
 test('restore-hosted: missing executables fail before target contact', async () => {
   const { deps } = fakeDeps();
   await assert.rejects(
@@ -277,8 +617,82 @@ test('restore-hosted: missing executables fail before target contact', async () 
         logger: silentLogger,
         deps: { ...deps, lookup: () => null },
       }),
-    /psql/,
+    // With every executable absent, Docker (required for reset + the
+    // Dockerized client) is the first hard dependency and must fail first,
+    // and the failure must never suggest installing host psql.
+    (err) => err instanceof HostedRestoreError && !/psql/.test(err.message),
   );
+});
+
+test('restore-hosted: an unpinned Supabase CLI on PATH is rejected before any target work', async () => {
+  const root = tmpdir('bp-hosted-cli-');
+  const pathSupabase = path.join(root, 'supabase');
+  fs.writeFileSync(pathSupabase, '#!/bin/sh\necho supabase\n', { mode: 0o755 });
+  const versionCalls = [];
+  const { deps, calls } = fakeDeps({
+    lookup: (name) => (name === 'supabase' ? pathSupabase : process.execPath),
+    run: async (opts) => {
+      if (opts.args.includes('--version')) {
+        versionCalls.push(opts.command);
+        return { stdout: '2.99.0\n' }; // NOT the pinned version
+      }
+      return { stdout: '' };
+    },
+  });
+  await assert.rejects(
+    () =>
+      runRestoreHosted({
+        options: hostedOptions(),
+        env: {},
+        cwd: '/repo',
+        logger: silentLogger,
+        deps,
+      }),
+    (err) =>
+      err instanceof HostedRestoreError &&
+      err.message.includes(`must be exactly ${PINNED_SUPABASE_CLI_VERSION}`),
+  );
+  assert.deepEqual(versionCalls, [pathSupabase]);
+  assert.equal(calls.preflight, 0, 'no target preflight may run with an unpinned CLI');
+  assert.equal(calls.prepare.length, 0, 'no source work may run');
+  assert.equal(calls.execute, 0);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('restore-hosted: the repository-pinned CLI binary is preferred over any PATH supabase', async () => {
+  const root = tmpdir('bp-hosted-cli-');
+  const binDir = path.join(root, 'node_modules', '.bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(path.join(binDir, 'supabase'), '#!/bin/sh\necho supabase\n', { mode: 0o755 });
+  let lookupSupabase = 0;
+  let executedWith = null;
+  const { deps, calls } = fakeDeps({
+    lookup: (name) => {
+      if (name === 'supabase') {
+        lookupSupabase += 1;
+        return '/usr/local/bin/supabase';
+      }
+      return process.execPath;
+    },
+    run: async (opts) => {
+      if (opts.args.includes('--version')) {
+        executedWith = opts.command;
+        return { stdout: `${PINNED_SUPABASE_CLI_VERSION}\n` };
+      }
+      return { stdout: '' };
+    },
+  });
+  await runRestoreHosted({
+    options: hostedOptions(),
+    env: {},
+    cwd: root,
+    logger: silentLogger,
+    deps,
+  });
+  assert.equal(executedWith, path.join(binDir, 'supabase'));
+  assert.equal(lookupSupabase, 0, 'PATH must not be consulted when the repo binary exists');
+  assert.equal(calls.execute, 1);
+  fs.rmSync(root, { recursive: true, force: true });
 });
 
 test('restore-hosted: declined confirmation maps to a distinct exit code', () => {

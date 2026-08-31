@@ -18,7 +18,6 @@ import {
 const REF_DEV = 'a1b2c3d4e5f6a7b8c9d0';
 const REF_PROD = 'f0e9d8c7b6a5f4e3d2c1';
 const PASSWORD = 'the-ultimate-secret-password';
-const EXAMPLE_PROJECT_WORKDIR = '../example-project';
 
 function makeRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'bp-config-'));
@@ -43,7 +42,7 @@ function devFile(root, overrides = {}) {
     R2_SECRET_ACCESS_KEY: 'dev-secret-key-abcdefghijklmnop',
     ENCRYPT_KEY: 'age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
     DECRYPT_KEY: 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ',
-    PROJECT_WORKDIR: EXAMPLE_PROJECT_WORKDIR,
+    PROJECT_WORKDIR: '../fragtrack',
     ...overrides,
   });
 }
@@ -315,26 +314,6 @@ test('config: missing variables identify names, not values', () => {
       return true;
     },
   );
-  // Missing PROJECT_WORKDIR names only the variable, never the ambient path.
-  devFile(root, { SUPABASE_DB_URL: undefined, PROJECT_WORKDIR: undefined });
-  assert.throws(
-    () =>
-      loadLocalRestoreConfig({
-        environment: 'development',
-        source: 'repo',
-        root,
-        vars: {},
-      }),
-    (err) => {
-      assert.ok(err instanceof ConfigError);
-      assert.equal(
-        err.message,
-        'Backup configuration error:\n  - MISSING PROJECT_WORKDIR',
-        'only the variable name may appear — never a path value',
-      );
-      return true;
-    },
-  );
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -577,106 +556,45 @@ test('config: age recipient and identity shape are validated without echoing val
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('config: PROJECT_WORKDIR resolves relative to the repository root and keeps absolute paths', () => {
+test('config: PROJECT_WORKDIR resolves relative to the repository root', () => {
   const root = makeRoot();
-  devFile(root, { PROJECT_WORKDIR: EXAMPLE_PROJECT_WORKDIR });
+  devFile(root, { PROJECT_WORKDIR: '../fragtrack-proj' });
   const cfg = loadLocalRestoreConfig({
     environment: 'development',
     source: 'repo',
     root,
     vars: {},
   });
-  assert.equal(path.relative(root, cfg.projectWorkdir), EXAMPLE_PROJECT_WORKDIR);
-  assert.equal(path.resolve(root, EXAMPLE_PROJECT_WORKDIR), cfg.projectWorkdir);
+  assert.equal(path.relative(root, cfg.fragtrackWorkdir), '../fragtrack-proj');
+  assert.equal(path.resolve(root, '../fragtrack-proj'), cfg.fragtrackWorkdir);
+  fs.rmSync(root, { recursive: true, force: true });
+});
 
-  // An absolute value is preserved unchanged, never re-anchored.
-  const absolute = path.join(root, 'elsewhere', 'example-project');
-  devFile(root, { PROJECT_WORKDIR: absolute });
-  const absCfg = loadLocalRestoreConfig({
+test('config: local restore defaults PROJECT_WORKDIR to ../fragtrack', () => {
+  const root = makeRoot();
+  devFile(root, { PROJECT_WORKDIR: undefined });
+  const cfg = loadLocalRestoreConfig({
     environment: 'development',
     source: 'repo',
     root,
     vars: {},
   });
-  assert.equal(absCfg.projectWorkdir, absolute);
-  fs.rmSync(root, { recursive: true, force: true });
-});
-
-test('config: local restore requires PROJECT_WORKDIR for repo sources', () => {
-  const root = makeRoot();
-  devFile(root, { PROJECT_WORKDIR: undefined });
-  assert.throws(
-    () =>
-      loadLocalRestoreConfig({
-        environment: 'development',
-        source: 'repo',
-        root,
-        vars: {},
-      }),
-    (err) => err instanceof ConfigError && err.message.includes('MISSING PROJECT_WORKDIR'),
-  );
-  fs.rmSync(root, { recursive: true, force: true });
-});
-
-test('config: local restore requires PROJECT_WORKDIR for r2 sources with otherwise valid R2 credentials', () => {
-  const root = makeRoot();
-  devFile(root, { PROJECT_WORKDIR: undefined });
-  assert.throws(
-    () =>
-      loadLocalRestoreConfig({
-        environment: 'development',
-        source: 'r2',
-        root,
-        vars: {},
-      }),
-    (err) => {
-      assert.ok(err instanceof ConfigError);
-      assert.ok(err.message.includes('MISSING PROJECT_WORKDIR'), err.message);
-      assert.ok(!err.message.includes('CLOUDFLARE_ACCOUNT_ID'), err.message);
-      assert.ok(!err.message.includes('R2_'), err.message);
-      return true;
-    },
-  );
-  fs.rmSync(root, { recursive: true, force: true });
-});
-
-test('config: local backup requires PROJECT_WORKDIR', () => {
-  const root = makeRoot();
-  devFile(root, { PROJECT_WORKDIR: undefined });
-  assert.throws(
-    () => loadLocalBackupConfig({ environment: 'development', root, vars: {} }),
-    (err) => err instanceof ConfigError && err.message.includes('MISSING PROJECT_WORKDIR'),
-  );
-  fs.rmSync(root, { recursive: true, force: true });
-});
-
-test('config: hosted loaders stay valid without PROJECT_WORKDIR', () => {
-  const root = makeRoot();
-  devFile(root, { PROJECT_WORKDIR: undefined });
-  const backupCfg = loadBackupConfig({ environment: 'development', root, vars: {} });
-  assert.equal(backupCfg.projectWorkdir, undefined);
-  const restoreCfg = loadHostedRestoreConfig({
-    environment: 'development',
-    source: 'r2',
-    root,
-    vars: {},
-  });
-  assert.equal(restoreCfg.projectWorkdir, undefined);
+  assert.equal(cfg.fragtrackWorkdir, path.join(root, '..', 'fragtrack'));
   fs.rmSync(root, { recursive: true, force: true });
 });
 
 test('config: local backup succeeds with only its own requirements', () => {
   const root = makeRoot();
-  devFile(root, { PROJECT_WORKDIR: EXAMPLE_PROJECT_WORKDIR });
+  devFile(root);
   const cfg = loadLocalBackupConfig({ environment: 'development', root, vars: {} });
   assert.equal(cfg.environment, 'development');
   assert.equal(cfg.projectRef, REF_DEV);
-  assert.equal(cfg.ageRecipient, 'age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx');
-  assert.equal(cfg.projectWorkdir, path.resolve(root, EXAMPLE_PROJECT_WORKDIR));
+  assert.equal(cfg.ageRecipient, undefined, 'ENCRYPT_KEY is not consumed by local backup');
+  assert.equal(cfg.fragtrackWorkdir, path.join(root, '..', 'fragtrack'));
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('config: local backup never resolves, validates, or returns hosted/R2/private fields', () => {
+test('config: local backup returns only consumed fields', () => {
   const root = makeRoot();
   devFile(root, {
     SUPABASE_DB_URL: 'not-a-url',
@@ -684,8 +602,8 @@ test('config: local backup never resolves, validates, or returns hosted/R2/priva
     R2_ACCESS_KEY_ID: 'x',
     R2_SECRET_ACCESS_KEY: 'y',
     R2_BUCKET: 'production',
+    ENCRYPT_KEY: 'not-an-age-key',
     DECRYPT_KEY: 'not-an-age-identity',
-    PROJECT_WORKDIR: EXAMPLE_PROJECT_WORKDIR,
   });
 
   const cfg = loadLocalBackupConfig({
@@ -696,6 +614,7 @@ test('config: local backup never resolves, validates, or returns hosted/R2/priva
       R2_ACCESS_KEY_ID: 'z',
       R2_SECRET_ACCESS_KEY: 'q',
       R2_BUCKET: 'not-development',
+      ENCRYPT_KEY: 'also-not-an-age-key',
       DECRYPT_KEY: 'also-not-an-age-identity',
     },
   });
@@ -703,8 +622,7 @@ test('config: local backup never resolves, validates, or returns hosted/R2/priva
   assert.deepEqual(cfg, {
     environment: 'development',
     projectRef: REF_DEV,
-    ageRecipient: 'age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-    projectWorkdir: path.resolve(root, EXAMPLE_PROJECT_WORKDIR),
+    fragtrackWorkdir: path.resolve(root, '../fragtrack'),
   });
   for (const name of [
     'dbUrl',
@@ -712,6 +630,7 @@ test('config: local backup never resolves, validates, or returns hosted/R2/priva
     'bucket',
     'accessKeyId',
     'secretAccessKey',
+    'ageRecipient',
     'ageIdentity',
     'r2Endpoint',
   ]) {
@@ -720,32 +639,20 @@ test('config: local backup never resolves, validates, or returns hosted/R2/priva
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('config: local backup resolves relative and absolute workdirs', () => {
+test('config: local backup resolves explicit and default workdirs', () => {
   const root = makeRoot();
-  devFile(root, { PROJECT_WORKDIR: EXAMPLE_PROJECT_WORKDIR });
+  devFile(root, { PROJECT_WORKDIR: '../fragtrack-proj' });
   const cfg = loadLocalBackupConfig({ environment: 'development', root, vars: {} });
-  assert.equal(path.resolve(root, EXAMPLE_PROJECT_WORKDIR), cfg.projectWorkdir);
+  assert.equal(path.resolve(root, '../fragtrack-proj'), cfg.fragtrackWorkdir);
 
-  const absolute = path.join(root, 'elsewhere', 'example-project');
-  devFile(root, { PROJECT_WORKDIR: absolute });
-  const absCfg = loadLocalBackupConfig({ environment: 'development', root, vars: {} });
-  assert.equal(absCfg.projectWorkdir, absolute);
+  devFile(root, { PROJECT_WORKDIR: undefined });
+  const defaulted = loadLocalBackupConfig({ environment: 'development', root, vars: {} });
+  assert.equal(defaulted.fragtrackWorkdir, path.join(root, '..', 'fragtrack'));
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('config: local backup fails on missing/invalid ref, recipient, or environment without leaks', () => {
+test('config: local backup fails on missing/invalid ref or environment without leaks', () => {
   const root = makeRoot();
-  const badRecipient = 'not-an-age-key';
-  devFile(root, { ENCRYPT_KEY: badRecipient });
-  assert.throws(
-    () => loadLocalBackupConfig({ environment: 'development', root, vars: {} }),
-    (err) => {
-      assert.ok(err instanceof ConfigError);
-      assert.ok(err.message.includes('ENCRYPT_KEY'), err.message);
-      assert.ok(!err.message.includes(badRecipient), 'recipient leaked');
-      return true;
-    },
-  );
   devFile(root, { SUPABASE_PROJECT_REF: 'not-a-ref' });
   assert.throws(
     () => loadLocalBackupConfig({ environment: 'development', root, vars: {} }),
@@ -792,20 +699,122 @@ test('config: local backup consumed disagreements conflict; unused ones never do
       loadLocalBackupConfig({
         environment: 'development',
         root,
-        vars: { ENCRYPT_KEY: `age0${'z'.repeat(40)}` },
-      }),
-    (err) => err instanceof ConfigError && err.message.includes(`${CONFLICT_PREFIX} ENCRYPT_KEY`),
-  );
-  assert.throws(
-    () =>
-      loadLocalBackupConfig({
-        environment: 'development',
-        root,
         vars: { PROJECT_WORKDIR: '../other' },
       }),
     (err) =>
       err instanceof ConfigError && err.message.includes(`${CONFLICT_PREFIX} PROJECT_WORKDIR`),
   );
+  // ENCRYPT_KEY is no longer consumed: a differing process export neither
+  // conflicts nor blocks the run (names-only scoping covers this).
+  const cfg = loadLocalBackupConfig({
+    environment: 'development',
+    root,
+    vars: { ENCRYPT_KEY: `age0${'z'.repeat(40)}` },
+  });
+  assert.equal(cfg.environment, 'development');
+  assert.equal(cfg.projectRef, REF_DEV);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: hosted local source resolves DECRYPT_KEY when present but never requires it', () => {
+  const root = makeRoot();
+  devFile(root); // the default file carries a valid DECRYPT_KEY
+  const cfg = loadHostedRestoreConfig({
+    environment: 'development',
+    source: 'local',
+    root,
+    vars: {},
+  });
+  assert.equal(
+    cfg.ageIdentity,
+    'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ',
+    'a configured DECRYPT_KEY must reach the local-source restore path',
+  );
+  assert.equal(cfg.environment, 'development');
+  assert.equal(cfg.projectRef, REF_DEV);
+
+  // No DECRYPT_KEY anywhere: plaintext local restores must still work.
+  devFile(root, { DECRYPT_KEY: undefined });
+  const without = loadHostedRestoreConfig({
+    environment: 'development',
+    source: 'local',
+    root,
+    vars: {},
+  });
+  assert.equal(without.ageIdentity, undefined);
+  assert.ok(!Object.hasOwn(without, 'ageIdentity'), 'absent identity is not exposed');
+
+  // Once consumed, DECRYPT_KEY disagreements are conflicts (names only).
+  devFile(root);
+  assert.throws(
+    () =>
+      loadHostedRestoreConfig({
+        environment: 'development',
+        source: 'local',
+        root,
+        vars: { DECRYPT_KEY: 'AGE-SECRET-KEY-1ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ' },
+      }),
+    (err) => err instanceof ConfigError && err.message.includes(`${CONFLICT_PREFIX} DECRYPT_KEY`),
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: hosted local-source restore consumes only ref, URL, and environment', () => {
+  const root = makeRoot();
+  devFile(root, { DECRYPT_KEY: undefined });
+  const cfg = loadHostedRestoreConfig({
+    environment: 'development',
+    source: 'local',
+    root,
+    vars: {},
+  });
+  assert.equal(cfg.environment, 'development');
+  assert.equal(cfg.projectRef, REF_DEV);
+  assert.equal(
+    cfg.dbUrl,
+    `postgresql://postgres.${REF_DEV}:${PASSWORD}@aws-0-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require`,
+  );
+  assert.equal(cfg.fragtrackWorkdir, undefined);
+  for (const name of [
+    'accountId',
+    'bucket',
+    'accessKeyId',
+    'secretAccessKey',
+    'ageRecipient',
+    'ageIdentity',
+    'r2Endpoint',
+  ]) {
+    assert.ok(!Object.hasOwn(cfg, name), `local-source restore config exposed ${name}`);
+  }
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: hosted local source requires target URL and ref, and ignores R2 disagreements', () => {
+  const root = makeRoot();
+  devFile(root, { SUPABASE_DB_URL: undefined });
+  assert.throws(
+    () => loadHostedRestoreConfig({ environment: 'development', source: 'local', root, vars: {} }),
+    (err) => err instanceof ConfigError && err.message.includes('SUPABASE_DB_URL'),
+  );
+  devFile(root, { SUPABASE_PROJECT_REF: undefined });
+  assert.throws(
+    () => loadHostedRestoreConfig({ environment: 'development', source: 'local', root, vars: {} }),
+    (err) => err instanceof ConfigError && err.message.includes('SUPABASE_PROJECT_REF'),
+  );
+  // R2 credentials are not consumed: a differing process export is not a conflict.
+  devFile(root);
+  const cfg = loadHostedRestoreConfig({
+    environment: 'development',
+    source: 'local',
+    root,
+    vars: {
+      R2_ACCESS_KEY_ID: 'different-access-key-98765',
+      R2_SECRET_ACCESS_KEY: 'different-secret-key-9876543210',
+      R2_BUCKET: 'production',
+    },
+  });
+  assert.equal(cfg.environment, 'development');
+  assert.equal(cfg.projectRef, REF_DEV);
   fs.rmSync(root, { recursive: true, force: true });
 });
 

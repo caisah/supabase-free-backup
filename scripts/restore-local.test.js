@@ -2,14 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { runRestoreLocal, exitCodeForResult, createCleanupWorkspace } from './restore-local.js';
+import { runRestoreLocal, exitCodeForResult } from './restore-local.js';
 import { LocalRestoreError } from '../src/local-restore.js';
-import { RESTORE_WORKSPACE_PREFIXES } from '../src/restore.js';
 import { tmpdir, writePrivateFile } from '../src/test-fixtures.js';
 
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import os from 'node:os';
 
 function runCli(name, args) {
   const script = fileURLToPath(new URL('./' + name + '.js', import.meta.url));
@@ -18,12 +16,12 @@ function runCli(name, args) {
 
 const ID = '2026-08-24T03-17-09Z';
 
-function makeProject(root) {
-  const workdir = path.join(root, 'example-project');
+function makeFragtrack(root) {
+  const workdir = path.join(root, 'fragtrack');
   fs.mkdirSync(path.join(workdir, 'supabase'), { recursive: true, mode: 0o700 });
   fs.writeFileSync(
     path.join(workdir, 'supabase', 'config.toml'),
-    'project_id = "example-project"\n\n[db]\nport = 54322\nshadow_port = 54320\nmajor_version = 17\n',
+    'project_id = "fragtrack"\n\n[db]\nport = 54322\nshadow_port = 54320\nmajor_version = 17\n',
   );
   return workdir;
 }
@@ -37,7 +35,7 @@ function fakeDeps(overrides = {}) {
         environment,
         source,
         ageIdentity: 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ',
-        projectWorkdir: '/workdir/example-project',
+        fragtrackWorkdir: '/fragtrack',
         accountId: '0123456789abcdef0123456789abcdef',
         bucket: environment,
         accessKeyId: 'a',
@@ -79,10 +77,10 @@ function fakeDeps(overrides = {}) {
     doValidateWorkdir: () => {
       calls.validate += 1;
       return {
-        workdir: '/workdir/example-project',
-        projectId: 'example-project',
+        workdir: '/fragtrack',
+        projectId: 'fragtrack',
         dbPort: 54322,
-        dbContainer: 'supabase_db_example-project',
+        dbContainer: 'supabase_db_fragtrack',
       };
     },
     doConfirm: async ({ isTTY: tty }) => {
@@ -159,10 +157,10 @@ test('restore-local: cheap workdir validation precedes expensive source preparat
     doValidateWorkdir: () => {
       order.push('validate');
       return {
-        workdir: '/workdir/example-project',
-        projectId: 'example-project',
+        workdir: '/fragtrack',
+        projectId: 'fragtrack',
         dbPort: 54322,
-        dbContainer: 'supabase_db_example-project',
+        dbContainer: 'supabase_db_fragtrack',
       };
     },
     doPrepare: async () => {
@@ -231,24 +229,6 @@ test('restore-local: non-TTY or wrong phrase leaves the stack untouched', async 
   assert.equal(calls2.restore, 0);
 });
 
-test('restore-local: cleanup workspace uses the shared prefix constant', async () => {
-  const preparedDir = tmpdir('bp-rl-cleanup-prefix-');
-  writePrivateFile(path.join(preparedDir, 'data.sql'), 'COPY "auth"."x" FROM stdin;\n1\n\\.\n');
-  const workspace = await createCleanupWorkspace({
-    dataPath: path.join(preparedDir, 'data.sql'),
-  });
-  try {
-    assert.ok(
-      workspace.cleanupDir.startsWith(path.join(os.tmpdir(), RESTORE_WORKSPACE_PREFIXES.cleanup)),
-      `cleanup dir must use the shared prefix ${RESTORE_WORKSPACE_PREFIXES.cleanup}`,
-    );
-    assert.ok(fs.existsSync(workspace.cleanupFile), 'cleanup SQL file must exist');
-  } finally {
-    fs.rmSync(workspace.cleanupDir, { recursive: true, force: true });
-    fs.rmSync(preparedDir, { recursive: true, force: true });
-  }
-});
-
 test('restore-local: combined SQL and prepared workspace are removed in every outcome', async () => {
   const { deps, calls } = fakeDeps({
     doRestore: async () => {
@@ -302,12 +282,12 @@ test('restore-local: prepared workspace is cleaned when cleanup SQL generation f
 
 test('restore-local: full flow with a real workdir and prepared workspace', async () => {
   const root = tmpdir('bp-rl-');
-  makeProject(root);
+  makeFragtrack(root);
   const wdInfo = {
-    workdir: fs.realpathSync(path.join(root, 'example-project')),
-    projectId: 'example-project',
+    workdir: fs.realpathSync(path.join(root, 'fragtrack')),
+    projectId: 'fragtrack',
     dbPort: 54322,
-    dbContainer: 'supabase_db_example-project',
+    dbContainer: 'supabase_db_fragtrack',
   };
   const { deps } = fakeDeps({
     doValidateWorkdir: () => wdInfo,
@@ -324,7 +304,7 @@ test('restore-local: full flow with a real workdir and prepared workspace', asyn
         execSeq.push({ prepared, cleanupFile, workdir, dbContainer, dbPort });
         assert.ok(prepared.dir, 'prepared workspace passed through');
         assert.ok(cleanupFile, 'cleanup file passed through');
-        assert.equal(dbContainer, 'supabase_db_example-project');
+        assert.equal(dbContainer, 'supabase_db_fragtrack');
         assert.equal(dbPort, 54322);
       },
     },
@@ -361,10 +341,6 @@ test('restore-local: output never contains URL/password/SQL data', async () => {
   assert.ok(!text.includes('AGE-SECRET-KEY-1Q'));
   assert.ok(!text.includes('data.sql'));
   assert.ok(text.includes('RESTORE local') || text.includes('snapshot'), text.slice(0, 200));
-  assert.ok(
-    text.includes('local Supabase project'),
-    'the data-loss warning must describe the configured project, not a default name',
-  );
 });
 
 test('restore-local: CLI entry point responds to --help', () => {

@@ -17,6 +17,19 @@ import { resolvePrivatePath, POSTGRES_MAJOR_VERSION } from './snapshot.js';
 
 export const PINNED_SUPABASE_CLI_VERSION = '2.114.0';
 
+/**
+ * Supabase Postgres image pinned by immutable manifest DIGEST, never a
+ * mutable tag: the registry verifies the digest, so a re-pointed or
+ * compromised tag can never be executed by a destructive restore. The
+ * reviewed human-readable tag kept below is documentation/upgrade context
+ * ONLY — code executes the digest reference. Both pins come from the same
+ * CLI release and must move together on upgrades; hosted restores run
+ * `psql` 17 from this ephemeral image.
+ */
+export const PINNED_SUPABASE_POSTGRES_TAG = 'public.ecr.aws/supabase/postgres:17.6.1.158';
+export const PINNED_SUPABASE_POSTGRES_IMAGE =
+  'public.ecr.aws/supabase/postgres@sha256:99b1729aeb0bac314445024fc149fbd39306170b61dd50800ccf180327ab3459';
+
 export const DUMP_FILE_NAMES = {
   roles: 'roles.sql',
   schema: 'schema.sql',

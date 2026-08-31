@@ -25,7 +25,7 @@ r2-download/
 restore-*/
 dump-*/
 
-# Private local backup store (repository-local, target-encrypted snapshots)
+# Private local backup store (repository-local, plaintext snapshots)
 local-backups/
 
 # Private plaintext row-data intermediates (never packaged or committed)
@@ -34,6 +34,7 @@ database-data.sql
 data.sql
 data.sql.gz
 data.sql.gz.age
+data.sql.gz.part-*
 *.age
 
 # OS / logs / editor

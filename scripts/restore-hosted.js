@@ -1,14 +1,18 @@
 #!/usr/bin/env node
 /**
- * Hosted development/production restore entry point (sub-plan 07).
+ * Hosted development/production restore entry point.
  *
- *   vp run restore:development --source r2 --backup latest
- *   vp run restore:production  --source repo --backup <snapshot-id>
+ *   vp run restore:development --source r2|repo|local --backup latest
+ *   vp run restore:production  --source r2|repo|local --backup <snapshot-id>
  *
- * The package alias fixes the target environment (passed as argv[0]). Every
- * verification, decryption, and read-only preflight completes BEFORE the
- * interactive confirmation gate; nothing destructive runs without the exact
- * phrase. Production additionally requires the exact project ref.
+ * The package alias fixes the target environment (passed as argv[0]).
+ * `--source local` reads the private local store (`local-backups/<env>/`)
+ * with NO decryption for plaintext snapshots; DECRYPT_KEY is resolved
+ * OPTIONALLY (plaintext snapshots never need it), and a pre-refactor
+ * age-encrypted local snapshot still restores when DECRYPT_KEY + age are
+ * configured. Every verification and read-only preflight completes BEFORE
+ * the interactive confirmation gate; nothing destructive runs without the
+ * exact phrase. Production additionally requires the exact project ref.
  */
 
 import fs from 'node:fs';
@@ -27,6 +31,7 @@ import {
   executeHostedRestore,
   HostedRestoreError,
 } from '../src/hosted-restore.js';
+import { PINNED_SUPABASE_POSTGRES_IMAGE, PINNED_SUPABASE_CLI_VERSION } from '../src/database.js';
 import { parseHostedRestoreArgs, HOSTED_RESTORE_USAGE, exitCodeForResult } from './args.js';
 
 export { exitCodeForResult };
@@ -35,21 +40,65 @@ function expectedPhrase(environment, projectRef) {
   return environment === 'production' ? `RESTORE production ${projectRef}` : 'RESTORE development';
 }
 
-/** Discover psql, the pinned Supabase CLI, Docker, and age; any miss aborts early. */
-function resolveHostedRestoreExecutables({ lookup, cwd, platform }) {
-  const psqlPath = lookup(platform === 'win32' ? 'psql.exe' : 'psql');
-  if (!psqlPath) throw new HostedRestoreError('psql (PostgreSQL 17 client) not found on PATH');
-  const supabasePath = lookup('supabase') ?? path.join(cwd, 'node_modules', '.bin', 'supabase');
+/**
+ * Discover the pinned Supabase CLI and Docker always; age only when
+ * `requireAge` is set. No host psql is ever discovered: every hosted
+ * PostgreSQL client operation runs psql 17 from the pinned ephemeral
+ * Supabase Postgres image (see `PINNED_SUPABASE_POSTGRES_IMAGE`). For
+ * repo/r2 sources age is always required; for the local source it is
+ * resolved only when DECRYPT_KEY is configured (a legacy encrypted local
+ * snapshot needs it; plaintext snapshots never do).
+ *
+ * The repository-pinned CLI (`node_modules/.bin/supabase`) is resolved
+ * FIRST and its exact version is enforced (matching the dump path's
+ * preflight) BEFORE any target contact: the destructive `db reset` must
+ * never run through an arbitrary PATH CLI while the operator is told the
+ * toolchain is pinned.
+ */
+async function resolveHostedRestoreExecutables({ lookup, cwd, platform, requireAge, run }) {
+  const repoCli = path.join(cwd, 'node_modules', '.bin', 'supabase');
+  const supabasePath = fs.existsSync(repoCli)
+    ? repoCli
+    : (lookup('supabase') ?? path.join(cwd, 'node_modules', '.bin', 'supabase'));
   if (!supabasePath || !fs.existsSync(supabasePath))
     throw new HostedRestoreError('Supabase CLI not found; run vp install');
+  await assertPinnedSupabaseCliVersion({ supabasePath, run });
   const dockerPath = lookup(platform === 'win32' ? 'docker.exe' : 'docker');
   if (!dockerPath)
-    throw new HostedRestoreError('Docker is required for the Supabase clean/reset step');
-  // Bundled with the other executables like restore-local: decryption needs
-  // the age binary and the same preflight guarantees apply before source work.
-  const ageBin = lookup(platform === 'win32' ? 'age.exe' : 'age');
-  if (!ageBin) throw new HostedRestoreError('age executable not found on PATH');
-  return { psqlPath, supabasePath, dockerPath, ageBin };
+    throw new HostedRestoreError(
+      'Docker is required for the Supabase clean/reset step and the Dockerized PostgreSQL restore client',
+    );
+  let ageBin;
+  if (requireAge) {
+    ageBin = lookup(platform === 'win32' ? 'age.exe' : 'age');
+    if (!ageBin) throw new HostedRestoreError('age executable not found on PATH');
+  }
+  return { supabasePath, dockerPath, ageBin };
+}
+
+/**
+ * The destructive hosted path enforces the SAME exact CLI pin the dump path
+ * uses, before confirmation and target mutation. Errors are static (no
+ * arguments) and never reproduce credentials.
+ */
+async function assertPinnedSupabaseCliVersion({ supabasePath, run }) {
+  let version;
+  try {
+    const res = await run({
+      command: supabasePath,
+      args: ['--version'],
+      stdout: 'collect',
+      stderr: 'collect',
+    });
+    version = (res.stdout ?? '').trim();
+  } catch (err) {
+    throw new HostedRestoreError('Supabase CLI version check failed', { cause: err });
+  }
+  if (version !== PINNED_SUPABASE_CLI_VERSION) {
+    throw new HostedRestoreError(
+      `Supabase CLI must be exactly ${PINNED_SUPABASE_CLI_VERSION}; found ${version || '(unreadable)'}. Update the pin in package.json and run vp install.`,
+    );
+  }
 }
 
 /** Render the summary and ask for the exact phrase; true only when confirmed. */
@@ -83,6 +132,7 @@ function resolveHostedRestoreDeps(deps) {
     makeAdapter: deps.makeAdapter ?? createS3Adapter,
     lookup: deps.lookup ?? lookupExecutable,
     run: deps.run ?? runCommand,
+    postgresImage: deps.postgresImage ?? PINNED_SUPABASE_POSTGRES_IMAGE,
     stdIn: deps.stdIn ?? process.stdin,
     stdErr: deps.stdErr ?? process.stderr,
   };
@@ -103,12 +153,21 @@ async function prepareHostedRestore({ ctx, d, logger }) {
   logger.addSecret(ctx.cfg.dbUrl);
   logger.addSecret(ctx.cfg.accessKeyId);
   logger.addSecret(ctx.cfg.secretAccessKey);
-  const executables = resolveHostedRestoreExecutables({
+  const executables = await resolveHostedRestoreExecutables({
     lookup: d.lookup,
     cwd: ctx.cwd,
     platform: process.platform,
+    run: d.run,
+    // repo/r2 restores always need age; the local source needs it exactly
+    // when DECRYPT_KEY is configured (legacy encrypted snapshots).
+    requireAge: ctx.source !== 'local' || Boolean(ctx.cfg.ageIdentity),
   });
-  await d.doPreflight({ psqlPath: executables.psqlPath, dbUrl: ctx.cfg.dbUrl, run: d.run });
+  await d.doPreflight({
+    dockerPath: executables.dockerPath,
+    postgresImage: d.postgresImage,
+    dbUrl: ctx.cfg.dbUrl,
+    run: d.run,
+  });
   const adapter = createRestoreAdapter({
     source: ctx.source,
     cfg: ctx.cfg,
@@ -144,6 +203,9 @@ export async function runRestoreHosted({
   const d = resolveHostedRestoreDeps(deps);
   const ctx = createHostedRestoreContext({ options, env, cwd, d });
   const { prepared, executables } = await prepareHostedRestore({ ctx, d, logger });
+  for (const warning of prepared.warnings ?? []) {
+    logger.warn(warning);
+  }
 
   try {
     const ok = await requestHostedConfirmation({
@@ -165,7 +227,8 @@ export async function runRestoreHosted({
       environment: ctx.target,
       config: { ...ctx.cfg, repoRoot: ctx.cwd },
       prepared,
-      psqlPath: executables.psqlPath,
+      dockerPath: executables.dockerPath,
+      postgresImage: d.postgresImage,
       supabasePath: executables.supabasePath,
       run: d.run,
       logger,

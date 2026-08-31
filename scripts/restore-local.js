@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * Local project restore entry point (sub-plan 08).
+ * Local Fragtrack restore entry point (sub-plan 08).
  *
  *   vp run restore:local --environment development --source r2 --backup latest
  *   vp run restore:local --environment production --source repo --backup <snapshot-id>
  *
- * Destroys ONLY the local Supabase project Docker volume after full source
+ * Destroys ONLY the local Fragtrack Docker volume after full source
  * verification and the exact `RESTORE local` confirmation; tracked files in
- * the project workdir are never touched.
+ * `../fragtrack` are never touched.
  */
 
 import fs from 'node:fs';
@@ -18,11 +18,7 @@ import { assertNodeVersion } from '../src/runtime.js';
 import { createLogger } from '../src/logger.js';
 import { runCommand, lookupExecutable } from '../src/process.js';
 import { loadLocalRestoreConfig } from '../src/config.js';
-import {
-  prepareRestore,
-  createRestoreAdapter,
-  RESTORE_WORKSPACE_PREFIXES,
-} from '../src/restore.js';
+import { prepareRestore, createRestoreAdapter } from '../src/restore.js';
 import { createS3Adapter } from '../src/r2.js';
 import { confirmExactPhrase, generateCleanupSqlFromFile } from '../src/hosted-restore.js';
 import {
@@ -41,15 +37,15 @@ function resolveLocalRestoreExecutables({ lookup, cwd, platform }) {
   if (!supabasePath || !fs.existsSync(supabasePath))
     throw new LocalRestoreError('Supabase CLI not found; run vp install');
   const dockerPath = lookup(platform === 'win32' ? 'docker.exe' : 'docker');
-  if (!dockerPath) throw new LocalRestoreError('Docker is required for the local Supabase stack');
+  if (!dockerPath) throw new LocalRestoreError('Docker is required for the local Fragtrack stack');
   const ageBin = lookup(platform === 'win32' ? 'age.exe' : 'age');
   if (!ageBin) throw new LocalRestoreError('age executable not found on PATH');
   return { supabasePath, dockerPath, ageBin };
 }
 
 /** Create the private cleanup SQL workspace; the caller owns its removal. */
-export async function createCleanupWorkspace(prepared) {
-  const cleanupDir = fs.mkdtempSync(path.join(os.tmpdir(), RESTORE_WORKSPACE_PREFIXES.cleanup));
+async function createCleanupWorkspace(prepared) {
+  const cleanupDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fragtrack-cleanup-'));
   fs.chmodSync(cleanupDir, 0o700);
   const cleanupFile = path.join(cleanupDir, 'cleanup.sql');
   try {
@@ -71,7 +67,7 @@ export async function createCleanupWorkspace(prepared) {
  */
 function renderLocalWarning({ workdir, environment, source, snapshotId }) {
   return [
-    `Target               : local Supabase project (${workdir})`,
+    `Target               : local Fragtrack stack (${workdir})`,
     `Source environment   : ${environment}`,
     `Source               : ${source}`,
     `Snapshot             : ${snapshotId}`,
@@ -112,11 +108,11 @@ function prepareLocalTarget({ ctx, d }) {
     cwd: ctx.cwd,
     platform: process.platform,
   });
-  const localProject = d.doValidateWorkdir({
-    projectWorkdir: ctx.cfg.projectWorkdir,
+  const fragtrack = d.doValidateWorkdir({
+    fragtrackWorkdir: ctx.cfg.fragtrackWorkdir,
     repoRoot: ctx.cwd,
   });
-  return { executables, localProject };
+  return { executables, fragtrack };
 }
 
 /** Fully acquire, verify, and decrypt the selected snapshot source. */
@@ -141,10 +137,10 @@ async function prepareLocalRestoreSource({ ctx, d, executables }) {
 }
 
 /** Render the data-loss warning and ask for the exact `RESTORE local` phrase. */
-async function confirmLocalRestore({ ctx, d, prepared, localProject, isTTY }) {
+async function confirmLocalRestore({ ctx, d, prepared, fragtrack, isTTY }) {
   d.stdErr.write(
     renderLocalWarning({
-      workdir: localProject.workdir,
+      workdir: fragtrack.workdir,
       environment: ctx.environment,
       source: ctx.source,
       snapshotId: prepared.snapshotId,
@@ -164,18 +160,18 @@ async function applyLocalRestore({
   d,
   prepared,
   executables,
-  localProject,
+  fragtrack,
   cleanupFile,
   logger,
 }) {
   await d.doRestore({
     supabasePath: executables.supabasePath,
-    workdir: localProject.workdir,
+    workdir: fragtrack.workdir,
     prepared,
     cleanupFile,
     dockerPath: executables.dockerPath,
-    dbContainer: localProject.dbContainer,
-    dbPort: localProject.dbPort,
+    dbContainer: fragtrack.dbContainer,
+    dbPort: fragtrack.dbPort,
     run: d.run,
     logger,
   });
@@ -184,7 +180,7 @@ async function applyLocalRestore({
       environment: ctx.environment,
       source: ctx.source,
       snapshotId: prepared.snapshotId,
-      workdir: localProject.workdir,
+      workdir: fragtrack.workdir,
     }),
   );
   return {
@@ -196,7 +192,7 @@ async function applyLocalRestore({
 }
 
 /**
- * Full local project restore orchestration. All heavy adapters are
+ * Full local Fragtrack restore orchestration. All heavy adapters are
  * injectable; `options` is the validated `{ environment, source, backup }`.
  */
 export async function runRestoreLocal({
@@ -211,7 +207,7 @@ export async function runRestoreLocal({
   logger.addSecret(ctx.cfg.dbUrl);
   logger.addSecret(ctx.cfg.accessKeyId);
   logger.addSecret(ctx.cfg.secretAccessKey);
-  const { executables, localProject } = prepareLocalTarget({ ctx, d });
+  const { executables, fragtrack } = prepareLocalTarget({ ctx, d });
   const prepared = await prepareLocalRestoreSource({ ctx, d, executables });
 
   let cleanupDir = null;
@@ -222,7 +218,7 @@ export async function runRestoreLocal({
       ctx,
       d,
       prepared,
-      localProject,
+      fragtrack,
       isTTY: deps.isTTY ?? Boolean(d.stdIn.isTTY),
     });
     if (!ok) {
@@ -234,7 +230,7 @@ export async function runRestoreLocal({
       d,
       prepared,
       executables,
-      localProject,
+      fragtrack,
       cleanupFile: workspace.cleanupFile,
       logger,
     });

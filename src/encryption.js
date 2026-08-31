@@ -14,19 +14,68 @@ import { runCommand, lookupExecutable } from './process.js';
 import { writeWithBackpressure, endWritable } from './stream.js';
 
 export const ENCRYPTION_FORMAT = 'age-x25519';
+export const PLAINTEXT_FORMAT = 'none';
+export const DEFAULT_FORMAT = ENCRYPTION_FORMAT;
 export const PART_SIZE = 90 * 1024 * 1024;
 export const PART_PREFIX = 'data.sql.gz.age.part-';
+export const PLAINTEXT_PART_PREFIX = 'data.sql.gz.part-';
 
-export function partName(index) {
-  return `${PART_PREFIX}${String(index).padStart(3, '0')}`;
+/** Escape regex metacharacters so a prefix can be embedded in a pattern. */
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/** Parse a part filename; returns its index or null when not canonical. */
-export function partIndex(name) {
+/** Build the canonical part-name matcher (with the index capture) for a prefix. */
+function partNameMatcher(prefix) {
+  return new RegExp(`^${escapeRegExp(prefix)}(\\d{3})$`);
+}
+
+/**
+ * Row-data storage codecs, keyed by `manifest.encryption.format`. Part
+ * names, ordering, and the `encrypted` flag are validated exclusively
+ * through the codec derived from the manifest format (one code path, no
+ * per-source branches). Each codec is deeply frozen: the exported registry
+ * is immutable validation policy, never caller-mutable state.
+ */
+export const ROW_DATA_CODECS = Object.freeze({
+  [ENCRYPTION_FORMAT]: Object.freeze({
+    partPrefix: PART_PREFIX,
+    partRe: partNameMatcher(PART_PREFIX),
+    encrypted: true,
+  }),
+  [PLAINTEXT_FORMAT]: Object.freeze({
+    partPrefix: PLAINTEXT_PART_PREFIX,
+    partRe: partNameMatcher(PLAINTEXT_PART_PREFIX),
+    encrypted: false,
+  }),
+});
+
+/** Resolve the row-data codec for a manifest format; unknown formats throw. */
+export function rowDataCodec(format) {
+  const codec = ROW_DATA_CODECS[format ?? DEFAULT_FORMAT];
+  if (!codec) throw new Error(`unknown row-data format: ${format}`);
+  return codec;
+}
+
+/** Parse a part filename for a given format; returns its index or null. */
+export function partIndexFor(format, name) {
   if (typeof name !== 'string') return null;
-  const match = /^data\.sql\.gz\.age\.part-(\d{3})$/.exec(name);
-  if (!match) return null;
-  return Number(match[1]);
+  const match = rowDataCodec(format).partRe.exec(name);
+  return match ? Number(match[1]) : null;
+}
+
+/** Canonical part name for a format and position. */
+export function partNameFor(format, index) {
+  return `${rowDataCodec(format).partPrefix}${String(index).padStart(3, '0')}`;
+}
+
+export function partName(index) {
+  return partNameFor(DEFAULT_FORMAT, index);
+}
+
+/** Parse an age-format part filename; returns its index or null. */
+export function partIndex(name) {
+  return partIndexFor(DEFAULT_FORMAT, name);
 }
 
 export function ensurePrivateDir(dir, mode = 0o700) {
@@ -60,10 +109,44 @@ export async function gzipFile({ input, output }) {
   await pipeline(fs.createReadStream(input), zlib.createGzip(), mode0600Stream(output));
 }
 
-/** Streaming gunzip to a private file. */
-export async function gunzipFile({ input, output }) {
+/** Streaming gunzip to a private file with a hard decompressed-size bound. */
+export async function gunzipFile({ input, output, maxBytes }) {
+  if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
+    throw new Error(`maxBytes must be a positive integer; got ${maxBytes}`);
+  }
   ensurePrivateDir(path.dirname(output), 0o700);
-  await pipeline(fs.createReadStream(input), zlib.createGunzip(), mode0600Stream(output));
+  const target = mode0600Stream(output);
+  const state = { written: 0, overflow: false };
+  try {
+    await pipeline(
+      fs.createReadStream(input),
+      zlib.createGunzip(),
+      countDecompressedBytes(maxBytes, state),
+      target,
+    );
+  } catch (err) {
+    if (state.overflow) await removeFiles([output]);
+    throw err;
+  }
+}
+
+/**
+ * Named pipeline transform that counts decompressed bytes and aborts
+ * (removing the partial output) once the bound is exceeded: a small valid
+ * gzip must never expand unbounded into the temporary filesystem during
+ * restore.
+ */
+function countDecompressedBytes(maxBytes, state) {
+  return async function* (chunks) {
+    for await (const chunk of chunks) {
+      state.written += chunk.length;
+      if (state.written > maxBytes) {
+        state.overflow = true;
+        throw new Error(`decompressed data exceeds the ${maxBytes}-byte limit`);
+      }
+      yield chunk;
+    }
+  };
 }
 
 function resolveAge(agePath) {

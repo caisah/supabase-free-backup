@@ -8,7 +8,7 @@ import {
   unpackAndVerify,
   buildManifest,
   resolvePrivatePath,
-  sameEncryptedContent,
+  sameSnapshotContent,
   PLAINTEXT_ARTIFACTS,
   MANIFEST_NAME,
   SnapshotError,
@@ -71,7 +71,24 @@ async function packageFixture(root, overrides = {}) {
   return { sourceDir, destDir };
 }
 
-test('snapshot: sameEncryptedContent requires matching content hash AND recipient', () => {
+/** Plaintext package fixture: no age binary, no run seam, no recipient. */
+async function packageFixturePlain(root, overrides = {}) {
+  const sourceDir = makeSourceDir(root);
+  const destDir = path.join(root, 'pkg');
+  await packageSnapshot({
+    sourceDir,
+    destDir,
+    snapshotId: overrides.snapshotId ?? ID,
+    environment: overrides.environment ?? ENV,
+    sourceProjectRef: overrides.sourceProjectRef ?? REF,
+    supabaseCliVersion: overrides.supabaseCliVersion ?? '2.114.0',
+    format: 'none',
+    ageRecipient: undefined,
+  });
+  return { sourceDir, destDir };
+}
+
+test('snapshot: sameSnapshotContent requires matching content hash AND encryption state', () => {
   const manifest = {
     contentSha256: 'a'.repeat(64),
     encryption: { recipient: AGE_RECIPIENT_1 },
@@ -88,45 +105,175 @@ test('snapshot: sameEncryptedContent requires matching content hash AND recipien
     contentSha256: 'a'.repeat(64),
     encryption: { recipient: AGE_RECIPIENT_2 },
   };
-  assert.equal(sameEncryptedContent(manifest, equal), true);
-  assert.equal(sameEncryptedContent(manifest, hashChanged), false, 'hash change must differ');
+  assert.equal(sameSnapshotContent(manifest, equal), true);
+  assert.equal(sameSnapshotContent(manifest, hashChanged), false, 'hash change must differ');
   assert.equal(
-    sameEncryptedContent(manifest, recipientChanged),
+    sameSnapshotContent(manifest, recipientChanged),
     false,
     'recipient change must differ',
   );
-  assert.equal(sameEncryptedContent(null, manifest), false, 'absent left input');
-  assert.equal(sameEncryptedContent(manifest, undefined), false, 'absent right input');
-  assert.equal(sameEncryptedContent(null, undefined), false, 'both absent');
+  assert.equal(sameSnapshotContent(null, manifest), false, 'absent left input');
+  assert.equal(sameSnapshotContent(manifest, undefined), false, 'absent right input');
+  assert.equal(sameSnapshotContent(null, undefined), false, 'both absent');
   assert.equal(
-    sameEncryptedContent({ contentSha256: 'a'.repeat(64) }, { contentSha256: 'a'.repeat(64) }),
+    sameSnapshotContent({ contentSha256: 'a'.repeat(64) }, { contentSha256: 'a'.repeat(64) }),
     false,
     'missing recipients must never compare equal',
   );
+});
+
+test('snapshot: sameSnapshotContent is format-aware for plaintext snapshots', () => {
+  const hash = 'a'.repeat(64);
+  const noneA = { contentSha256: hash, encryption: { format: 'none' } };
+  const noneB = { contentSha256: hash, encryption: { format: 'none' } };
+  const agePartial = { contentSha256: hash, encryption: { recipient: AGE_RECIPIENT_1 } };
+  const agePartialRd = { contentSha256: hash, encryption: { recipient: AGE_RECIPIENT_2 } };
+  assert.equal(sameSnapshotContent(noneA, noneB), true, 'two none snapshots, same hash');
   assert.equal(
-    sameEncryptedContent(
-      { encryption: { recipient: AGE_RECIPIENT_1 } },
-      { encryption: { recipient: AGE_RECIPIENT_1 } },
-    ),
+    sameSnapshotContent({ ...noneA, contentSha256: 'b'.repeat(64) }, noneB),
     false,
-    'two missing content hashes must never compare equal',
+    'none snapshots with differing hashes must differ',
   );
   assert.equal(
-    sameEncryptedContent(
-      { contentSha256: 'a'.repeat(64), encryption: { recipient: AGE_RECIPIENT_1 } },
-      { contentSha256: undefined, encryption: { recipient: AGE_RECIPIENT_1 } },
-    ),
+    sameSnapshotContent(noneA, agePartial),
     false,
-    'one missing content hash must never compare equal',
+    'plaintext vs encrypted must never compare equal regardless of hash',
   );
   assert.equal(
-    sameEncryptedContent(
-      { contentSha256: '', encryption: { recipient: AGE_RECIPIENT_1 } },
-      { contentSha256: '', encryption: { recipient: AGE_RECIPIENT_1 } },
-    ),
-    false,
-    'empty content hashes must never compare equal',
+    sameSnapshotContent(agePartial, agePartial),
+    true,
+    'age vs partial RHS, same recipient',
   );
+  assert.equal(
+    sameSnapshotContent(agePartial, agePartialRd),
+    false,
+    'age vs partial RHS with a different recipient must differ',
+  );
+});
+
+test('snapshot: buildManifest rejects unknown formats instead of emitting bare recipients', () => {
+  assert.throws(
+    () =>
+      buildManifest({
+        environment: ENV,
+        sourceProjectRef: REF,
+        snapshotId: ID,
+        createdAt: '2026-08-24T03:17:09.000Z',
+        supabaseCliVersion: '2.114.0',
+        contentSha256: 'a'.repeat(64),
+        encryption: { format: 'aes-gcm' },
+        files: [],
+        dataParts: ['data.sql.gz.part-000'],
+      }),
+    /unknown row-data format: aes-gcm/,
+  );
+});
+
+test('snapshot: plaintext package validates without age or encryption', async () => {
+  const root = tmpdir('bp-snap-');
+  const { destDir } = await packageFixturePlain(root);
+  const { manifest } = await validatePackagedDirectory(destDir, {
+    expectedEnvironment: ENV,
+    expectedSnapshotId: ID,
+  });
+  assert.deepEqual(manifest.encryption, { format: 'none' }, 'no recipient key on plaintext');
+  assert.ok(manifest.dataParts.length >= 1);
+  assert.ok(
+    manifest.dataParts.every((n) => /^data\.sql\.gz\.part-\d{3}$/.test(n)),
+    'plaintext part names',
+  );
+  assert.ok(
+    manifest.files
+      .filter((f) => f.name.startsWith('data.sql.gz.part-'))
+      .every((f) => f.encrypted === false),
+    'plaintext part entries must be unencrypted',
+  );
+  for (const entry of manifest.files) {
+    assert.equal(await sha256OfFile(path.join(destDir, entry.name)), entry.sha256, entry.name);
+  }
+  const entries = fs.readdirSync(destDir);
+  for (const forbidden of ['data.sql', 'data.sql.gz', 'data.sql.gz.age', '.age']) {
+    assert.ok(!entries.some((n) => n === forbidden || n.endsWith('.age')), forbidden);
+  }
+  assert.equal(fileMode(destDir), 0o700);
+  for (const entry of entries) {
+    if (entry === 'manifest.json') continue;
+    assert.equal(fileMode(path.join(destDir, entry)), 0o600, entry);
+  }
+  // The none-format manifest must round-trip byte-identically through the builder.
+  const raw = fs.readFileSync(path.join(destDir, 'manifest.json'), 'utf8');
+  const rebuilt = JSON.stringify(buildManifest(JSON.parse(raw)), null, 2) + '\n';
+  assert.equal(rebuilt, raw, 'none-format manifest round-trip must be byte-identical');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('snapshot: plaintext package unpacks without identity or age binary', async () => {
+  const root = tmpdir('bp-snap-');
+  const { destDir } = await packageFixturePlain(root);
+  const unpackRoot = tmpdir('bp-unpack-');
+  const prepared = await unpackAndVerify({
+    sourceDir: destDir,
+    destDir: path.join(unpackRoot, 'prepared'),
+    expectedEnvironment: ENV,
+  });
+  const expected =
+    'COPY supabase_migrations.schema_migrations FROM stdin;\n1\n\\.\nCOPY "public"."t" FROM stdin;\n42\n\\.\n';
+  assert.equal(fs.readFileSync(prepared.dataPath, 'utf8'), expected);
+  assert.equal(fileMode(prepared.dataPath), 0o600);
+  const packagedManifest = JSON.parse(fs.readFileSync(path.join(destDir, MANIFEST_NAME), 'utf8'));
+  assert.equal(
+    prepared.contentSha256,
+    packagedManifest.contentSha256,
+    'aggregate fingerprint must match between package and unpack',
+  );
+  for (const name of [...PLAINTEXT_ARTIFACTS, MANIFEST_NAME]) {
+    assert.ok(fs.existsSync(path.join(prepared.dir, name)), name);
+  }
+  const leftovers = fs.readdirSync(prepared.dir);
+  assert.ok(
+    !leftovers.some((n) => n.endsWith('.age') || n.endsWith('.gz') || n.includes('.part-')),
+    leftovers.join(','),
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(unpackRoot, { recursive: true, force: true });
+});
+
+test('snapshot: plaintext tampered parts and fingerprint mismatch fail', async () => {
+  const root = tmpdir('bp-snap-');
+  const { destDir } = await packageFixturePlain(root);
+  const firstPart = path.join(destDir, 'data.sql.gz.part-000');
+  const bytes = fs.readFileSync(firstPart);
+  bytes[bytes.length - 5] ^= 0x01;
+  fs.writeFileSync(firstPart, bytes);
+  await assert.rejects(
+    () =>
+      unpackAndVerify({
+        sourceDir: destDir,
+        destDir: path.join(root, 'prepared-tampered'),
+        expectedEnvironment: ENV,
+      }),
+    (err) => err instanceof SnapshotError && /SIZE|CHECKSUM/i.test(err.message),
+  );
+  assert.ok(!fs.existsSync(path.join(root, 'prepared-tampered')));
+
+  const fresh = tmpdir('bp-snap-');
+  const { destDir: freshDir } = await packageFixturePlain(fresh);
+  const manifestPath = path.join(freshDir, MANIFEST_NAME);
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.contentSha256 = 'f'.repeat(64);
+  fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  await assert.rejects(
+    () =>
+      unpackAndVerify({
+        sourceDir: freshDir,
+        destDir: path.join(fresh, 'prepared-fingerprint'),
+        expectedEnvironment: ENV,
+      }),
+    (err) => err instanceof SnapshotError && /FINGERPRINT MISMATCH/.test(err.message),
+  );
+  assert.ok(!fs.existsSync(path.join(fresh, 'prepared-fingerprint')));
+  fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(fresh, { recursive: true, force: true });
 });
 
 test('snapshot: valid version 1 package passes validation', async () => {
@@ -321,6 +468,36 @@ test('snapshot: unknown versions, properties, and bad values fail manifest valid
     ['bad recipient', { ...raw, encryption: { ...raw.encryption, recipient: 'nope' } }],
     ['bad encryption format', { ...raw, encryption: { ...raw.encryption, format: 'aes-gcm' } }],
     [
+      'none format with a stray recipient',
+      { ...raw, encryption: { format: 'none', recipient: AGE_RECIPIENT_1 } },
+    ],
+    [
+      'age format with a plaintext part name',
+      {
+        ...raw,
+        dataParts: raw.dataParts.map((n) => n.replace('.age.', '')),
+        files: raw.files.map((f) =>
+          f.name.startsWith('data.sql.gz.age.part-')
+            ? { ...f, name: f.name.replace('.age.', '') }
+            : f,
+        ),
+      },
+    ],
+    ['none format with an age part name', { ...raw, encryption: { format: 'none' } }],
+    [
+      'none format part marked encrypted',
+      {
+        ...raw,
+        encryption: { format: 'none' },
+        dataParts: raw.dataParts.map((n) => n.replace('.age.', '')),
+        files: raw.files.map((f) =>
+          f.name.startsWith('data.sql.gz.age.part-')
+            ? { ...f, name: f.name.replace('.age.', ''), encrypted: true }
+            : f,
+        ),
+      },
+    ],
+    [
       'identity in manifest',
       { ...raw, ageIdentity: 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ' },
     ],
@@ -389,6 +566,37 @@ test('snapshot: missing file, extra file, and symlink fail directory validation'
     () => validatePackagedDirectory(destDir),
     (err) => err instanceof SnapshotError && /roles\.sql/i.test(err.message),
   );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('snapshot: plaintext packaging progress has no encryption lines and new split lines', async () => {
+  const root = tmpdir('bp-snap-');
+  const progress = [];
+  const sourceDir = makeSourceDir(root);
+  const destDir = path.join(root, 'pkg');
+  await packageSnapshot({
+    sourceDir,
+    destDir,
+    snapshotId: ID,
+    environment: ENV,
+    sourceProjectRef: REF,
+    supabaseCliVersion: '2.114.0',
+    format: 'none',
+    onProgress: (message) => progress.push(message),
+  });
+  const compression = progress.indexOf('starting row-data compression');
+  assert.ok(compression !== -1, 'compression starts');
+  assert.deepEqual(progress.slice(compression, compression + 4), [
+    'starting row-data compression',
+    'completed row-data compression',
+    'starting row-data split (plaintext format)',
+    'completed row-data split (plaintext format)',
+  ]);
+  assert.ok(
+    !progress.some((m) => m.includes('encryption') || m.includes('encrypted')),
+    'no encryption progress lines for plaintext',
+  );
+  assert.ok(progress.includes('starting manifest creation'), 'pipeline completes');
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -692,6 +900,48 @@ test(
     fs.rmSync(tampered, { recursive: true, force: true });
   },
 );
+
+test('snapshot: unpackAndVerify bounds plaintext decompression by the row-data limit', async () => {
+  const root = tmpdir('bp-snap-');
+  const sourceDir = makeSourceDir(root);
+  // ~4 MiB of repeated bytes: gzip shrinks it hard, so the combined
+  // row-data bound (2 inputs x maxPlaintextBytes) must be enforced during
+  // gunzip, long before the decompressed 4 MiB would exhaust disk.
+  fs.writeFileSync(
+    path.join(sourceDir, 'database-data.sql'),
+    `COPY "public"."t" FROM stdin;\n${'a'.repeat(4 * 1024 * 1024)}\n\\.\n`,
+  );
+  const destDir = path.join(root, 'pkg');
+  await packageSnapshot({
+    sourceDir,
+    destDir,
+    snapshotId: ID,
+    environment: ENV,
+    sourceProjectRef: REF,
+    supabaseCliVersion: '2.114.0',
+    format: 'none',
+  });
+  await assert.rejects(
+    () =>
+      unpackAndVerify({
+        sourceDir: destDir,
+        destDir: path.join(root, 'prepared'),
+        expectedEnvironment: ENV,
+        limits: { maxPlaintextBytes: 1024 * 1024 },
+      }),
+    (err) => /exceeds/.test(err.message),
+  );
+  assert.ok(!fs.existsSync(path.join(root, 'prepared')), 'no partial prepared dir on overflow');
+
+  // Default limits still unpack the same package.
+  const ok = await unpackAndVerify({
+    sourceDir: destDir,
+    destDir: path.join(root, 'prepared-ok'),
+    expectedEnvironment: ENV,
+  });
+  assert.ok(fs.readFileSync(ok.dataPath, 'utf8').includes('a'.repeat(4096)));
+  fs.rmSync(root, { recursive: true, force: true });
+});
 
 test('snapshot: private path resolution rejects traversal, separators, and absolute paths', () => {
   const root = '/tmp/bp-safe-root';

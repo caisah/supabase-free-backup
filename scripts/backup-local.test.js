@@ -16,22 +16,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { runBackupLocal } from './backup-local.js';
-import { BACKUP_WORKSPACE_PREFIX } from '../src/backup.js';
-import { validatePackagedDirectory } from '../src/snapshot.js';
+import { validatePackagedDirectory, packageSnapshot } from '../src/snapshot.js';
+import { resolveBackupExecutables } from '../src/backup.js';
 import {
   assertLocalStackRunning,
   openLocalBackupStore,
   finalizeLocalBackup,
-  LocalBackupError,
 } from '../src/local-backup.js';
 import { createLogger } from '../src/logger.js';
-import {
-  tmpdir,
-  writePrivateFile,
-  AGE_RECIPIENT_1,
-  AGE_RECIPIENT_2,
-  fakeAge,
-} from '../src/test-fixtures.js';
+import { tmpdir, writePrivateFile } from '../src/test-fixtures.js';
 
 const REF = 'a1b2c3d4e5f6a7b8c9d0';
 const REF_PROD = 'f0e9d8c7b6a5f4e3d2c1';
@@ -52,14 +45,13 @@ const SIX = [
 ];
 
 const EXECUTABLES = {
-  ageBin: '/fake/age',
   supabasePath: '/fake/supabase',
   dockerPath: '/fake/docker',
 };
-const LOCAL_PROJECT = {
-  workdir: '/workdir/example-project',
+const FRAGTRACK = {
+  workdir: '/workdir/fragtrack',
   dbPort: PORT,
-  dbContainer: 'supabase_db_example-project',
+  dbContainer: 'supabase_db_fragtrack',
 };
 
 function runCli(args, env = {}) {
@@ -102,29 +94,23 @@ function dumpContent(seed = 'a') {
   ].join('\n');
 }
 
-function makeRun({ calls, ageFail = false } = {}) {
+function makeRun({ calls } = {}) {
   const logged = calls ?? [];
   return async (opts) => {
     logged.push(opts);
     const base = path.basename(String(opts.command));
     if (base === 'age') {
-      if (ageFail) throw new Error('age exploded');
-      return fakeAge(opts);
+      // Plaintext local backups never run age: this branch is an assertion
+      // trap, not an executable path.
+      throw new Error('age must never be invoked on the plaintext local path');
     }
     if (base === 'docker') {
-      // `docker port <container> <port>/tcp` publication mapping.
-      if (String(opts.args[0]) === 'port') {
-        return { stdout: `0.0.0.0:${PORT}\n[::]:${PORT}\n` };
-      }
       const query = String(opts.args.at(-1));
       if (query.includes('pg_stat_all_tables')) {
         return {
           stdout:
             '00000000000000000000000000000000|0123456789abcdef0123456789abcdef|11111111111111111111111111111111|22222222222222222222222222222222\n',
         };
-      }
-      if (query.includes('pg_locks')) {
-        return { stdout: 't\n' }; // barrier already granted
       }
       return { stdout: '1\n' };
     }
@@ -140,10 +126,9 @@ function depsFor({ repoRoot: _repoRoot, runAt, seed = 'a', extra = {} } = {}) {
       loadConfig: ({ environment }) => ({
         environment,
         projectRef: environment === 'production' ? REF_PROD : REF,
-        ageRecipient: AGE_RECIPIENT_1,
-        projectWorkdir: LOCAL_PROJECT.workdir,
+        fragtrackWorkdir: FRAGTRACK.workdir,
       }),
-      doValidateWorkdir: () => LOCAL_PROJECT,
+      doValidateWorkdir: () => FRAGTRACK,
       doResolveExecutables: () => EXECUTABLES,
       doAssertRunning: assertLocalStackRunning,
       doDump: async (opts) => {
@@ -204,7 +189,21 @@ test('backup-local: first run creates a fully validated package at the fixed pri
     expectedProjectRef: REF,
   });
   assert.equal(manifest.sourceProjectRef, REF);
-  assert.equal(manifest.encryption.recipient, AGE_RECIPIENT_1);
+  assert.deepEqual(manifest.encryption, { format: 'none' }, 'plaintext manifest, no recipient');
+  assert.ok(
+    manifest.dataParts.every((n) => n.startsWith('data.sql.gz.part-')),
+    'plaintext part names',
+  );
+  assert.ok(
+    manifest.files
+      .filter((f) => f.name.startsWith('data.sql.gz.part-'))
+      .every((f) => f.encrypted === false),
+    'part entries are unencrypted',
+  );
+  assert.ok(
+    !calls.run.some((c) => path.basename(String(c.command)) === 'age'),
+    'no age command may run',
+  );
   assert.equal(fs.statSync(envDir(repoRoot)).mode & 0o777, 0o700);
   assert.equal(fs.statSync(result.path).mode & 0o777, 0o700);
   assert.ok(!fs.readdirSync(result.path).includes('data.sql'), 'no plaintext row data retained');
@@ -219,9 +218,7 @@ test('backup-local: first run creates a fully validated package at the fixed pri
   }
   assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-development')));
   assert.ok(
-    !fs
-      .readdirSync(os.tmpdir())
-      .some((e) => e.startsWith(`${BACKUP_WORKSPACE_PREFIX}${process.pid}-`)),
+    !fs.readdirSync(os.tmpdir()).some((e) => e.startsWith(`fragtrack-backup-${process.pid}-`)),
     'private OS workspace removed',
   );
   fs.rmSync(repoRoot, { recursive: true, force: true });
@@ -240,31 +237,19 @@ test('backup-local: identical later run retains the first ID and path', async ()
   fs.rmSync(repoRoot, { recursive: true, force: true });
 });
 
-test('backup-local: changed content, recipient, or target ref publishes a new snapshot and removes the old', async () => {
+test('backup-local: changed content or target ref publishes a new snapshot and removes the old', async () => {
   for (const [label, change] of [
     ['content', { seed: 'b' }],
-    ['recipient', {}],
     ['targetRef', {}],
   ]) {
     const repoRoot = tmpdir('bp-bl-');
     let extra = {};
-    if (label === 'recipient') {
-      extra = {
-        loadConfig: ({ environment }) => ({
-          environment,
-          projectRef: REF,
-          ageRecipient: AGE_RECIPIENT_2,
-          projectWorkdir: LOCAL_PROJECT.workdir,
-        }),
-      };
-    }
     if (label === 'targetRef') {
       extra = {
         loadConfig: ({ environment }) => ({
           environment,
           projectRef: REF_PROD,
-          ageRecipient: AGE_RECIPIENT_1,
-          projectWorkdir: LOCAL_PROJECT.workdir,
+          fragtrackWorkdir: FRAGTRACK.workdir,
         }),
       };
     }
@@ -278,11 +263,7 @@ test('backup-local: changed content, recipient, or target ref publishes a new sn
       expectedSnapshotId: ID2,
       expectedProjectRef: label === 'targetRef' ? REF_PROD : REF,
     });
-    assert.equal(
-      manifest.encryption.recipient,
-      label === 'recipient' ? AGE_RECIPIENT_2 : AGE_RECIPIENT_1,
-      label,
-    );
+    assert.deepEqual(manifest.encryption, { format: 'none' }, label);
     const entries = fs.readdirSync(envDir(repoRoot)).filter((e) => !e.startsWith('.candidate-'));
     assert.deepEqual(entries, [ID2], `${label}: old snapshot removed after publish`);
     assert.ok(!fs.existsSync(first.result.path), `${label}: baseline path was removed`);
@@ -298,105 +279,7 @@ test('backup-local: dump cwd is the backup repository; source URL is only the wo
   assert.ok(!calls.dump[0].dbUrl.includes('pooler.supabase.com'));
   assert.ok(!calls.dump[0].dbUrl.includes('.supabase.co'));
   assert.equal(calls.dump[0].cwd, repoRoot, 'dump runs with the backup repo as cwd');
-  assert.notEqual(repoRoot, LOCAL_PROJECT.workdir, 'never the sibling workdir');
-  fs.rmSync(repoRoot, { recursive: true, force: true });
-});
-
-test('backup-local: container-to-host port identity is verified before any probe or dump', async () => {
-  const repoRoot = tmpdir('bp-bl-');
-  const { calls } = await runOnce({ repoRoot, runAt: T1 });
-  const indexOf = (predicate) => calls.run.findIndex(predicate);
-  const portIdx = indexOf((c) => c.args[0] === 'port');
-  const stateIdx = indexOf((c) => String(c.args.at(-1)).includes('pg_stat_all_tables'));
-  const holderIdx = indexOf((c) => c.args[0] === 'exec' && c.args.includes('-i'));
-  assert.ok(portIdx !== -1, '`docker port` identity check must run');
-  assert.ok(portIdx < stateIdx, 'port identity must be proven before the state probe');
-  assert.ok(portIdx < holderIdx, 'port identity must be proven before the write barrier');
-  assert.deepEqual(
-    calls.run[portIdx].args,
-    ['port', LOCAL_PROJECT.dbContainer, `${PORT}/tcp`],
-    'the check must ask exactly for the config.toml port of the derived container',
-  );
-  fs.rmSync(repoRoot, { recursive: true, force: true });
-});
-
-test('backup-local: the source is write-barriered across the whole dump window', async () => {
-  const repoRoot = tmpdir('bp-bl-');
-  const events = [];
-  await runOnce({
-    repoRoot,
-    runAt: T1,
-    extra: {
-      doAcquireBarrier: async ({ dbContainer }) => {
-        events.push(`acquire:${dbContainer}`);
-        return {
-          release: async () => {
-            events.push('release');
-          },
-        };
-      },
-      doReleaseBarrier: async (barrier) => barrier.release(),
-      doDump: async (opts) => {
-        events.push('dump');
-        for (const name of SIX)
-          writePrivateFile(path.join(opts.outDir, name), `${dumpContent('a')}\n`);
-      },
-    },
-  });
-  assert.equal(events[0], `acquire:${LOCAL_PROJECT.dbContainer}`);
-  assert.equal(events[1], 'dump');
-  assert.equal(events[2], 'release');
-  fs.rmSync(repoRoot, { recursive: true, force: true });
-});
-
-test('backup-local: an unpublishable config port aborts before any probe or dump', async () => {
-  const repoRoot = tmpdir('bp-bl-');
-  let dumpRan = false;
-  await assert.rejects(
-    () =>
-      runOnce({
-        repoRoot,
-        runAt: T1,
-        extra: {
-          doAssertPortPublished: async () => {
-            throw new LocalBackupError(
-              'the local database port from supabase/config.toml is not published by the derived container',
-              { stage: 'connect' },
-            );
-          },
-          doDump: async () => {
-            dumpRan = true;
-          },
-        },
-      }),
-    (err) => err instanceof LocalBackupError && /not published/.test(err.message),
-  );
-  assert.equal(dumpRan, false, 'no dump may run when the source identity is unproven');
-  assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-development')));
-  fs.rmSync(repoRoot, { recursive: true, force: true });
-});
-
-test('backup-local: a broken barrier fails the run before any snapshot is published', async () => {
-  const repoRoot = tmpdir('bp-bl-');
-  await assert.rejects(
-    () =>
-      runOnce({
-        repoRoot,
-        runAt: T1,
-        extra: {
-          doAcquireBarrier: async () => {
-            throw new LocalBackupError(
-              'cannot establish the local database write barrier; no snapshot was published',
-              { stage: 'consistency' },
-            );
-          },
-        },
-      }),
-    /cannot establish the local database write barrier/,
-  );
-  const entries = fs.readdirSync(envDir(repoRoot)).filter((e) => !e.startsWith('.candidate-'));
-  assert.deepEqual(entries, [], 'no snapshot may be published without the barrier');
-  assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-development')));
+  assert.notEqual(repoRoot, FRAGTRACK.workdir, 'never the sibling workdir');
   fs.rmSync(repoRoot, { recursive: true, force: true });
 });
 
@@ -407,14 +290,8 @@ test('backup-local: no stack lifecycle command and no R2/credential access', asy
   for (const call of calls.run) {
     const base = path.basename(String(call.command));
     assert.notEqual(base, 'supabase', 'local backup never runs the Supabase CLI');
-    if (base === 'docker' && call.args[0] === 'exec') {
-      // `docker exec <container> ...` and the holder `docker exec -i <container> ...`
-      const container = call.args[1] === '-i' ? call.args[2] : call.args[1];
-      assert.equal(
-        container,
-        LOCAL_PROJECT.dbContainer,
-        'every exec targets the derived container',
-      );
+    if (base === 'docker') {
+      assert.deepEqual(call.args.slice(0, 2), ['exec', FRAGTRACK.dbContainer]);
       for (const forbidden of ['start', 'stop', 'reset', 'migrate']) {
         assert.ok(!call.args.includes(forbidden), `no lifecycle command ${forbidden}`);
       }
@@ -548,7 +425,7 @@ test('backup-local: workspaces, unpublished candidates, and locks clean up on an
   const repoRoot = tmpdir('bp-bl-');
   const before = fs
     .readdirSync(os.tmpdir())
-    .filter((n) => n.startsWith(`${BACKUP_WORKSPACE_PREFIX}${process.pid}-`));
+    .filter((n) => n.startsWith(`fragtrack-backup-${process.pid}-`));
   await assert.rejects(
     () =>
       runOnce({
@@ -564,7 +441,7 @@ test('backup-local: workspaces, unpublished candidates, and locks clean up on an
   );
   const after = fs
     .readdirSync(os.tmpdir())
-    .filter((n) => n.startsWith(`${BACKUP_WORKSPACE_PREFIX}${process.pid}-`));
+    .filter((n) => n.startsWith(`fragtrack-backup-${process.pid}-`));
   assert.deepEqual(after, before, 'private OS workspace removed after failure');
   assert.ok(
     !fs.readdirSync(envDir(repoRoot)).some((e) => e.startsWith('.candidate-')),
@@ -652,7 +529,6 @@ test('backup-local: logs reveal only environment, state, ID, and path', async ()
     LOCAL_URL,
     'postgres:postgres',
     REF,
-    AGE_RECIPIENT_1,
     'CREATE ROLE',
     '42',
     'formatVersion',
@@ -660,8 +536,7 @@ test('backup-local: logs reveal only environment, state, ID, and path', async ()
   ]) {
     assert.ok(!log.includes(secret), `log leaked: ${secret}`);
   }
-  assert.ok(!log.includes(LOCAL_PROJECT.workdir), 'no workdir dump in logs');
-  assert.ok(!log.includes(LOCAL_PROJECT.dbContainer), 'no container name in logs');
+  assert.ok(!log.includes('backup:fragtrack'), 'no env dump in logs');
   fs.rmSync(repoRoot, { recursive: true, force: true });
 });
 
@@ -687,6 +562,47 @@ test('backup-local: malformed CLI exits nonzero before external work', () => {
     const res = runCli(args, { PATH: process.env.PATH });
     assert.notEqual(res.status, 0, `expected nonzero exit for ${JSON.stringify(args)}`);
   }
+});
+
+test('backup-local: no age executable is resolved', async () => {
+  const repoRoot = tmpdir('bp-bl-');
+  const packageOpts = [];
+  const { deps } = depsFor({
+    repoRoot,
+    runAt: T1,
+    extra: {
+      doResolveExecutables: (opts) => resolveBackupExecutables(opts),
+      lookup: (name) => {
+        if (name === 'age' || name === 'age.exe') throw new Error('age must not be resolved');
+        if (name === 'docker') return '/bin/docker';
+        return null;
+      },
+      locateCli: () => '/fake/supabase',
+      doPackage: async (opts) => {
+        packageOpts.push(opts);
+        return packageSnapshot(opts);
+      },
+    },
+  });
+  const result = await runBackupLocal({
+    options: { environment: 'development' },
+    env: {},
+    repoRoot,
+    logger: silentLogger(),
+    deps,
+  });
+  assert.equal(result.changed, true);
+  assert.equal(packageOpts.length, 1);
+  assert.equal(packageOpts[0].format, 'none', 'dump/package options carry the plaintext codec');
+  assert.equal(packageOpts[0].agePath, undefined);
+  const { manifest } = await validatePackagedDirectory(result.path, {
+    expectedEnvironment: 'development',
+    expectedSnapshotId: ID1,
+    expectedProjectRef: REF,
+  });
+  assert.deepEqual(manifest.encryption, { format: 'none' });
+  assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-development')));
+  fs.rmSync(repoRoot, { recursive: true, force: true });
 });
 
 test('backup-local: the whole local path never references R2 operations or credentials', () => {

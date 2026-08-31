@@ -9,10 +9,9 @@ import {
   selectFromSnapshots,
   RestoreError,
   describeUnavailable,
-  RESTORE_WORKSPACE_PREFIXES,
 } from './restore.js';
-import { BACKUP_WORKSPACE_PREFIX } from './backup.js';
 import { packageSnapshot, buildManifest, PLAINTEXT_ARTIFACTS, MANIFEST_NAME } from './snapshot.js';
+import { ENCRYPTION_FORMAT } from './encryption.js';
 import { memoryStore } from './test-s3-store.js';
 import { parseSnapshotId } from './fingerprint.js';
 import {
@@ -23,33 +22,17 @@ import {
   AGE_IDENTITY_2,
   ageAvailable,
   agePath,
+  fakeAge,
 } from './test-fixtures.js';
 
 const ENV = 'development';
 const REF = 'a1b2c3d4e5f6a7b8c9d0';
 const ID = '2026-08-24T03-17-09Z';
 
-test('restore: workspace prefixes use the canonical generic identity', () => {
-  assert.deepEqual(RESTORE_WORKSPACE_PREFIXES, {
-    identity: 'supabase-db-backup-identity-',
-    download: 'supabase-db-backup-download-',
-    prepared: 'supabase-db-backup-prepared-',
-    cleanup: 'supabase-db-backup-cleanup-',
-  });
-});
-
-test('restore: every restore prefix derives from the canonical backup prefix', () => {
-  for (const [suffix, value] of Object.entries(RESTORE_WORKSPACE_PREFIXES)) {
-    assert.equal(
-      value,
-      `${BACKUP_WORKSPACE_PREFIX}${suffix}-`,
-      `${suffix} must stay in lockstep with the canonical prefix`,
-    );
-    assert.ok(value.startsWith(BACKUP_WORKSPACE_PREFIX));
-  }
-});
-
-async function makePackage(root, { snapshotId = ID, environment = ENV, idSuffix = '' } = {}) {
+async function makePackage(
+  root,
+  { snapshotId = ID, environment = ENV, idSuffix = '', format = ENCRYPTION_FORMAT, run } = {},
+) {
   const sourceDir = path.join(root, `src${idSuffix}`);
   fs.mkdirSync(sourceDir, { mode: 0o700 });
   writePrivateFile(path.join(sourceDir, 'roles.sql'), 'CREATE ROLE app;\n');
@@ -75,7 +58,9 @@ async function makePackage(root, { snapshotId = ID, environment = ENV, idSuffix 
     environment,
     sourceProjectRef: REF,
     supabaseCliVersion: '2.114.0',
-    ageRecipient: AGE_RECIPIENT_1,
+    format,
+    ageRecipient: format === 'none' ? undefined : AGE_RECIPIENT_1,
+    run,
   });
   return pkgDir;
 }
@@ -385,11 +370,384 @@ test('restore: preparation performs no destructive or target calls', async () =>
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test('restore: local source prepares a plaintext snapshot without identity or age', async () => {
+  const root = tmpdir('bp-rest-');
+  const storeDir = path.join(root, 'local-backups', ENV);
+  fs.mkdirSync(storeDir, { recursive: true, mode: 0o700 });
+  const pkg = await makePackage(root, { format: 'none' });
+  const finalDir = path.join(storeDir, ID);
+  fs.renameSync(pkg, finalDir);
+
+  const prepared = await prepareRestore({
+    environment: ENV,
+    source: 'local',
+    selector: 'latest',
+    repoRoot: root,
+  });
+  assert.equal(prepared.snapshotId, ID);
+  assert.ok(fs.readFileSync(prepared.dataPath, 'utf8').includes('COPY "public"."t"'));
+  for (const name of [...PLAINTEXT_ARTIFACTS, MANIFEST_NAME]) {
+    assert.ok(fs.existsSync(path.join(prepared.dir, name)), name);
+  }
+  await prepared.cleanup();
+  await prepared.cleanup(); // idempotent
+  assert.ok(!fs.existsSync(prepared.dir), 'cleanup removes the prepared dir');
+  assert.ok(fs.existsSync(finalDir), 'store snapshot survives cleanup');
+  assert.deepEqual(fs.readdirSync(storeDir), [ID], 'no extra store entries');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('restore: local latest skips malformed snapshots and picks the newest valid', async () => {
+  const root = tmpdir('bp-rest-');
+  const storeDir = path.join(root, 'local-backups', ENV);
+  fs.mkdirSync(storeDir, { recursive: true, mode: 0o700 });
+  const olderId = '2026-08-23T03-17-09Z';
+  const newerId = '2026-08-24T03-17-09Z';
+  const olderPkg = await makePackage(root, {
+    snapshotId: olderId,
+    idSuffix: 'older',
+    format: 'none',
+  });
+  fs.renameSync(olderPkg, path.join(storeDir, olderId));
+  // Malformed newer dir (valid ID, no manifest): must be skipped, not fatal.
+  const bad = path.join(storeDir, newerId);
+  fs.mkdirSync(bad, { mode: 0o700 });
+  writePrivateFile(path.join(bad, 'roles.sql'), 'stray');
+
+  const prepared = await prepareRestore({
+    environment: ENV,
+    source: 'local',
+    selector: 'latest',
+    repoRoot: root,
+  });
+  assert.equal(prepared.snapshotId, olderId, 'latest skips the malformed newer dir');
+  assert.ok(fs.readFileSync(prepared.dataPath, 'utf8').includes('older'));
+  await prepared.cleanup();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('restore: local source validates environment and project ref', async () => {
+  const root = tmpdir('bp-rest-');
+  const storeDir = path.join(root, 'local-backups', ENV);
+  fs.mkdirSync(storeDir, { recursive: true, mode: 0o700 });
+  const pkg = await makePackage(root, { format: 'none' });
+  fs.renameSync(pkg, path.join(storeDir, ID));
+
+  await assert.rejects(
+    () =>
+      prepareRestore({
+        environment: 'production',
+        source: 'local',
+        selector: 'latest',
+        repoRoot: root,
+      }),
+    (err) => err instanceof RestoreError && /no valid snapshots/.test(err.message),
+  );
+  await assert.rejects(
+    () =>
+      prepareRestore({
+        environment: ENV,
+        source: 'local',
+        selector: 'latest',
+        repoRoot: root,
+        projectRef: 'fedcba9876543210fedc',
+      }),
+    (err) => err instanceof RestoreError && /no valid snapshots/.test(err.message),
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('restore: local source exact-ID selection, unavailable IDs, and absent store', async () => {
+  const root = tmpdir('bp-rest-');
+  const storeDir = path.join(root, 'local-backups', ENV);
+  fs.mkdirSync(storeDir, { recursive: true, mode: 0o700 });
+  const pkg = await makePackage(root, { format: 'none' });
+  fs.renameSync(pkg, path.join(storeDir, ID));
+
+  const exact = await prepareRestore({
+    environment: ENV,
+    source: 'local',
+    selector: ID,
+    repoRoot: root,
+  });
+  assert.equal(exact.snapshotId, ID);
+  await exact.cleanup();
+
+  await assert.rejects(
+    () =>
+      prepareRestore({
+        environment: ENV,
+        source: 'local',
+        selector: '2026-08-20T00-00-00Z',
+        repoRoot: root,
+      }),
+    (err) => {
+      assert.ok(err instanceof RestoreError, err.name);
+      assert.ok(err.message.includes(ID), 'valid-ID list must be reported');
+      return true;
+    },
+  );
+
+  // Missing store directory -> the same "no valid snapshots" answer.
+  const bare = tmpdir('bp-rest-');
+  await assert.rejects(
+    () =>
+      prepareRestore({
+        environment: ENV,
+        source: 'local',
+        selector: 'latest',
+        repoRoot: bare,
+      }),
+    (err) => err instanceof RestoreError && /no valid snapshots/.test(err.message),
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(bare, { recursive: true, force: true });
+});
+
+test('restore: plaintext repo snapshot needs no identity; encrypted still demands DECRYPT_KEY', async () => {
+  const root = tmpdir('bp-rest-');
+  const repoRoot = path.join(root, 'repo');
+  fs.mkdirSync(path.join(repoRoot, 'backups', ENV), { recursive: true, mode: 0o700 });
+
+  // A plaintext repo snapshot prepares with NO identity file and NO agePath.
+  const plainId = '2026-08-23T03-17-09Z';
+  const plain = await makePackage(root, { snapshotId: plainId, idSuffix: 'plain', format: 'none' });
+  fs.cpSync(plain, path.join(repoRoot, 'backups', ENV, plainId), { recursive: true });
+  const prepared = await prepareRestore({
+    environment: ENV,
+    source: 'repo',
+    selector: 'latest',
+    repoRoot,
+  });
+  assert.equal(prepared.snapshotId, plainId);
+  assert.ok(fs.readFileSync(prepared.dataPath, 'utf8').includes('plain'));
+  await prepared.cleanup();
+
+  // An age-format repo snapshot without any identity fails with the hint.
+  const encId = '2026-08-24T03-17-09Z';
+  const encrypted = await makePackage(root, {
+    snapshotId: encId,
+    idSuffix: 'enc',
+    run: fakeAge,
+  });
+  fs.cpSync(encrypted, path.join(repoRoot, 'backups', ENV, encId), { recursive: true });
+  await assert.rejects(
+    () => prepareRestore({ environment: ENV, source: 'repo', selector: 'latest', repoRoot }),
+    (err) => err instanceof RestoreError && /DECRYPT_KEY/.test(err.message),
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('restore: local source restores a legacy age-encrypted snapshot with identity and age', async () => {
+  const root = tmpdir('bp-rest-');
+  const storeDir = path.join(root, 'local-backups', ENV);
+  fs.mkdirSync(storeDir, { recursive: true, mode: 0o700 });
+  const pkg = await makePackage(root, { run: fakeAge }); // age-format codec
+  const finalDir = path.join(storeDir, ID);
+  fs.renameSync(pkg, finalDir);
+
+  const prepared = await prepareRestore({
+    environment: ENV,
+    source: 'local',
+    selector: 'latest',
+    repoRoot: root,
+    ageIdentity: AGE_IDENTITY_1,
+    agePath: agePath() ?? 'fake-age',
+    run: fakeAge,
+  });
+  assert.equal(prepared.snapshotId, ID);
+  assert.ok(fs.readFileSync(prepared.dataPath, 'utf8').includes('COPY "public"."t"'));
+  await prepared.cleanup();
+  assert.ok(fs.existsSync(finalDir), 'store snapshot survives cleanup');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('restore: local listing honors caller-supplied safety limits', async () => {
+  const root = tmpdir('bp-rest-');
+  const storeDir = path.join(root, 'local-backups', ENV);
+  fs.mkdirSync(storeDir, { recursive: true, mode: 0o700 });
+  const pkg = await makePackage(root, { format: 'none' });
+  fs.renameSync(pkg, path.join(storeDir, ID));
+
+  // The manifest is far larger than 1 byte: a tightened manifest bound must
+  // exclude the snapshot during SELECTION, not only at unpack time.
+  await assert.rejects(
+    () =>
+      prepareRestore({
+        environment: ENV,
+        source: 'local',
+        selector: 'latest',
+        repoRoot: root,
+        limits: { maxManifestBytes: 1 },
+      }),
+    (err) => err instanceof RestoreError && /no valid snapshots/.test(err.message),
+  );
+
+  // The default limits still select the same snapshot.
+  const prepared = await prepareRestore({
+    environment: ENV,
+    source: 'local',
+    selector: 'latest',
+    repoRoot: root,
+  });
+  assert.equal(prepared.snapshotId, ID);
+  await prepared.cleanup();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test(
+  'restore: local store with unsafe store/environment modes fails closed',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const root = tmpdir('bp-rest-');
+    const storeDir = path.join(root, 'local-backups', ENV);
+    fs.mkdirSync(storeDir, { recursive: true, mode: 0o700 });
+    const pkg = await makePackage(root, { format: 'none' });
+    fs.renameSync(pkg, path.join(storeDir, ID));
+
+    // World-writable environment directory: the store's trust boundary is
+    // gone, so NO snapshot from it may be restored.
+    fs.chmodSync(storeDir, 0o777);
+    await assert.rejects(
+      () =>
+        prepareRestore({
+          environment: ENV,
+          source: 'local',
+          selector: 'latest',
+          repoRoot: root,
+        }),
+      (err) => err instanceof RestoreError && /unsafe permissions/.test(err.message),
+    );
+
+    // World-writable store root with a private environment directory fails
+    // the same way.
+    fs.chmodSync(storeDir, 0o700);
+    fs.chmodSync(path.join(root, 'local-backups'), 0o777);
+    await assert.rejects(
+      () =>
+        prepareRestore({
+          environment: ENV,
+          source: 'local',
+          selector: 'latest',
+          repoRoot: root,
+        }),
+      (err) => err instanceof RestoreError && /unsafe permissions/.test(err.message),
+    );
+    fs.rmSync(root, { recursive: true, force: true });
+  },
+);
+
+test('restore: local store environment path symlinks fail closed', async () => {
+  const root = tmpdir('bp-rest-');
+  const storeDir = path.join(root, 'local-backups', ENV);
+  fs.mkdirSync(storeDir, { recursive: true, mode: 0o700 });
+  const pkg = await makePackage(root, { format: 'none' });
+  fs.renameSync(pkg, path.join(storeDir, ID));
+  fs.rmSync(storeDir, { recursive: true, force: true });
+  fs.symlinkSync(path.join(root, 'local-backups'), storeDir, 'dir');
+  await assert.rejects(
+    () =>
+      prepareRestore({
+        environment: ENV,
+        source: 'local',
+        selector: 'latest',
+        repoRoot: root,
+      }),
+    (err) => err instanceof RestoreError && /must be a real directory/.test(err.message),
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test(
+  'restore: local snapshot dirs or files with unsafe modes are never selectable',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const root = tmpdir('bp-rest-');
+    const storeDir = path.join(root, 'local-backups', ENV);
+    fs.mkdirSync(storeDir, { recursive: true, mode: 0o700 });
+    const pkg = await makePackage(root, { format: 'none' });
+    const finalDir = path.join(storeDir, ID);
+    fs.renameSync(pkg, finalDir);
+
+    // World-writable snapshot directory: never selectable.
+    fs.chmodSync(finalDir, 0o777);
+    await assert.rejects(
+      () =>
+        prepareRestore({
+          environment: ENV,
+          source: 'local',
+          selector: 'latest',
+          repoRoot: root,
+        }),
+      (err) => err instanceof RestoreError && /no valid snapshots/.test(err.message),
+    );
+
+    // World-readable stored file inside a private snapshot dir: same result.
+    fs.chmodSync(finalDir, 0o700);
+    fs.chmodSync(path.join(finalDir, 'roles.sql'), 0o644);
+    await assert.rejects(
+      () =>
+        prepareRestore({
+          environment: ENV,
+          source: 'local',
+          selector: 'latest',
+          repoRoot: root,
+        }),
+      (err) => err instanceof RestoreError && /no valid snapshots/.test(err.message),
+    );
+    fs.rmSync(root, { recursive: true, force: true });
+  },
+);
+
+test('restore: local latest surfaces skip warnings for malformed snapshots', async () => {
+  const root = tmpdir('bp-rest-');
+  const storeDir = path.join(root, 'local-backups', ENV);
+  fs.mkdirSync(storeDir, { recursive: true, mode: 0o700 });
+  const olderId = '2026-08-23T03-17-09Z';
+  const newerId = '2026-08-24T03-17-09Z';
+  const olderPkg = await makePackage(root, {
+    snapshotId: olderId,
+    idSuffix: 'older',
+    format: 'none',
+  });
+  fs.renameSync(olderPkg, path.join(storeDir, olderId));
+  const bad = path.join(storeDir, newerId);
+  fs.mkdirSync(bad, { mode: 0o700 });
+  writePrivateFile(path.join(bad, 'roles.sql'), 'stray');
+
+  const prepared = await prepareRestore({
+    environment: ENV,
+    source: 'local',
+    selector: 'latest',
+    repoRoot: root,
+  });
+  assert.equal(prepared.snapshotId, olderId, 'latest skips the malformed newer dir');
+  assert.ok(
+    Array.isArray(prepared.warnings) &&
+      prepared.warnings.some((w) => w.includes(newerId) && w.includes('skipped')),
+    `expected a skip warning for ${newerId}, got: ${JSON.stringify(prepared.warnings)}`,
+  );
+  await prepared.cleanup();
+
+  // A store where every canonical snapshot is valid yields no warnings.
+  fs.rmSync(bad, { recursive: true, force: true });
+  const clean = await prepareRestore({
+    environment: ENV,
+    source: 'local',
+    selector: olderId,
+    repoRoot: root,
+  });
+  assert.deepEqual(clean.warnings, []);
+  await clean.cleanup();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test('restore: module has no confirmation, reset, or restore-stack dependency', () => {
   const src = fs.readFileSync(new URL('./restore.js', import.meta.url), 'utf8');
   for (const forbidden of [
     'hosted-restore',
     'local-restore',
+    'local-backup',
     'confirmExactPhrase',
     'executeHostedRestore',
     'restoreLocalStack',
@@ -452,7 +810,7 @@ test('restore: an acquisition failure removes the allocated download directory',
       throw new Error('download exploded');
     },
   };
-  await assertNoNewPrivateDirs([RESTORE_WORKSPACE_PREFIXES.download], () =>
+  await assertNoNewPrivateDirs(['fragtrack-download-'], () =>
     assert.rejects(
       () =>
         prepareRestore({
@@ -487,7 +845,7 @@ test('restore: a failed identity write removes its temp directory', async () => 
     return originalWrite(file, ...rest);
   };
   try {
-    await assertNoNewPrivateDirs([RESTORE_WORKSPACE_PREFIXES.identity], () =>
+    await assertNoNewPrivateDirs(['fragtrack-identity-'], () =>
       assert.rejects(
         () =>
           prepareRestore({
@@ -518,21 +876,19 @@ test(
     fs.cpSync(pkg, path.join(repoRoot, 'backups', ENV, ID), { recursive: true });
     // Wrong identity makes unpack/decrypt fail after identity + prepared dirs
     // were allocated; no identity override so the generated dir is also owned.
-    await assertNoNewPrivateDirs(
-      [RESTORE_WORKSPACE_PREFIXES.identity, RESTORE_WORKSPACE_PREFIXES.prepared],
-      () =>
-        assert.rejects(
-          () =>
-            prepareRestore({
-              environment: ENV,
-              source: 'repo',
-              selector: 'latest',
-              ageIdentity: AGE_IDENTITY_2,
-              agePath: agePath(),
-              repoRoot,
-            }),
-          (err) => err instanceof RestoreError || err.name === 'ProcessError',
-        ),
+    await assertNoNewPrivateDirs(['fragtrack-identity-', 'fragtrack-prepared-'], () =>
+      assert.rejects(
+        () =>
+          prepareRestore({
+            environment: ENV,
+            source: 'repo',
+            selector: 'latest',
+            ageIdentity: AGE_IDENTITY_2,
+            agePath: agePath(),
+            repoRoot,
+          }),
+        (err) => err instanceof RestoreError || err.name === 'ProcessError',
+      ),
     );
     fs.rmSync(root, { recursive: true, force: true });
   },

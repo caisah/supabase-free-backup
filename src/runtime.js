@@ -24,7 +24,7 @@ export function currentNodeVersion() {
 export function assertNodeVersion({ version = process.version } = {}) {
   if (version !== REQUIRED_NODE_VERSION_LABEL) {
     throw new Error(
-      `Supabase DB backup requires Node.js ${REQUIRED_NODE_VERSION} exactly; running ${version}. ` +
+      `Fragtrack backup requires Node.js ${REQUIRED_NODE_VERSION} exactly; running ${version}. ` +
         `Install the pinned release (see .node-version) and re-run.`,
     );
   }

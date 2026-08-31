@@ -14,9 +14,9 @@ import {
   resolveBackupExecutables,
   createBackupWorkspace,
   dumpAndPackageSnapshot,
-  BACKUP_WORKSPACE_PREFIX,
 } from './backup.js';
 import { PINNED_SUPABASE_CLI_VERSION } from './database.js';
+import { ENCRYPTION_FORMAT } from './encryption.js';
 import { tmpdir } from './test-fixtures.js';
 
 const REF = 'a1b2c3d4e5f6a7b8c9d0';
@@ -27,7 +27,6 @@ const RECIPIENT = 'age1rz8dtx9s7r2fyjejpq9wmewumm23ukwfdfqy0zjq0063ua6twfuqh0vyk
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 test('backup: createBackupWorkspace is private and leaves the package path nonexistent', () => {
-  assert.equal(BACKUP_WORKSPACE_PREFIX, 'supabase-db-backup-');
   const ws = createBackupWorkspace();
   try {
     assert.equal(fs.statSync(ws.workspace).mode & 0o777, 0o700);
@@ -70,6 +69,41 @@ test('backup: missing age, pinned CLI, or Docker fails preflight before any dump
         lookup: (name) => (name === 'docker' ? null : '/bin/x'),
       }),
     /Docker is required/,
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('backup: requireAge false never looks up age and returns no ageBin', () => {
+  const root = tmpdir('bp-backup-src-');
+  const lookup = (name) => {
+    if (name === 'age' || name === 'age.exe') throw new Error('age must not be resolved');
+    return `/bin/${name}`;
+  };
+  assert.deepEqual(
+    resolveBackupExecutables({
+      lookup,
+      locateCli: () => '/repo/node_modules/.bin/supabase',
+      root,
+      platform: 'linux',
+      requireAge: false,
+    }),
+    {
+      ageBin: undefined,
+      supabasePath: '/repo/node_modules/.bin/supabase',
+      dockerPath: '/bin/docker',
+    },
+  );
+  assert.throws(
+    () =>
+      resolveBackupExecutables({
+        lookup: (name) => (name === 'age' ? null : '/bin/x'),
+        locateCli: () => null,
+        root,
+        platform: 'linux',
+        requireAge: false,
+      }),
+    /Supabase CLI not found/,
+    'supabase is still required without age',
   );
   fs.rmSync(root, { recursive: true, force: true });
 });
@@ -117,6 +151,7 @@ test('backup: dump precedes package and receives the URL only as its source inpu
         environment: 'development',
         sourceProjectRef: REF,
         supabaseCliVersion: PINNED_SUPABASE_CLI_VERSION,
+        format: ENCRYPTION_FORMAT,
         ageRecipient: RECIPIENT,
         agePath: '/bin/age',
         run,

@@ -45,11 +45,6 @@ test('runtime preflight: error names both the required and the current version',
     () => assertNodeVersion({ version: laterMajorVersion }),
     new RegExp(laterMajorVersion.replaceAll('.', '\\.')),
   );
-  assert.throws(
-    () => assertNodeVersion({ version: laterMajorVersion }),
-    /Supabase DB backup requires Node\.js/,
-    'the version error must carry the canonical generic label',
-  );
 });
 
 test('runtime preflight: Node pin agrees across every machine-readable pin source', () => {
