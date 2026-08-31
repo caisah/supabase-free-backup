@@ -2,8 +2,7 @@
 
 Encrypted logical backups of the **development** and **production**
 Supabase databases, stored in Cloudflare R2 (7-day rolling window) and in this
-Git repository (permanent, dated), with verified restore commands for hosted
-targets (restore sources: R2, Git repository, or the private local store).
+Git repository (permanent, dated), with verified restore commands.
 
 > This backs up the _databases_, not the whole Supabase project: no Storage
 > object bytes, Edge Functions, dashboard/Auth provider settings, API keys, or
@@ -25,10 +24,11 @@ by storing daily (for the last week) db snapshots in Cloudflare R2 and a weekly 
 
 ## Usage
 
-1. Create a separate private GitHub repository from this source. A public fork remains public and cannot run backups.
+### Setup
+
+1. Create a separate private GitHub repository from this source. (A public fork remains public and cannot run backups.)
 2. Create `.env.production.local` and, if needed, `.env.development.local`; only production is mandatory. See [Configuration](#configuration).
-3. Configure the required GitHub Actions variables and secrets.
-4. Set the repository Actions variable `BACKUPS_ENABLED` to exactly `true` only after configuration is complete.
+3. Set the required GitHub Actions variables and secrets (or use `github:configure` script).
 
 ## Architecture
 
@@ -36,13 +36,13 @@ When the repository is private and `BACKUPS_ENABLED` is exactly `true`, GitHub A
 
 ```mermaid
 flowchart TD
-    A["Hosted DBs\n(development, production)"] -->|"daily logical dump\n(roles, custom schema, auth/storage deltas,\nmigration history, row data)"| B
+    A["Hosted DBs<br/>(development, production)"] -->|"daily logical dump<br/>roles, custom schema, auth/storage deltas,<br/>migration history, row data"| B
     B{"normalize + fingerprint"}
     B -->|same as newest R2 snapshot| C["nothing uploaded"]
-    B -->|changed| D["age-encrypt row data\n(per-env identity), split into 90 MiB parts"]
+    B -->|changed| D["age-encrypt row data<br/>(per-env identity), split into 90 MiB parts"]
     D --> E["R2 bucket per environment"]
-    E -->|"7-day retention, always keeps newest valid\nsnapshot (unchanged DB never loses its copy)"| E
-    E --> F["Sunday: commit snapshot\ninto backups/<env>/…\nin this repo (append-only)"]
+    E -->|"7-day retention, always keeps newest valid<br/>snapshot; unchanged DB never loses its copy"| E
+    E --> F["Sunday: commit snapshot<br/>into backups/&lt;env&gt;/…<br/>in this repo (append-only)"]
     style C fill:#e0e0e0,stroke:#666
     style E fill:#e3f2fd,stroke:#1976d2
     style F fill:#e8f5e9,stroke:#388e3c
@@ -114,7 +114,7 @@ Configuration values (see [.env.example](.env.example)):
 
 | Variable                                    | Purpose                                     | Notes                                                                                                                        |
 | ------------------------------------------- | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `BACKUPS_ENABLED`                           | GitHub Actions opt-in                       | repository-level Actions variable; only exact `true` enables jobs; not consumed by local commands                            |
+| `BACKUPS_ENABLED`                           | GitHub Actions opt-in                       | must be set to `true` to enable automatic jobs; not consumed by local commands;                                              |
 | `BACKUP_ENVIRONMENT`                        | `development` \| `production`               | must match target (development for env.development.local & production from env.production.local)                             |
 | `SUPABASE_PROJECT_REF`                      | supabase project reference                  | the unique 20-character identifier for your Supabase project, shown as the last part of your dashboard URL (after /project/) |
 | `SUPABASE_DB_URL`                           | **session-pooler or matching direct**       | postgres://<USER>:<PASSWORD>@<HOST>:<PORT>/<DATABASE>?sslmode=require                                                        |
@@ -126,32 +126,9 @@ Configuration values (see [.env.example](.env.example)):
 | `PROJECT_WORKDIR`                           | path to sibling project where supabase runs | used for local restore; `backup:local` dump source                                                                           |
 |                                             |                                             |                                                                                                                              |
 
-To generate `ENCRYPT_KEY` and `DECRYPT_KEY` run `npm run generate-age-keys` to populate these fields.
-
-`npm run github:configure [OWNER/REPO]` validates the local files and syncs the
-corresponding GitHub Environments. It creates absent environments, upserts only
-the approved environment variables and secrets above, and never deletes remote
-configuration. `DECRYPT_KEY`, `PROJECT_WORKDIR`, `BACKUP_ENVIRONMENT`, and
-unknown keys are never uploaded. The target repository must be private and `gh`
-must be authenticated. Reruns are safe and idempotent.
-
-`BACKUPS_ENABLED` is intentionally a **repository-level GitHub Actions
-variable**, not an environment variable uploaded by `github:configure`. After
-all required GitHub Environments are configured, set it under **Settings →
-Secrets and variables → Actions → Variables**. Unset it or use any value other
-than the exact lowercase string `true` to disable both scheduled and manually
-dispatched backup jobs. The private-repository condition remains mandatory.
-The public source repository therefore creates only skipped scheduled runs; to
-suppress those run records too, disable the workflow in that repository's
-Actions settings.
+To generate `ENCRYPT_KEY` and `DECRYPT_KEY` run `npm run generate-age-keys` to populate these fields inside .env files.
 
 ## Scripts
-
-All commands can be run with `npm run`.
-Arguments pass through directly — no `--` separator (`npm run backup -- --environment development`).
-
-**Quality gates** (no Docker/network/secrets required except
-`test:integration`):
 
 | Script                     | Runs                                                               | Purpose                                                                              |
 | -------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
