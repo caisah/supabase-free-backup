@@ -1,4 +1,4 @@
-# Fragtrack database backup and restore
+# Supabase DB (free) backup
 
 Encrypted logical backups of the **development** and **production** Fragtrack
 Supabase databases, stored in Cloudflare R2 (7-day rolling window) and in this
@@ -10,6 +10,27 @@ targets (restore sources: R2, Git repository, or the private local store).
 > the Vault root key. See [Backup scope](#backup-scope).
 
 ---
+
+
+## Rationale
+
+Supabase **free tier** plan does not offer a backup solution. This repo tries to solve that problem,
+by storing daily (for the last week) db snapshots in Cloudflare R2 and a weekly snapshot in this repo.
+
+
+## Prerequisites
+
+- **Node.js >= the release pinned in `.node-version`** (the preflight rejects older versions; npm `12.0.2`);
+- **age** ([used for encryption](https://github.com/FiloSottile/age));
+- **Docker** (Having Supabase installed from a docker image suffices);
+- **`gh`** (**optional** - only for `github:configure` script).
+
+
+## Usage
+
+1. Clone the repository and make it private (otherwise the job will fail).
+2. Create the `.env.production.local` and (if needed) `.env.development.local` files. Check [configuration](#configuration)
+
 
 ## Architecture
 
@@ -84,26 +105,7 @@ Git repository (backups/<environment>/):
                                                   # no snapshots/ level
 ```
 
-## Prerequisites
 
-- **Vite+ `0.3.0`** and **Node.js exactly the release pinned in `.node-version`**
-  (the preflight refuses any other version; npm `12.0.2` stays the package
-  manager via `devEngines`).
-- **Docker** and **age** (`brew install age`): hosted restores run `psql` 17.6
-  from the pinned ephemeral Supabase Postgres image — the image is referenced
-  by its immutable manifest **digest**
-  (`public.ecr.aws/supabase/postgres@sha256:99b1729aeb0bac314445024fc149fbd39306170b61dd50800ccf180327ab3459`,
-  reviewed tag `17.6.1.158`), never a mutable tag — no host PostgreSQL client
-  is ever installed, discovered, or executed, and Docker may pull that exact
-  image when it is absent (the read-only preflight launches `docker run …
-psql --version`, so an unreachable registry/daemon now fails the preflight
-  before any target contact). `age` stays conditional: only encrypted
-  repo/R2 snapshots need it — local-store snapshots are plaintext and never
-  require age or `DECRYPT_KEY`.
-- The sibling **`../fragtrack`** project (local backups only; hosted
-  restores need **no running local Supabase stack** and `--source local`
-  restores run against a hosted target like any other hosted restore).
-- **`gh`** (only for `github:configure`).
 
 ## Configuration
 
@@ -112,21 +114,24 @@ Ignored local files (never commit):
 - `.env.development.local`,
 - `.env.production.local`.
 
-Variables (see `.env.example`):
+Variables (see [.env.example](.env.example)):
 
-| Variable                                    | Purpose                                                        | Notes                                                                              |
-| ------------------------------------------- | -------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| `BACKUP_ENVIRONMENT`                        | `development` \| `production`                                  | must match target                                                                  |
-| `SUPABASE_PROJECT_REF`                      | project reference                                              |                                                                                    |
-| `SUPABASE_DB_URL`                           | **session-pooler or matching direct** URL (postgresql://, SSL) | username `postgres.<ref>` (direct: `db.<ref>.supabase.co:5432`)                    |
-| `CLOUDFLARE_ACCOUNT_ID`                     | Cloudflare account id                                          |                                                                                    |
-| `R2_BUCKET`                                 | R2 bucket                                                      | must equal the environment                                                         |
-| `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 credentials (scoped to the bucket)                          |                                                                                    |
-| `ENCRYPT_KEY`                               | public age recipient (`age1…`)                                 | backup only (hosted); not consumed by `backup:local` or `restore:* --source local` |
-| `DECRYPT_KEY`                               | private age identity (`AGE-SECRET-KEY-…`)                      | r2/repo restores only; never consumed by `--source local`; never uploaded          |
-| `PROJECT_WORKDIR`                           | path to sibling Fragtrack project                              | `backup:local` dump source                                                         |
+| Variable                                    | Purpose                                     | Notes                                                                                                                        |
+|---------------------------------------------|---------------------------------------------|------------------------------------------------------------------------------------------------------------------------------|
+| `BACKUP_ENVIRONMENT`                        | `development` \| `production`               | must match target (development for env.development.local & production from env.production.local)                             |
+| `SUPABASE_PROJECT_REF`                      | supabase project reference                  | the unique 20-character identifier for your Supabase project, shown as the last part of your dashboard URL (after /project/) |
+| `SUPABASE_DB_URL`                           | **session-pooler or matching direct**       | postgres://<USER>:<PASSWORD>@<HOST>:<PORT>/<DATABASE>?sslmode=require                                                        |
+| `CLOUDFLARE_ACCOUNT_ID`                     | Cloudflare account id                       |                                                                                                                              |
+| `R2_BUCKET`                                 | R2 bucket                                   | must equal the environment (production \| development)                                                                       |
+| `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 credentials (scoped to the bucket)       |                                                                                                                              |
+| `ENCRYPT_KEY`                               | public age recipient (`age1…`)              | backup only (hosted); not consumed by `backup:local` or `restore:* --source local`                                           |
+| `DECRYPT_KEY`                               | private age identity (`AGE-SECRET-KEY-…`)   | r2/repo restores only (and legacy encrypted local snapshots); never uploaded                                                 |
+| `PROJECT_WORKDIR`                           | path to sibling project where supabase runs | used for local restore; `backup:local` dump source                                                                           |
+|                                             |                                             |                                                                                                                              |
 
-`vp run github:configure [OWNER/REPO]` validates both local files and syncs
+To generate `ENCRYPT_KEY` and `DECRYPT_KEY` run `npm run generate-age-keys` to populate these fields.
+
+`npm run github:configure [OWNER/REPO]` validates both local files and syncs
 both GitHub Environments (creates absent ones, upserts only the approved
 variables/secrets above; never deletes remote config;
 `DECRYPT_KEY` and other keys are never uploaded).
@@ -134,40 +139,40 @@ Target repository must be private and `gh` authenticated. Reruns are safe and id
 
 ## Scripts
 
-All commands run under Vite+ (`vp`).
-Arguments pass through directly — no `--` separator (`vp run backup --environment development`).
+All commands can be run with `npm run`.
+Arguments pass through directly — no `--` separator (`npm run backup -- --environment development`).
 
 **Quality gates** (no Docker/network/secrets required except
 `test:integration`):
 
-| Script                    | Runs                                                               | Purpose                                                                              |
-| ------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
-| `vp run lint`             | `vp lint`                                                          | Oxlint with the migrated ESLint policy (`vite.config.ts` `lint.rules`)               |
-| `vp run test`             | `node --test --test-skip-pattern=integration`                      | Native unit tests (never `vp test`)                                                  |
-| `vp run test:integration` | `node --test --test-name-pattern=integration --test-concurrency=1` | Serial Docker integration suite on disposable fixtures                               |
-| `vp run check`            | `vp check` + unit tests                                            | Full package check. Note: bare `vp check` is only formatting + lint (Vite+ built-in) |
-| `vp run preflight`        | `node --input-type=module -e "…assertNodeVersion()"`               | Runtime version gate (exact `.node-version` pin)                                     |
+| Script                      | Runs                                                               | Purpose                                                                              |
+| --------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
+| `npm run lint`              | `vp lint`                                                          | Oxlint with the migrated ESLint policy (`vite.config.ts` `lint.rules`)               |
+| `npm run test`              | `node --test --test-skip-pattern=integration`                      | Native unit tests                                                                    |
+| `npm run test:integration`  | `node --test --test-name-pattern=integration --test-concurrency=1` | Serial Docker integration suite on disposable fixtures                               |
+| `npm run check`             | `vp check` + unit tests                                            | Full package check. Note: bare `vp check` is only formatting + lint (Vite+ built-in) |
+| `npm run preflight`         | `node --input-type=module -e "…assertNodeVersion()"`                | Runtime version gate (`.node-version` minimum)                                       |
 
-**Vite+ built-ins:**
+**Formatting and environment:**
 
-| Command                 | Runs                                               | Purpose                                                        |
-| ----------------------- | -------------------------------------------------- | -------------------------------------------------------------- |
-| `vp lint`               | Oxlint (policy from `vite.config.ts` `lint.rules`) | Lint only — no formatting, no type checking                    |
-| `vp fmt`                | Oxfmt                                              | Auto-format all files in the working tree                      |
-| `vp fmt --check`        | Oxfmt (dry-run)                                    | Fail if any file is unformatted; used in CI                    |
-| `vp env current --json` | Reads active `.env` + `.env.local` files           | Print resolved environment name and loaded variables as JSON   |
-| `vp env doctor`         | Validates env files against required variables     | Report missing/invalid config; used before backup/restore runs |
+| Command                   | Runs                                               | Purpose                                                        |
+| ------------------------- | -------------------------------------------------- | -------------------------------------------------------------- |
+| `npm run fmt`             | Oxfmt                                              | Auto-format all files in the working tree                      |
+| `npm run fmt:check`       | Oxfmt (dry-run)                                    | Fail if any file is unformatted; used in CI                    |
+
 
 **Backup and restore:**
 
-| Script                                                                               | Purpose                                                                         |
-| ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------- |
-| `vp run backup --environment development\|production`                                | Dump, fingerprint, upload changed snapshot to R2, run retention                 |
-| `vp run backup:local`                                                                | Package the ALREADY-RUNNING local Fragtrack DB into `local-backups/local/`      |
-| `vp run restore:development --source r2\|repo\|local --backup latest\|<snapshot-id>` | Restore into hosted development DB                                              |
-| `vp run restore:production --source r2\|repo\|local --backup latest\|<snapshot-id>`  | Restore into hosted production DB (maintenance window required)                 |
-| `vp run github:configure [OWNER/REPO]`                                               | Validate local env files, sync GitHub Environments                              |
-| `vp run commit:weekly --staging-dir <path> --repo-root .`                            | Weekly Git snapshot commit (used by the workflow; runnable locally on `master`) |
+| Script                                                                                                          | Purpose                                                                         |
+| --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `npm run backup -- --environment development\|production`                                                       | Dump, fingerprint, upload changed snapshot to R2, run retention                 |
+| `npm run backup:local -- --environment development\|production`                                                 | Package the ALREADY-RUNNING local Fragtrack DB into `local-backups/<env>/`      |
+| `npm run restore:development -- --source r2\|repo\|local --backup latest\|<snapshot-id>`                        | Restore into hosted development DB                                              |
+| `npm run restore:production -- --source r2\|repo\|local --backup latest\|<snapshot-id>`                         | Restore into hosted production DB (maintenance window required)                 |
+| `npm run restore:local -- --environment development\|production --source r2\|repo --backup latest\|<snapshot-id>` | Restore either hosted snapshot into the local `../fragtrack` stack              |
+| `npm run github:configure [OWNER/REPO]`                                                                          | Validate local env files, sync GitHub Environments                              |
+| `npm run generate-age-keys`                                                                                      | Generate age X25519 key pair and write to existing `.env.*.local` files         |
+| `npm run commit:weekly -- --staging-dir <path> --repo-root .`                                                   | Weekly Git snapshot commit (used by the workflow; runnable locally on `master`) |
 
 - Restore targets are **cleaned first** (`supabase db reset` / volume
   recreation), then the verified snapshot applies in **one Dockerized psql
@@ -215,22 +220,15 @@ flowchart LR
 
 ### Local backup (`backup:local`)
 
-`vp run backup:local` packages the **already-running local Supabase stack**
-owned by the sibling Fragtrack project into a private, repository-local
-store. It reuses the exact dump, fingerprint, gzip + plaintext part splitting,
-and manifest pipeline as the hosted backup, but never encrypts (no age
-binary, no `ENCRYPT_KEY`), never touches R2, and never starts, stops,
-resets, or migrates the local stack. It uses only read-only connectivity and
-source-state probes.
-
-There is **no environment argument**: the local stack is a single database.
-Its config identity is fixed to the development dotenv file —
-`vp run backup:local` reads `.env.development.local` (whose
-`BACKUP_ENVIRONMENT` must be `development`) for `SUPABASE_PROJECT_REF` and
-`PROJECT_WORKDIR`; the data source is always the local database. Snapshots
-are labeled environment `local` and stored under `local-backups/local/` with
-the lock `local-backups/.lock-local`; both hosted targets consume the SAME
-store later via `restore:development|restore:production --source local`.
+`npm run backup:local -- --environment <development|production>` packages the
+**already-running local Supabase stack** owned by the sibling Fragtrack project
+into a private, repository-local store. It reuses the exact dump, fingerprint,
+gzip + plaintext part splitting, and manifest pipeline as the hosted backup,
+but never encrypts (no age binary, no `ENCRYPT_KEY`), never touches R2, and
+never starts, stops, resets, or migrates the local stack. It uses only
+read-only connectivity and source-state probes. The selected environment only
+selects **target metadata** (`SUPABASE_PROJECT_REF`); the data source is always
+the local database.
 
 ```text
 local-backups/local/<YYYY-MM-DDTHH-mm-ssZ>/
@@ -278,23 +276,18 @@ local-backups/local/<YYYY-MM-DDTHH-mm-ssZ>/
 
 ### Restore a local backup to a hosted environment
 
-`vp run restore:development --source local --backup latest|<snapshot-id>` and
-`vp run restore:production --source local --backup latest|<snapshot-id>` BOTH
-read the SAME single store `local-backups/local/`; the target is chosen by the
-command name. No environment or project-ref matching is applied — a local
-snapshot may be restored into any hosted environment by explicit operator
-choice. Local snapshots are **plaintext**: no `DECRYPT_KEY`, no age binary,
-no R2 credentials, and no encryption step ever exists on this path.
-
-The confirmation summary always shows the snapshot's **source project ref**
-(the project the local data actually came from), and when that ref differs
-from the target project — e.g. restoring a development-local snapshot into
-production — the exact confirmation phrase additionally requires typing the
-source ref (`RESTORE production <target> from local snapshot <source>`), so a
-cross-project restore is an explicit, typed acknowledgement. The confirmation
-gate requires an interactive TTY: piped/automated input always declines, and
-no destructive step runs without the exact phrase. Hosted read-only preflight,
-reset/apply pipeline, and existing confirmation phrases are unchanged.
+`npm run restore:development|restore:production -- --source local --backup
+latest|<snapshot-id>` restores a snapshot from `local-backups/<target-env>/`
+into the hosted target database. Plaintext snapshots need **no decryption**:
+no `DECRYPT_KEY`, no age binary, no R2 credentials. `DECRYPT_KEY` is
+**optional** for `--source local` — it is only resolved when actually
+configured (and then conflict-checked like any other consumed variable). A
+pre-refactor age-encrypted snapshot still found in the store keeps working
+when `DECRYPT_KEY` and the age binary are configured; if the age binary is
+missing from PATH while `DECRYPT_KEY` is set, the restore fails fast during
+preflight with the install hint. Hosted read-only preflight,
+reset/apply pipeline, and confirmation phrases are unchanged (production still
+requires `RESTORE production <project-ref>`).
 
 ## References
 
