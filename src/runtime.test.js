@@ -53,11 +53,11 @@ test('runtime preflight: later major version is accepted', () => {
 test('runtime preflight: error names both the required and the current version', () => {
   assert.throws(
     () => assertNodeVersion({ version: olderMajorVersion }),
-    new RegExp(`>= ${REQUIRED_NODE_VERSION.replace('.', '\.')}`),
+    new RegExp(`>= ${REQUIRED_NODE_VERSION.replace('.', '.')}`),
   );
   assert.throws(
     () => assertNodeVersion({ version: olderMajorVersion }),
-    new RegExp(olderMajorVersion.replaceAll('.', '\.')),
+    new RegExp(olderMajorVersion.replaceAll('.', '.')),
   );
 });
 

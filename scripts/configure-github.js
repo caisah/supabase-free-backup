@@ -12,6 +12,7 @@
  * exclusively over gh stdin, and the target repository must be private.
  */
 
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertNodeVersion } from '../src/runtime.js';
@@ -104,23 +105,36 @@ function gitHubMapsFromConfig(config) {
   return { secrets, variables };
 }
 
+function envFilePath(root, environment) {
+  return path.join(root, `.env.${environment}.local`);
+}
+
 /**
  * Load and validate both environments before any external command.
  * `vars: {}` is mandatory: ambient process values cannot replace file values.
  * Registers every value that will be sent to gh so a later failure cannot
  * expose a credential through the logger/error path.
+ * Skips environments whose dotenv file does not exist.
  *
- * @returns {Record<'development'|'production', {secrets: object, variables: object}>}
+ * @returns {{ configs: Record<string, {secrets: object, variables: object}>, environments: string[] }}
  */
 export function loadGitHubEnvironmentConfigs({ root, loadConfig = loadBackupConfig, logger }) {
   const configs = {};
+  const environments = [];
   for (const environment of ENVIRONMENTS) {
+    const filePath = envFilePath(root, environment);
+    try {
+      fs.accessSync(filePath, fs.constants.R_OK);
+    } catch {
+      continue;
+    }
     const config = loadConfig({ environment, root, vars: {} });
     const maps = gitHubMapsFromConfig(config);
     for (const value of Object.values(maps.secrets)) logger?.addSecret(value);
     configs[environment] = maps;
+    environments.push(environment);
   }
-  return configs;
+  return { configs, environments };
 }
 
 /** Parse `gh repo view --json nameWithOwner,isPrivate` stdout defensively. */
@@ -199,7 +213,11 @@ export async function runConfigureGitHub({
   const parsed = parseConfigureGitHubArgs(argv);
   if (parsed.help) return { help: true };
 
-  const configs = loadGitHubEnvironmentConfigs({ root, loadConfig, logger });
+  const { configs, environments } = loadGitHubEnvironmentConfigs({ root, loadConfig, logger });
+
+  if (environments.length === 0) {
+    throw new Error('no .env.*.local files found; nothing to configure');
+  }
 
   const ghBin = resolveGhBin({ lookup, platform });
   if (!ghBin) {
@@ -262,7 +280,7 @@ export async function runConfigureGitHub({
 
     // Create absent environments only; never touch protection on existing ones.
     const createdEnvironments = [];
-    for (const environment of ENVIRONMENTS) {
+    for (const environment of environments) {
       if (existing.has(environment)) continue;
       await run({
         command: ghBin,
@@ -285,7 +303,7 @@ export async function runConfigureGitHub({
     }
 
     const upserts = {};
-    for (const environment of ENVIRONMENTS) {
+    for (const environment of environments) {
       const counts = { variables: 0, secrets: 0 };
       for (const [name, value] of Object.entries(configs[environment].variables)) {
         await setGitHubValue({

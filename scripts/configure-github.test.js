@@ -245,7 +245,7 @@ test('github:configure: maps both environments to exactly the approved allowlist
   const root = tmpdir('cfg-gh-map-');
   writeEnvFiles(root);
   try {
-    const configs = loadGitHubEnvironmentConfigs({ root, loadConfig: loadBackupConfig });
+    const { configs } = loadGitHubEnvironmentConfigs({ root, loadConfig: loadBackupConfig });
     for (const environment of ['development', 'production']) {
       assert.deepEqual(Object.keys(configs[environment].secrets).sort(), [
         'R2_ACCESS_KEY_ID',
@@ -291,7 +291,7 @@ test('github:configure: file values win over ambient process values', async () =
   process.env.SUPABASE_DB_URL = ambientUrl;
   process.env.R2_SECRET_ACCESS_KEY = 'ambient-key-override-1234567890';
   try {
-    const configs = loadGitHubEnvironmentConfigs({ root, loadConfig: loadBackupConfig });
+    const { configs } = loadGitHubEnvironmentConfigs({ root, loadConfig: loadBackupConfig });
     assert.equal(configs.development.secrets.SUPABASE_DB_URL, dbUrl('development'));
     assert.equal(configs.development.secrets.R2_SECRET_ACCESS_KEY, SECRET_KEY);
   } finally {
@@ -305,8 +305,7 @@ test('github:configure: file values win over ambient process values', async () =
 
 test('github:configure: invalid local configuration rejects before any gh call', async () => {
   const cases = [
-    { name: 'missing production file', development: {}, production: undefined },
-    { name: 'missing approved field', development: { SUPABASE_DB_URL: undefined } },
+    { name: 'missing approved field', development: { SUPABASE_DB_URL: undefined }, production: {} },
     { name: 'wrong BACKUP_ENVIRONMENT', production: { BACKUP_ENVIRONMENT: 'development' } },
     { name: 'invalid bucket', development: { R2_BUCKET: 'staging' } },
     { name: 'project-ref/URL mismatch', development: { SUPABASE_PROJECT_REF: 'z'.repeat(20) } },
@@ -489,7 +488,7 @@ test('github:configure: only the missing environment is created', async () => {
 test('github:configure: fourteen upserts in deterministic environment/field order', async () => {
   const root = tmpdir('cfg-gh-order-');
   writeEnvFiles(root);
-  const configs = loadGitHubEnvironmentConfigs({ root, loadConfig: loadBackupConfig });
+  const { configs } = loadGitHubEnvironmentConfigs({ root, loadConfig: loadBackupConfig });
   const { calls: expected, values } = expectedSetCalls(configs);
   const { deps, calls, logger } = makeDeps({ loadConfig: loadBackupConfig, root });
   await runConfigureGitHub({ argv: [], root, logger, deps });
@@ -541,7 +540,7 @@ test('github:configure: no invocation contains a delete operation', async () => 
 test('github:configure: write failure stops later writes, hides values, and rerun is safe', async () => {
   const root = tmpdir('cfg-gh-fail-');
   writeEnvFiles(root);
-  const configs = loadGitHubEnvironmentConfigs({ root, loadConfig: loadBackupConfig });
+  const { configs } = loadGitHubEnvironmentConfigs({ root, loadConfig: loadBackupConfig });
   const { logger } = capturingLogger();
   // call 0: repo view, 1: env list, 2-3: PUTs, 4-7: dev variables, 8: first dev secret.
   const failing = makeDeps({ loadConfig: loadBackupConfig, root, environments: '', failAt: 8 });
@@ -730,4 +729,44 @@ test('github:configure: CLI entry point responds to --help', () => {
   assert.ok(res.stdout.includes('usage: vp run github:configure'), res.stdout);
   assert.ok(/development and production/.test(res.stdout), res.stdout);
   assert.equal(res.stderr, '');
+});
+
+test('github:configure: skips environments with missing dotenv files', () => {
+  const root = tmpdir('cfg-gh-skip-');
+  writeEnvFile(root, 'production', {
+    BACKUP_ENVIRONMENT: 'production',
+    SUPABASE_PROJECT_REF: REF_PROD,
+    SUPABASE_DB_URL: dbUrl('production'),
+    CLOUDFLARE_ACCOUNT_ID: ACCOUNT_ID,
+    R2_BUCKET: 'production',
+    R2_ACCESS_KEY_ID: ACCESS_KEY,
+    R2_SECRET_ACCESS_KEY: SECRET_KEY,
+    ENCRYPT_KEY: AGE_RECIPIENT,
+  });
+  try {
+    const { configs, environments } = loadGitHubEnvironmentConfigs({
+      root,
+      loadConfig: loadBackupConfig,
+    });
+    assert.deepEqual(environments, ['production']);
+    assert.ok(!('development' in configs));
+    assert.ok('production' in configs);
+    assert.equal(configs.production.variables.SUPABASE_PROJECT_REF, REF_PROD);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('github:configure: errors when no dotenv files exist', () => {
+  const root = tmpdir('cfg-gh-none-');
+  try {
+    const { configs, environments } = loadGitHubEnvironmentConfigs({
+      root,
+      loadConfig: loadBackupConfig,
+    });
+    assert.deepEqual(environments, []);
+    assert.deepEqual(configs, {});
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

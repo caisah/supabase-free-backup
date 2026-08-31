@@ -32,7 +32,8 @@ const DECRYPT_KEY_NAME = 'DECRYPT_KEY';
  * @returns {string|null} Absolute path to the executable, or null if not found
  */
 function resolveAgeKeygen({ lookup, platform = process.platform }) {
-  const names = platform === 'win32' ? ['age-keygen.exe', 'age-keygen.cmd', 'age-keygen'] : ['age-keygen'];
+  const names =
+    platform === 'win32' ? ['age-keygen.exe', 'age-keygen.cmd', 'age-keygen'] : ['age-keygen'];
   for (const name of names) {
     const found = lookup(name);
     if (found) return found;
@@ -99,11 +100,9 @@ function readEnvFile(filePath) {
  * (`# KEY=value`) to prevent duplicate keys.
  *
  * @param {string} content - Raw dotenv file content
- * @param {string} publicKey - Unused (kept for signature consistency)
- * @param {string} secretKey - Unused (kept for signature consistency)
  * @returns {{ encryptKeyFound: boolean, decryptKeyFound: boolean, content: string }}
  */
-function updateEnvContent(content, publicKey, secretKey) {
+function updateEnvContent(content) {
   const lines = content.split('\n');
   let encryptKeyFound = false;
   let decryptKeyFound = false;
@@ -112,10 +111,16 @@ function updateEnvContent(content, publicKey, secretKey) {
     const line = lines[i];
     const trimmed = line.trim();
 
-    if (trimmed.startsWith(`${ENCRYPT_KEY_NAME}=`) || trimmed.startsWith(`# ${ENCRYPT_KEY_NAME}=`)) {
+    if (
+      trimmed.startsWith(`${ENCRYPT_KEY_NAME}=`) ||
+      trimmed.startsWith(`# ${ENCRYPT_KEY_NAME}=`)
+    ) {
       encryptKeyFound = true;
     }
-    if (trimmed.startsWith(`${DECRYPT_KEY_NAME}=`) || trimmed.startsWith(`# ${DECRYPT_KEY_NAME}=`)) {
+    if (
+      trimmed.startsWith(`${DECRYPT_KEY_NAME}=`) ||
+      trimmed.startsWith(`# ${DECRYPT_KEY_NAME}=`)
+    ) {
       decryptKeyFound = true;
     }
   }
@@ -212,11 +217,13 @@ export async function runGenerateAgeKeys({
       continue;
     }
 
-    const { encryptKeyFound, decryptKeyFound } = updateEnvContent(content, publicKey, secretKey);
+    const { encryptKeyFound, decryptKeyFound } = updateEnvContent(content);
 
     if (encryptKeyFound || decryptKeyFound) {
       skippedFiles.push(filePath);
-      logger.status(`${filePath}: already contains ${ENCRYPT_KEY_NAME} or ${DECRYPT_KEY_NAME} — skipping`);
+      logger.status(
+        `${filePath}: already contains ${ENCRYPT_KEY_NAME} or ${DECRYPT_KEY_NAME} — skipping`,
+      );
       continue;
     }
 

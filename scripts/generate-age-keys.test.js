@@ -2,9 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { runGenerateAgeKeys } from './generate-age-keys.js';
-import { REPOSITORY_ROOT } from '../src/config.js';
 import { tmpdir, writePrivateFile } from '../src/test-fixtures.js';
 
 const AGE_RECIPIENT = 'age1rz8dtx9s7r2fyjejpq9wmewumm23ukwfdfqy0zjq0063ua6twfuqh0vyk9';

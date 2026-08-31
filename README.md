@@ -11,12 +11,10 @@ targets (restore sources: R2, Git repository, or the private local store).
 
 ---
 
-
 ## Rationale
 
 Supabase **free tier** plan does not offer a backup solution. This repo tries to solve that problem,
 by storing daily (for the last week) db snapshots in Cloudflare R2 and a weekly snapshot in this repo.
-
 
 ## Prerequisites
 
@@ -25,12 +23,11 @@ by storing daily (for the last week) db snapshots in Cloudflare R2 and a weekly 
 - **Docker** (Having Supabase installed from a docker image suffices);
 - **`gh`** (**optional** - only for `github:configure` script).
 
-
 ## Usage
 
 1. Clone the repository and make it private (otherwise the job will fail).
-2. Create the `.env.production.local` and (if needed) `.env.development.local` files. Check [configuration](#configuration)
-
+2. Create the `.env.production.local` and (if needed) `.env.development.local` files - only the _production_ one is mandatory.
+   Check [configuration](#configuration).
 
 ## Architecture
 
@@ -117,7 +114,7 @@ Ignored local files (never commit):
 Variables (see [.env.example](.env.example)):
 
 | Variable                                    | Purpose                                     | Notes                                                                                                                        |
-|---------------------------------------------|---------------------------------------------|------------------------------------------------------------------------------------------------------------------------------|
+| ------------------------------------------- | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | `BACKUP_ENVIRONMENT`                        | `development` \| `production`               | must match target (development for env.development.local & production from env.production.local)                             |
 | `SUPABASE_PROJECT_REF`                      | supabase project reference                  | the unique 20-character identifier for your Supabase project, shown as the last part of your dashboard URL (after /project/) |
 | `SUPABASE_DB_URL`                           | **session-pooler or matching direct**       | postgres://<USER>:<PASSWORD>@<HOST>:<PORT>/<DATABASE>?sslmode=require                                                        |
@@ -131,6 +128,7 @@ Variables (see [.env.example](.env.example)):
 
 To generate `ENCRYPT_KEY` and `DECRYPT_KEY` run `npm run generate-age-keys` to populate these fields.
 
+To set these variables automatically instead of
 `npm run github:configure [OWNER/REPO]` validates both local files and syncs
 both GitHub Environments (creates absent ones, upserts only the approved
 variables/secrets above; never deletes remote config;
@@ -145,34 +143,33 @@ Arguments pass through directly — no `--` separator (`npm run backup -- --envi
 **Quality gates** (no Docker/network/secrets required except
 `test:integration`):
 
-| Script                      | Runs                                                               | Purpose                                                                              |
-| --------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
-| `npm run lint`              | `vp lint`                                                          | Oxlint with the migrated ESLint policy (`vite.config.ts` `lint.rules`)               |
-| `npm run test`              | `node --test --test-skip-pattern=integration`                      | Native unit tests                                                                    |
-| `npm run test:integration`  | `node --test --test-name-pattern=integration --test-concurrency=1` | Serial Docker integration suite on disposable fixtures                               |
-| `npm run check`             | `vp check` + unit tests                                            | Full package check. Note: bare `vp check` is only formatting + lint (Vite+ built-in) |
-| `npm run preflight`         | `node --input-type=module -e "…assertNodeVersion()"`                | Runtime version gate (`.node-version` minimum)                                       |
+| Script                     | Runs                                                               | Purpose                                                                              |
+| -------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------ |
+| `npm run lint`             | `vp lint`                                                          | Oxlint with the migrated ESLint policy (`vite.config.ts` `lint.rules`)               |
+| `npm run test`             | `node --test --test-skip-pattern=integration`                      | Native unit tests                                                                    |
+| `npm run test:integration` | `node --test --test-name-pattern=integration --test-concurrency=1` | Serial Docker integration suite on disposable fixtures                               |
+| `npm run check`            | `vp check` + unit tests                                            | Full package check. Note: bare `vp check` is only formatting + lint (Vite+ built-in) |
+| `npm run preflight`        | `node --input-type=module -e "…assertNodeVersion()"`               | Runtime version gate (`.node-version` minimum)                                       |
 
 **Formatting and environment:**
 
-| Command                   | Runs                                               | Purpose                                                        |
-| ------------------------- | -------------------------------------------------- | -------------------------------------------------------------- |
-| `npm run fmt`             | Oxfmt                                              | Auto-format all files in the working tree                      |
-| `npm run fmt:check`       | Oxfmt (dry-run)                                    | Fail if any file is unformatted; used in CI                    |
-
+| Command             | Runs            | Purpose                                     |
+| ------------------- | --------------- | ------------------------------------------- |
+| `npm run fmt`       | Oxfmt           | Auto-format all files in the working tree   |
+| `npm run fmt:check` | Oxfmt (dry-run) | Fail if any file is unformatted; used in CI |
 
 **Backup and restore:**
 
-| Script                                                                                                          | Purpose                                                                         |
-| --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| `npm run backup -- --environment development\|production`                                                       | Dump, fingerprint, upload changed snapshot to R2, run retention                 |
-| `npm run backup:local -- --environment development\|production`                                                 | Package the ALREADY-RUNNING local Fragtrack DB into `local-backups/<env>/`      |
-| `npm run restore:development -- --source r2\|repo\|local --backup latest\|<snapshot-id>`                        | Restore into hosted development DB                                              |
-| `npm run restore:production -- --source r2\|repo\|local --backup latest\|<snapshot-id>`                         | Restore into hosted production DB (maintenance window required)                 |
+| Script                                                                                                            | Purpose                                                                         |
+| ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `npm run backup -- --environment development\|production`                                                         | Dump, fingerprint, upload changed snapshot to R2, run retention                 |
+| `npm run backup:local -- --environment development\|production`                                                   | Package the ALREADY-RUNNING local Fragtrack DB into `local-backups/<env>/`      |
+| `npm run restore:development -- --source r2\|repo\|local --backup latest\|<snapshot-id>`                          | Restore into hosted development DB                                              |
+| `npm run restore:production -- --source r2\|repo\|local --backup latest\|<snapshot-id>`                           | Restore into hosted production DB (maintenance window required)                 |
 | `npm run restore:local -- --environment development\|production --source r2\|repo --backup latest\|<snapshot-id>` | Restore either hosted snapshot into the local `../fragtrack` stack              |
-| `npm run github:configure [OWNER/REPO]`                                                                          | Validate local env files, sync GitHub Environments                              |
-| `npm run generate-age-keys`                                                                                      | Generate age X25519 key pair and write to existing `.env.*.local` files         |
-| `npm run commit:weekly -- --staging-dir <path> --repo-root .`                                                   | Weekly Git snapshot commit (used by the workflow; runnable locally on `master`) |
+| `npm run github:configure [OWNER/REPO]`                                                                           | Validate local env files, sync GitHub Environments                              |
+| `npm run generate-age-keys`                                                                                       | Generate age X25519 key pair and write to existing `.env.*.local` files         |
+| `npm run commit:weekly -- --staging-dir <path> --repo-root .`                                                     | Weekly Git snapshot commit (used by the workflow; runnable locally on `master`) |
 
 - Restore targets are **cleaned first** (`supabase db reset` / volume
   recreation), then the verified snapshot applies in **one Dockerized psql
