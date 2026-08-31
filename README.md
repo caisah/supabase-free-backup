@@ -25,17 +25,18 @@ by storing daily (for the last week) db snapshots in Cloudflare R2 and a weekly 
 
 ## Usage
 
-1. Clone the repository and make it private (otherwise the job will fail).
-2. Create the `.env.production.local` and (if needed) `.env.development.local` files - only the _production_ one is mandatory.
-   Check [configuration](#configuration).
+1. Create a separate private GitHub repository from this source. A public fork remains public and cannot run backups.
+2. Create `.env.production.local` and, if needed, `.env.development.local`; only production is mandatory. See [Configuration](#configuration).
+3. Configure the required GitHub Actions variables and secrets.
+4. Set the repository Actions variable `BACKUPS_ENABLED` to exactly `true` only after configuration is complete.
 
 ## Architecture
 
-Every day at **03:17 UTC** (GitHub Actions, `.github/workflows/backup.yml`):
+When the repository is private and `BACKUPS_ENABLED` is exactly `true`, GitHub Actions (`.github/workflows/backup.yml`) runs every day at **03:17 UTC**:
 
 ```mermaid
 flowchart TD
-    A["Hosted DBs\n(development, production)"] -->|daily logical dump\n(roles, custom schema, auth/storage deltas,\nmigration history, row data)| B
+    A["Hosted DBs\n(development, production)"] -->|"daily logical dump\n(roles, custom schema, auth/storage deltas,\nmigration history, row data)"| B
     B{"normalize + fingerprint"}
     B -->|same as newest R2 snapshot| C["nothing uploaded"]
     B -->|changed| D["age-encrypt row data\n(per-env identity), split into 90 MiB parts"]
@@ -109,10 +110,11 @@ Ignored local files (never commit):
 - `.env.development.local`,
 - `.env.production.local`.
 
-Variables (see [.env.example](.env.example)):
+Configuration values (see [.env.example](.env.example)):
 
 | Variable                                    | Purpose                                     | Notes                                                                                                                        |
 | ------------------------------------------- | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `BACKUPS_ENABLED`                           | GitHub Actions opt-in                       | repository-level Actions variable; only exact `true` enables jobs; not consumed by local commands                            |
 | `BACKUP_ENVIRONMENT`                        | `development` \| `production`               | must match target (development for env.development.local & production from env.production.local)                             |
 | `SUPABASE_PROJECT_REF`                      | supabase project reference                  | the unique 20-character identifier for your Supabase project, shown as the last part of your dashboard URL (after /project/) |
 | `SUPABASE_DB_URL`                           | **session-pooler or matching direct**       | postgres://<USER>:<PASSWORD>@<HOST>:<PORT>/<DATABASE>?sslmode=require                                                        |
@@ -126,12 +128,22 @@ Variables (see [.env.example](.env.example)):
 
 To generate `ENCRYPT_KEY` and `DECRYPT_KEY` run `npm run generate-age-keys` to populate these fields.
 
-To set these variables automatically instead of
-`npm run github:configure [OWNER/REPO]` validates both local files and syncs
-both GitHub Environments (creates absent ones, upserts only the approved
-variables/secrets above; never deletes remote config;
-`DECRYPT_KEY` and other keys are never uploaded).
-Target repository must be private and `gh` authenticated. Reruns are safe and idempotent.
+`npm run github:configure [OWNER/REPO]` validates the local files and syncs the
+corresponding GitHub Environments. It creates absent environments, upserts only
+the approved environment variables and secrets above, and never deletes remote
+configuration. `DECRYPT_KEY`, `PROJECT_WORKDIR`, `BACKUP_ENVIRONMENT`, and
+unknown keys are never uploaded. The target repository must be private and `gh`
+must be authenticated. Reruns are safe and idempotent.
+
+`BACKUPS_ENABLED` is intentionally a **repository-level GitHub Actions
+variable**, not an environment variable uploaded by `github:configure`. After
+all required GitHub Environments are configured, set it under **Settings →
+Secrets and variables → Actions → Variables**. Unset it or use any value other
+than the exact lowercase string `true` to disable both scheduled and manually
+dispatched backup jobs. The private-repository condition remains mandatory.
+The public source repository therefore creates only skipped scheduled runs; to
+suppress those run records too, disable the workflow in that repository's
+Actions settings.
 
 ## Scripts
 

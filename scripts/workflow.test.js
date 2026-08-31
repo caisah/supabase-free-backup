@@ -34,6 +34,21 @@ test('workflow: backup steps expose every required configuration variable', () =
   }
 });
 
+test('workflow: every backup job requires explicit opt-in in a private repository', () => {
+  const jobConditions = yaml.match(/^ {4}if: .*BACKUPS_ENABLED.*$/gm) ?? [];
+  assert.equal(jobConditions.length, 2, 'backup and weekly-commit must both be gated');
+  for (const condition of jobConditions) {
+    assert.ok(
+      condition.includes('github.event.repository.private == true'),
+      'each job gate must require a private repository',
+    );
+    assert.ok(
+      condition.includes("vars.BACKUPS_ENABLED == 'true'"),
+      'each job gate must require the exact repository opt-in value',
+    );
+  }
+});
+
 test('workflow: backup matrix jobs do not share a serialized concurrency group', () => {
   assert.match(
     yaml,
