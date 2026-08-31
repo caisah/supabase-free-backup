@@ -24,7 +24,14 @@ import {
   finalizeLocalBackup,
 } from '../src/local-backup.js';
 import { createLogger } from '../src/logger.js';
+import {
+  LOCAL_STACK_ENVIRONMENT,
+  LOCAL_STORE_ENVIRONMENT,
+  REPOSITORY_ROOT,
+} from '../src/config.js';
 import { tmpdir, writePrivateFile } from '../src/test-fixtures.js';
+
+const REPO_ROOT = REPOSITORY_ROOT;
 
 const REF = 'a1b2c3d4e5f6a7b8c9d0';
 const REF_PROD = 'f0e9d8c7b6a5f4e3d2c1';
@@ -105,8 +112,10 @@ function makeRun({ calls } = {}) {
       throw new Error('age must never be invoked on the plaintext local path');
     }
     if (base === 'docker') {
-      const query = String(opts.args.at(-1));
-      if (query.includes('pg_stat_all_tables')) {
+      const joined = String(opts.args.join(' '));
+      if (joined.includes('inspect')) return { stdout: 'true\n' };
+      if (joined.includes('server_version_num')) return { stdout: '170006\n' };
+      if (joined.includes('pg_stat_all_tables')) {
         return {
           stdout:
             '00000000000000000000000000000000|0123456789abcdef0123456789abcdef|11111111111111111111111111111111|22222222222222222222222222222222\n',
@@ -123,9 +132,11 @@ function depsFor({ repoRoot: _repoRoot, runAt, seed = 'a', extra = {} } = {}) {
   const run = makeRun({ calls: calls.run });
   return {
     deps: {
-      loadConfig: ({ environment }) => ({
-        environment,
-        projectRef: environment === 'production' ? REF_PROD : REF,
+      // The runner fixes config identity to the development dotenv; the stub
+      // mirrors that with the LOCAL_STACK_ENVIRONMENT constant.
+      loadConfig: () => ({
+        environment: LOCAL_STACK_ENVIRONMENT,
+        projectRef: REF,
         fragtrackWorkdir: FRAGTRACK.workdir,
       }),
       doValidateWorkdir: () => FRAGTRACK,
@@ -160,31 +171,25 @@ async function runOnce({
   extra = {},
 }) {
   const { deps, calls } = depsFor({ repoRoot, runAt, seed, extra });
-  const result = await runBackupLocal({
-    options: { environment: 'development' },
-    env,
-    repoRoot,
-    logger,
-    deps,
-  });
+  const result = await runBackupLocal({ env, repoRoot, logger, deps });
   return { result, calls };
 }
 
-function envDir(repoRoot, environment = 'development') {
+function envDir(repoRoot, environment = LOCAL_STORE_ENVIRONMENT) {
   return path.join(repoRoot, 'local-backups', environment);
 }
 
 test('backup-local: first run creates a fully validated package at the fixed private path', async () => {
   const repoRoot = tmpdir('bp-bl-');
   const { result, calls } = await runOnce({ repoRoot, runAt: T1 });
-  assert.equal(result.environment, 'development');
+  assert.equal(result.environment, LOCAL_STORE_ENVIRONMENT);
   assert.equal(result.changed, true);
   assert.equal(result.snapshotId, ID1);
   assert.equal(result.path, path.join(envDir(repoRoot), ID1));
   assert.equal(calls.dump.length, 1);
   // Full independent validation of the retained package.
   const { manifest } = await validatePackagedDirectory(result.path, {
-    expectedEnvironment: 'development',
+    expectedEnvironment: LOCAL_STORE_ENVIRONMENT,
     expectedSnapshotId: ID1,
     expectedProjectRef: REF,
   });
@@ -216,7 +221,7 @@ test('backup-local: first run creates a fully validated package at the fixed pri
   if (leftoverCandidates.length === 1) {
     assert.deepEqual(fs.readdirSync(path.join(envDir(repoRoot), leftoverCandidates[0])), []);
   }
-  assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-development')));
+  assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-local')));
   assert.ok(
     !fs.readdirSync(os.tmpdir()).some((e) => e.startsWith(`fragtrack-backup-${process.pid}-`)),
     'private OS workspace removed',
@@ -259,7 +264,7 @@ test('backup-local: changed content or target ref publishes a new snapshot and r
     assert.equal(second.result.changed, true, label);
     assert.equal(second.result.snapshotId, ID2, label);
     const { manifest } = await validatePackagedDirectory(second.result.path, {
-      expectedEnvironment: 'development',
+      expectedEnvironment: LOCAL_STORE_ENVIRONMENT,
       expectedSnapshotId: ID2,
       expectedProjectRef: label === 'targetRef' ? REF_PROD : REF,
     });
@@ -291,7 +296,14 @@ test('backup-local: no stack lifecycle command and no R2/credential access', asy
     const base = path.basename(String(call.command));
     assert.notEqual(base, 'supabase', 'local backup never runs the Supabase CLI');
     if (base === 'docker') {
-      assert.deepEqual(call.args.slice(0, 2), ['exec', FRAGTRACK.dbContainer]);
+      if (call.args[0] === 'exec') {
+        assert.deepEqual(call.args.slice(0, 2), ['exec', FRAGTRACK.dbContainer]);
+      } else if (call.args[0] === 'inspect') {
+        assert.ok(
+          call.args.includes('{{.State.Running}}') && call.args.includes(FRAGTRACK.dbContainer),
+          'container probe targets the derived container',
+        );
+      }
       for (const forbidden of ['start', 'stop', 'reset', 'migrate']) {
         assert.ok(!call.args.includes(forbidden), `no lifecycle command ${forbidden}`);
       }
@@ -300,27 +312,16 @@ test('backup-local: no stack lifecycle command and no R2/credential access', asy
   fs.rmSync(repoRoot, { recursive: true, force: true });
 });
 
-test('backup-local: target environments write to isolated destinations', async () => {
+test('backup-local: always targets the single local store regardless of config', async () => {
   const repoRoot = tmpdir('bp-bl-');
-  const dev = await runOnce({ repoRoot, runAt: T1 });
-  const prodDeps = depsFor({ repoRoot, runAt: T2 });
-  const deployed = await runBackupLocal({
-    options: { environment: 'production' },
-    env: {},
-    repoRoot,
-    logger: silentLogger(),
-    deps: prodDeps.deps,
-  });
-  assert.equal(deployed.changed, true);
-  assert.equal(deployed.environment, 'production');
-  assert.equal(deployed.path, path.join(envDir(repoRoot, 'production'), ID2));
+  const { result } = await runOnce({ repoRoot, runAt: T1 });
+  assert.equal(result.environment, LOCAL_STORE_ENVIRONMENT);
+  assert.equal(path.basename(path.dirname(result.path)), LOCAL_STORE_ENVIRONMENT);
+  // lock is the fixed local-store lock
+  assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-local')));
   assert.deepEqual(
     fs.readdirSync(envDir(repoRoot)).filter((e) => !e.startsWith('.candidate-')),
-    [dev.result.snapshotId],
-  );
-  assert.deepEqual(
-    fs.readdirSync(envDir(repoRoot, 'production')).filter((e) => !e.startsWith('.candidate-')),
-    [ID2],
+    [ID1],
   );
   fs.rmSync(repoRoot, { recursive: true, force: true });
 });
@@ -357,7 +358,7 @@ test('backup-local: source mutation during the six dumps rejects the candidate',
     fs.readdirSync(envDir(repoRoot)).filter((entry) => !entry.startsWith('.candidate-')),
     [ID1],
   );
-  assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-development')));
+  assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-local')));
   fs.rmSync(repoRoot, { recursive: true, force: true });
 });
 
@@ -414,7 +415,7 @@ test('backup-local: dump/package/validation/publication failures preserve the ol
       `${label}: old snapshot preserved on failure`,
     );
     assert.ok(
-      !fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-development')),
+      !fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-local')),
       `${label}: lock released`,
     );
     fs.rmSync(repoRoot, { recursive: true, force: true });
@@ -447,7 +448,7 @@ test('backup-local: workspaces, unpublished candidates, and locks clean up on an
     !fs.readdirSync(envDir(repoRoot)).some((e) => e.startsWith('.candidate-')),
     'unpublished candidate removed after failure',
   );
-  assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-development')));
+  assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-local')));
   fs.rmSync(repoRoot, { recursive: true, force: true });
 });
 
@@ -478,7 +479,7 @@ test('backup-local: cleanup failures never prevent lock release', async () => {
     /workspace cleanup exploded/,
   );
   assert.equal(releases, 1);
-  assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-development')));
+  assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-local')));
   fs.rmSync(repoRoot, { recursive: true, force: true });
 });
 
@@ -508,13 +509,14 @@ test('backup-local: a release failure is retained without hiding the primary err
     (err) => {
       assert.ok(err instanceof AggregateError);
       assert.match(err.message, /dump exploded first/);
-      assert.match(err.message, /release exploded/);
-      assert.match(err.errors[0].message, /dump exploded first/);
+      assert.ok(!/release exploded/.test(err.message), 'message stays short; detail in .errors');
+      assert.match(err.message, /cleanup also failed/);
+      assert.equal(err.errors[0].message, 'dump exploded first');
       assert.ok(err.errors.some((failure) => /release exploded/.test(failure.message)));
       return true;
     },
   );
-  assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-development')));
+  assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-local')));
   fs.rmSync(repoRoot, { recursive: true, force: true });
 });
 
@@ -523,7 +525,7 @@ test('backup-local: logs reveal only environment, state, ID, and path', async ()
   const { logger, text } = captureLogger();
   await runOnce({ repoRoot, runAt: T1, logger });
   const log = text();
-  assert.ok(log.includes('backup:local development'), 'environment name is logged');
+  assert.ok(log.includes('backup:local: created snapshot'), 'status line is logged');
   assert.ok(log.includes(ID1), 'retained snapshot id is logged');
   for (const secret of [
     LOCAL_URL,
@@ -550,11 +552,43 @@ test('backup-local: --help prints usage and exits zero without external work', (
   }
 });
 
+test('backup-local: the snapshot id is derived only after the store lock is held', async () => {
+  // The id is captured at RUN start (inside the exclusive store lock), not
+  // at CLI entry: with the lock serializing runs, two serialized full runs
+  // would have to finish inside the same wall-clock second to collide, and
+  // the canonical second-resolution id then still reflects the actual run.
+  const repoRoot = tmpdir('bp-bl-');
+  const order = [];
+  let runAtOf = T1;
+  const { deps } = depsFor({
+    repoRoot,
+    runAt: T1,
+    extra: {
+      now: () => {
+        order.push('now');
+        return new Date(runAtOf);
+      },
+      doOpenStore: (opts) => {
+        order.push('open');
+        return openLocalBackupStore(opts);
+      },
+    },
+  });
+  const result = await runBackupLocal({ env: {}, repoRoot, logger: silentLogger(), deps });
+  assert.equal(result.snapshotId, ID1);
+  assert.deepEqual(
+    order.slice(0, 2),
+    ['open', 'now'],
+    'the id must be captured after the store lock is acquired',
+  );
+  fs.rmSync(repoRoot, { recursive: true, force: true });
+});
+
 test('backup-local: malformed CLI exits nonzero before external work', () => {
   for (const args of [
-    [],
     ['--bogus'],
     ['--environment'],
+    ['--environment', 'development'],
     ['--environment', 'staging'],
     ['--environment', 'development', 'extra'],
     ['--', '--environment', 'development'],
@@ -562,6 +596,25 @@ test('backup-local: malformed CLI exits nonzero before external work', () => {
     const res = runCli(args, { PATH: process.env.PATH });
     assert.notEqual(res.status, 0, `expected nonzero exit for ${JSON.stringify(args)}`);
   }
+});
+
+test('backup-local: bare invocation is grammar-safe and never touches the real local store', () => {
+  // The real `.env.development.local` satisfies config on a developer machine,
+  // so a bare CLI spawn with a clean env would execute the REAL dump/package/
+  // retention cycle (docker + Supabase CLI + the local store) from a unit
+  // test. Force a deterministic CONFLICT on BACKUP_ENVIRONMENT instead: the
+  // CLI must fail fast at the config gate, report the conflict (names only),
+  // and never run external work or mutate the developer's store.
+  const storeDir = path.join(REPO_ROOT, 'local-backups', LOCAL_STORE_ENVIRONMENT);
+  const before = fs.existsSync(storeDir) ? fs.readdirSync(storeDir) : [];
+  const res = runCli([], { PATH: process.env.PATH, BACKUP_ENVIRONMENT: 'staging' });
+  assert.notEqual(res.status, 0, 'config gate must fail under the conflicting env');
+  assert.ok(!res.stderr.includes('requires'), 'grammar accepted the bare invocation');
+  assert.match(res.stderr, /Backup configuration error/, 'config gate is the failure point');
+  assert.match(res.stderr, /CONFLICT BACKUP_ENVIRONMENT/);
+  assert.ok(!res.stderr.includes('created snapshot'), 'no backup run may be reported');
+  const after = fs.existsSync(storeDir) ? fs.readdirSync(storeDir) : [];
+  assert.deepEqual(after, before, 'a unit test must never publish into the real store');
 });
 
 test('backup-local: no age executable is resolved', async () => {
@@ -584,24 +637,18 @@ test('backup-local: no age executable is resolved', async () => {
       },
     },
   });
-  const result = await runBackupLocal({
-    options: { environment: 'development' },
-    env: {},
-    repoRoot,
-    logger: silentLogger(),
-    deps,
-  });
+  const result = await runBackupLocal({ env: {}, repoRoot, logger: silentLogger(), deps });
   assert.equal(result.changed, true);
   assert.equal(packageOpts.length, 1);
   assert.equal(packageOpts[0].format, 'none', 'dump/package options carry the plaintext codec');
   assert.equal(packageOpts[0].agePath, undefined);
   const { manifest } = await validatePackagedDirectory(result.path, {
-    expectedEnvironment: 'development',
+    expectedEnvironment: LOCAL_STORE_ENVIRONMENT,
     expectedSnapshotId: ID1,
     expectedProjectRef: REF,
   });
   assert.deepEqual(manifest.encryption, { format: 'none' });
-  assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-development')));
+  assert.ok(!fs.existsSync(path.join(repoRoot, 'local-backups', '.lock-local')));
   fs.rmSync(repoRoot, { recursive: true, force: true });
 });
 

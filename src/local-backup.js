@@ -1,25 +1,34 @@
 /**
  * Private local snapshot store for `backup:local`.
  *
- * Owns the fixed `local-backups/<environment>/` tree, a per-environment
- * lock, read-only local-stack connectivity/state checks, the validated
- * existing-snapshot scan, and publish-before-retention finalization. The
- * local stack is READ-ONLY here: nothing starts, stops, resets, or migrates
- * it, and no R2 adapter or hosted DB connection is imported.
+ * Owns the fixed `local-backups/local/` tree (one lock `.lock-local`, one
+ * retained snapshot), read-only local-stack connectivity/state checks, the
+ * validated existing-snapshot scan, and publish-before-retention
+ * finalization. The environment parameter is always LOCAL_STORE_ENVIRONMENT
+ * from the caller. The local stack is READ-ONLY here: nothing starts,
+ * stops, resets, or migrates it, and no R2 adapter or hosted DB connection
+ * is imported.
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isValidSnapshotId } from './fingerprint.js';
-import { MANIFEST_NAME, validatePackagedDirectory, sameSnapshotContent } from './snapshot.js';
-import { localPsqlQuery } from './local-restore.js';
+import {
+  MANIFEST_NAME,
+  validatePackagedDirectory,
+  sameSnapshotContent,
+  POSTGRES_MAJOR_VERSION,
+} from './snapshot.js';
+import { localPsqlQuery } from './local-stack.js';
+import { LOCAL_STORE_ENVIRONMENT } from './config.js';
 import {
   LOCAL_BACKUP_DIRECTORY_NAME,
   PRIVATE_DIRECTORY_MODE,
   PRIVATE_FILE_MODE,
   privateDirectoryProblem,
   privateSnapshotProblem,
+  sortSnapshotsNewestFirst,
 } from './local-store.js';
 
 export { LOCAL_BACKUP_DIRECTORY_NAME };
@@ -179,15 +188,60 @@ export class LocalBackupError extends Error {
   }
 }
 
+/**
+ * Fixture-only connection URL for the LOCAL database (supabase's local
+ * default `postgres` user/password on 127.0.0.1). Not part of any exported
+ * stack boundary: the caller registers it as a logger secret.
+ */
+export function localDbUrl(dbPort) {
+  return `postgresql://postgres:postgres@127.0.0.1:${dbPort}/postgres`;
+}
+
 /** Static offline guidance; never echoes addresses or credentials. */
 export const LOCAL_STACK_OFFLINE_MESSAGE =
   'local stack is not reachable; start the local stack in the Fragtrack workdir (supabase start) and retry';
 
+/** Static guidance for a wrong/missing db container; names only, no paths. */
+export const LOCAL_STACK_CONTAINER_MESSAGE =
+  'local stack container %s not found or not running; start the local stack in the Fragtrack workdir (supabase start), or fix the project_id in the Fragtrack config, and retry';
+
+/** Static guidance for a Postgres major mismatch. */
+export const LOCAL_STACK_VERSION_MESSAGE =
+  'local stack database reports PostgreSQL major %s, but this backup pins major %s; upgrade the local stack and retry';
+
+/** Probe that the derived db container exists and is running (docker inspect). */
+async function assertContainerRunning({ dockerPath, dbContainer, run, signal }) {
+  let res;
+  try {
+    res = await run({
+      command: dockerPath,
+      args: ['inspect', '--format', '{{.State.Running}}', dbContainer],
+      stdout: 'collect',
+      stderr: 'collect',
+      signal,
+    });
+  } catch (err) {
+    throw new LocalBackupError(LOCAL_STACK_CONTAINER_MESSAGE.replace('%s', dbContainer), {
+      cause: err,
+      stage: 'connect',
+    });
+  }
+  if ((res.stdout ?? '').trim() !== 'true') {
+    throw new LocalBackupError(LOCAL_STACK_CONTAINER_MESSAGE.replace('%s', dbContainer), {
+      stage: 'connect',
+    });
+  }
+  return { ok: true };
+}
+
 /**
  * Read-only connectivity gate: require the already-running local stack to
- * answer `SELECT 1` with exactly `1`. No lifecycle command is ever invoked.
+ * answer `SELECT 1` with exactly `1`, the derived container to exist and
+ * run, and the LIVE server to report the pinned Postgres major version
+ * (`SHOW server_version_num`). No lifecycle command is ever invoked.
  */
 export async function assertLocalStackRunning({ dockerPath, dbContainer, run, signal }) {
+  await assertContainerRunning({ dockerPath, dbContainer, run, signal });
   let lines;
   try {
     lines = await localPsqlQuery({ dockerPath, dbContainer, query: 'SELECT 1', run, signal });
@@ -196,6 +250,29 @@ export async function assertLocalStackRunning({ dockerPath, dbContainer, run, si
   }
   if (lines.length !== 1 || lines[0] !== '1') {
     throw new LocalBackupError(LOCAL_STACK_OFFLINE_MESSAGE, { stage: 'connect' });
+  }
+  let versionLines;
+  try {
+    versionLines = await localPsqlQuery({
+      dockerPath,
+      dbContainer,
+      query: 'SHOW server_version_num',
+      run,
+      signal,
+    });
+  } catch (err) {
+    throw new LocalBackupError(LOCAL_STACK_OFFLINE_MESSAGE, { cause: err, stage: 'connect' });
+  }
+  const raw = versionLines.length === 1 ? Number(versionLines[0]) : NaN;
+  const major = Number.isFinite(raw) ? Math.floor(raw / 10000) : null;
+  if (major !== POSTGRES_MAJOR_VERSION) {
+    throw new LocalBackupError(
+      LOCAL_STACK_VERSION_MESSAGE.replace('%s', String(major ?? 'unknown')).replace(
+        '%s',
+        String(POSTGRES_MAJOR_VERSION),
+      ),
+      { stage: 'connect' },
+    );
   }
   return { ok: true };
 }
@@ -285,17 +362,29 @@ function cleanupStaleCandidates(environmentDir) {
 }
 
 /**
- * Open the per-environment local snapshot store.
+ * Open the single fixed local snapshot store.
  *
- * Creates `local-backups/` and `local-backups/<environment>/` privately when
- * absent, rejects symlink/non-directory paths, and takes an exclusive
- * mode-0600 lock scoped by environment. The returned `release()` is
- * idempotent; a setup failure after lock creation releases it before the
- * error propagates. An existing lock is never auto-deleted: the error names
- * the lock path and instructs the operator to confirm no matching command is
- * active before removing it.
+ * The store is a fixed ONE-label tree (`local-backups/local/`): this
+ * boundary validates that the environment argument IS the fixed label, so a
+ * caller can never silently open or lock a different/arbitrary environment
+ * (values containing path segments would otherwise reach path
+ * construction). Creates `local-backups/` and the store's environment
+ * subdirectory privately when absent, rejects symlink/non-directory paths,
+ * and takes an exclusive mode-0600 lock scoped by environment. The returned
+ * `release()` removes the lock on success and retries an ownership-checked
+ * unlink if the first attempt failed (the close stays one-shot); a setup
+ * failure after lock creation releases it before the error propagates. An
+ * existing lock is never auto-deleted: the error names the lock path and
+ * instructs the operator to confirm no matching command is active before
+ * removing it.
  */
 export function openLocalBackupStore({ repoRoot, environment }) {
+  if (environment !== LOCAL_STORE_ENVIRONMENT) {
+    throw new LocalBackupError(
+      `local backup store is the fixed single store (environment ${LOCAL_STORE_ENVIRONMENT}); refusing environment ${environment}`,
+      { stage: 'store' },
+    );
+  }
   const root = path.join(repoRoot, LOCAL_BACKUP_DIRECTORY_NAME);
   ensureRealDirectory(root, `local backup store root (${LOCAL_BACKUP_DIRECTORY_NAME}/)`);
   const environmentDir = path.join(root, environment);
@@ -432,14 +521,15 @@ function assertPrivateSnapshotModes(dir, manifest) {
 }
 
 /**
- * Scan the environment directory for completed snapshots after store
- * preparation removed stale candidates. Every remaining entry must be a
- * canonical snapshot-ID directory that passes full packaged validation;
- * anything else is a hard error, never ignored or deleted. Returns valid
- * snapshots newest first as `[{ dir, snapshotId, manifest }]`, so a prior
- * post-publication retention failure can be reconciled from the survivors.
+ * Scan the store's environment directory for completed snapshots after
+ * store preparation removed stale candidates. Every remaining entry must be
+ * a canonical snapshot-ID directory that passes full packaged validation
+ * against the fixed store label; anything else is a hard error, never
+ * ignored or deleted. Returns valid snapshots newest first as
+ * `[{ dir, snapshotId, manifest }]`, so a prior post-publication retention
+ * failure can be reconciled from the survivors.
  */
-export async function scanLocalBackupSnapshots({ environmentDir, environment }) {
+export async function scanLocalBackupSnapshots({ environmentDir }) {
   let entries;
   try {
     entries = fs.readdirSync(environmentDir, { withFileTypes: true });
@@ -463,16 +553,13 @@ export async function scanLocalBackupSnapshots({ environmentDir, environment }) 
     }
     const dir = path.join(environmentDir, entry.name);
     const { manifest } = await validatePackagedDirectory(dir, {
-      expectedEnvironment: environment,
+      expectedEnvironment: LOCAL_STORE_ENVIRONMENT,
       expectedSnapshotId: entry.name,
     });
     assertPrivateSnapshotModes(dir, manifest);
     snapshots.push({ dir, snapshotId: entry.name, manifest });
   }
-  snapshots.sort((a, b) =>
-    a.snapshotId < b.snapshotId ? 1 : a.snapshotId > b.snapshotId ? -1 : 0,
-  );
-  return snapshots;
+  return sortSnapshotsNewestFirst(snapshots);
 }
 
 /**
@@ -487,6 +574,9 @@ export function createLocalBackupCandidate({ environmentDir }) {
     const dir = path.join(environmentDir, name);
     try {
       fs.mkdirSync(dir, { mode: PRIVATE_DIRECTORY_MODE });
+      // mkdirSync mode is ANDed with ~umask; enforce the strict private mode
+      // explicitly so the candidate parent is 0700 under any umask.
+      fs.chmodSync(dir, PRIVATE_DIRECTORY_MODE);
       candidateDir = dir;
       break;
     } catch (err) {
@@ -588,9 +678,10 @@ export async function finalizeLocalBackup({
 
   const final = path.join(environmentDir, snapshotId);
   if (pathExists(final)) {
-    throw new LocalBackupError(`refusing to overwrite existing snapshot ${final}`, {
-      stage: 'publish',
-    });
+    throw new LocalBackupError(
+      `refusing to overwrite existing snapshot ${final}; if a previous run published this same-second id with different content, wait one second for the next id and retry`,
+      { stage: 'publish' },
+    );
   }
   await syncSnapshot(candidate.pkgDir);
   fs.renameSync(candidate.pkgDir, final);

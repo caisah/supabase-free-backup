@@ -9,9 +9,17 @@ import {
   ProcessAbortedError,
   lookupExecutable,
   assertSuccessfulExit,
+  psqlOutputLines,
 } from './process.js';
 import { fileURLToPath } from 'node:url';
 
+test('process runner: psqlOutputLines trims, splits, and drops empty lines', () => {
+  assert.deepEqual(psqlOutputLines('1\n\n  2  \n'), ['1', '2']);
+  assert.deepEqual(psqlOutputLines('  '), []);
+  assert.deepEqual(psqlOutputLines(undefined), []);
+  assert.deepEqual(psqlOutputLines(''), []);
+  assert.deepEqual(psqlOutputLines('170006'), ['170006']);
+});
 const node = process.execPath;
 
 function tmpdir() {

@@ -23,6 +23,16 @@ import dotenv from 'dotenv';
 
 export const ENVIRONMENTS = ['development', 'production'];
 
+/** Config/dotenv identity of the single local Fragtrack stack: selects the
+ * `.env.<value>.local` file and must equal the BACKUP_ENVIRONMENT inside it.
+ * Deliberately NOT derived from ENVIRONMENTS[0]: the hosted environment list
+ * may change without the local stack's config identity changing, and the
+ * two lists serve different purposes. */
+export const LOCAL_STACK_ENVIRONMENT = 'development';
+
+/** Store label of local snapshots: the single fixed `local` subdirectory. */
+export const LOCAL_STORE_ENVIRONMENT = 'local';
+
 /** Fixed bucket mapping: the bucket name always equals the environment. */
 export const BUCKET_BY_ENVIRONMENT = Object.freeze({
   development: 'development',
@@ -236,7 +246,7 @@ function conflictScopedNames(requirements) {
   if (requirements.accountId) names.push(CLOUDFLARE_ACCOUNT_ID);
   if (requirements.r2) names.push('R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET');
   if (requirements.ageRecipient) names.push('ENCRYPT_KEY');
-  if (requirements.ageIdentity || requirements.optionalAgeIdentity) names.push('DECRYPT_KEY');
+  if (requirements.ageIdentity) names.push('DECRYPT_KEY');
   if (requirements.fragtrackWorkdir) names.push('PROJECT_WORKDIR');
   return new Set(names);
 }
@@ -380,14 +390,7 @@ function buildOperationConfig({ environment, requirements, resolved, fragtrackWo
     scoped.secretAccessKey = config.secretAccessKey;
   }
   if (requirements.ageRecipient) scoped.ageRecipient = config.ageRecipient;
-  // `optionalAgeIdentity` resolves DECRYPT_KEY when configured (legacy
-  // encrypted local snapshots) without ever requiring it (plaintext ones).
-  if (
-    (requirements.ageIdentity || requirements.optionalAgeIdentity) &&
-    config.ageIdentity !== undefined
-  ) {
-    scoped.ageIdentity = config.ageIdentity;
-  }
+  if (requirements.ageIdentity) scoped.ageIdentity = config.ageIdentity;
   if (requirements.fragtrackWorkdir) scoped.fragtrackWorkdir = fragtrackWorkdir;
   return scoped;
 }
@@ -410,16 +413,10 @@ const LOCAL_BACKUP_REQUIREMENTS = {
 const HOSTED_RESTORE_REQUIREMENTS = {
   r2: { ...BACKUP_REQUIREMENTS, ageIdentity: true },
   repo: { projectRef: true, dbUrl: true, ageRecipient: true, ageIdentity: true },
-  // Plaintext local-store snapshots need target URL + ref only. DECRYPT_KEY
-  // is OPTIONALLY consumed: it is resolved and conflict-checked when present
-  // (a legacy age-encrypted snapshot still found in the store then restores),
-  // but never required — `format: "none"` snapshots need no identity.
-  local: { projectRef: true, dbUrl: true, consumedOnly: true, optionalAgeIdentity: true },
-};
-
-const LOCAL_RESTORE_REQUIREMENTS = {
-  r2: { accountId: true, r2: true, ageRecipient: true, ageIdentity: true, fragtrackWorkdir: true },
-  repo: { ageRecipient: true, ageIdentity: true, fragtrackWorkdir: true },
+  // Plaintext local-store snapshots need target URL + ref only; the local
+  // path is plaintext-only (the legacy encrypted-local compatibility claim
+  // was removed together with the pre-single-store layout).
+  local: { projectRef: true, dbUrl: true, consumedOnly: true },
 };
 
 function loadDotenvValues(filePath) {
@@ -527,15 +524,6 @@ export function loadHostedRestoreConfig({ source, ...opts }) {
   const requirements = HOSTED_RESTORE_REQUIREMENTS[source];
   if (!requirements) {
     throw new ConfigError(['source must be one of: r2, repo, local']);
-  }
-  return loadOperationConfig({ ...opts, requirements });
-}
-
-/** Local Fragtrack restore. Requires the age identity and workdir. */
-export function loadLocalRestoreConfig({ source, ...opts }) {
-  const requirements = LOCAL_RESTORE_REQUIREMENTS[source];
-  if (!requirements) {
-    throw new ConfigError(['source must be one of: r2, repo']);
   }
   return loadOperationConfig({ ...opts, requirements });
 }

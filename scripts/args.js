@@ -19,12 +19,8 @@ export const COMMIT_WEEKLY_USAGE =
   'usage: vp run commit:weekly --staging-dir <path> [--repo-root <path>]';
 export const HOSTED_RESTORE_USAGE =
   'usage: vp run restore:development|restore:production --source <r2|repo|local> --backup <latest|snapshot-id>';
-export const LOCAL_RESTORE_USAGE =
-  'usage: vp run restore:local --environment <development|production> --source <r2|repo> --backup <latest|snapshot-id>';
-export const LOCAL_BACKUP_USAGE =
-  'usage: vp run backup:local --environment <development|production>';
+export const LOCAL_BACKUP_USAGE = 'usage: vp run backup:local';
 
-const SOURCES = ['r2', 'repo'];
 // Hosted restores additionally read the private local snapshot store.
 const HOSTED_RESTORE_SOURCES = ['r2', 'repo', 'local'];
 
@@ -60,13 +56,8 @@ const RESTORE_OPTIONS = {
   source: { type: 'string' },
   backup: { type: 'string' },
 };
-const LOCAL_RESTORE_OPTIONS = {
-  ...RESTORE_OPTIONS,
-  environment: { type: 'string' },
-};
 const LOCAL_BACKUP_OPTIONS = {
   ...HELP_OPTIONS,
-  environment: { type: 'string' },
 };
 
 /**
@@ -153,8 +144,10 @@ export function parseHostedRestoreArgs(argv) {
 }
 
 /**
- * Parse the local-backup arguments: strict grammar, no output-path option.
- * @returns {{environment:string}|{help:true}}
+ * Parse the local-backup arguments: no options exist; only --help is
+ * accepted. The single local stack and the `local` store label are fixed
+ * in the runner (see LOCAL_STACK_ENVIRONMENT / LOCAL_STORE_ENVIRONMENT).
+ * @returns {{}|{help:true}}
  */
 export function parseLocalBackupArgs(argv) {
   const parsed = parseArgs({
@@ -165,39 +158,5 @@ export function parseLocalBackupArgs(argv) {
   });
   const values = parsed.values;
   if (values.help) return { help: true };
-  const environment = values.environment;
-  if (environment === undefined) {
-    throw new Error('backup:local requires --environment development|production');
-  }
-  if (!ENVIRONMENTS.includes(environment)) {
-    throw new Error('backup:local --environment must be development or production');
-  }
-  return { environment };
-}
-
-/**
- * Parse the local restore arguments.
- * @returns {{environment:string, source:string, backup:string}|{help:true}}
- */
-export function parseLocalRestoreArgs(argv) {
-  const parsed = parseArgs({
-    args: argv,
-    options: LOCAL_RESTORE_OPTIONS,
-    strict: true,
-    allowPositionals: false,
-  });
-  const values = parsed.values;
-  if (values.help) return { help: true };
-  const environment = values.environment;
-  if (environment === undefined || !ENVIRONMENTS.includes(environment)) {
-    throw new Error('restore:local requires --environment development|production');
-  }
-  const source = values.source;
-  if (source === undefined || !SOURCES.includes(source)) {
-    throw new Error('restore:local requires --source r2|repo');
-  }
-  if (values.backup === undefined) {
-    throw new Error('restore:local requires --backup latest|<snapshot-id>');
-  }
-  return { environment, source, backup: values.backup };
+  return {};
 }

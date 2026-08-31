@@ -46,6 +46,18 @@ export class ProcessAbortedError extends Error {
 }
 
 /**
+ * Parse captured `psql -t -A` stdout into trimmed, non-empty lines. Shared
+ * by the local-stack (`docker exec`) and hosted (`docker run` hardened)
+ * psql runners so their captured-output semantics can never drift.
+ */
+export function psqlOutputLines(stdout) {
+  return (stdout ?? '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+}
+
+/**
  * Byte-accurate bounded tail: keeps the last `maxBytes` BYTES of pushed
  * chunks (multi-byte UTF-8 sequences are counted as bytes, never chars).
  */

@@ -122,6 +122,42 @@ test('snapshot: sameSnapshotContent requires matching content hash AND encryptio
   );
 });
 
+test('snapshot: sameSnapshotContent derives formats from the codec registry, never hard-coded pairs', () => {
+  const hash = 'a'.repeat(64);
+  // A manifest carrying an UNREGISTERED format string (unvalidated input)
+  // must never compare equal to a registered-age manifest, even when the
+  // recipient matches: format knowledge comes only from ROW_DATA_CODECS.
+  const unknown = {
+    contentSha256: hash,
+    encryption: { format: 'not-a-real-format', recipient: AGE_RECIPIENT_1 },
+  };
+  const agePartial = { contentSha256: hash, encryption: { recipient: AGE_RECIPIENT_1 } };
+  const ageExplicit = {
+    contentSha256: hash,
+    encryption: { format: 'age-x25519', recipient: AGE_RECIPIENT_1 },
+  };
+  assert.equal(
+    sameSnapshotContent(unknown, agePartial),
+    false,
+    'unknown format must never silently default to age',
+  );
+  assert.equal(
+    sameSnapshotContent({ ...unknown, encryption: { format: 'none' } }, agePartial),
+    false,
+    'none vs age must differ',
+  );
+  assert.equal(
+    sameSnapshotContent(ageExplicit, agePartial),
+    true,
+    'explicit registered age format equals the legacy partial form',
+  );
+  assert.equal(
+    sameSnapshotContent(ageExplicit, { ...ageExplicit, encryption: { format: 'none' } }),
+    false,
+    'explicit format difference must differ',
+  );
+});
+
 test('snapshot: sameSnapshotContent is format-aware for plaintext snapshots', () => {
   const hash = 'a'.repeat(64);
   const noneA = { contentSha256: hash, encryption: { format: 'none' } };

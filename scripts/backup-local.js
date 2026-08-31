@@ -3,7 +3,13 @@
  * Local backup entry point: package the ALREADY-RUNNING local Fragtrack
  * database into the private repository store.
  *
- *   vp run backup:local --environment <development|production>
+ *   vp run backup:local
+ *
+ * No environment selection: the local stack is a single database whose
+ * config identity is fixed to the development dotenv (`.env.development.local`,
+ * BACKUP_ENVIRONMENT must be `development`), and snapshots are always labeled
+ * environment `local` under `local-backups/local/`. Restore targets are chosen
+ * later by `restore:development|restore:production --source local`.
  *
  * Flow: config (target metadata + workdir only, no hosted DB/R2/identity,
  * no ENCRYPT_KEY/recipient) -> validated local workdir -> read-only
@@ -24,7 +30,12 @@ import { fileURLToPath } from 'node:url';
 import { assertNodeVersion } from '../src/runtime.js';
 import { createLogger } from '../src/logger.js';
 import { runCommand, lookupExecutable } from '../src/process.js';
-import { loadLocalBackupConfig, REPOSITORY_ROOT } from '../src/config.js';
+import {
+  loadLocalBackupConfig,
+  REPOSITORY_ROOT,
+  LOCAL_STACK_ENVIRONMENT,
+  LOCAL_STORE_ENVIRONMENT,
+} from '../src/config.js';
 import { dumpDatabase, locateSupabaseCli } from '../src/database.js';
 import {
   resolveBackupExecutables,
@@ -33,7 +44,7 @@ import {
 } from '../src/backup.js';
 import { packageSnapshot, validatePackagedDirectory } from '../src/snapshot.js';
 import { PLAINTEXT_FORMAT } from '../src/encryption.js';
-import { localDbUrl, validateWorkdir } from '../src/local-restore.js';
+import { validateWorkdir } from '../src/local-stack.js';
 import {
   assertLocalStackRunning,
   readLocalDatabaseState,
@@ -42,6 +53,7 @@ import {
   scanLocalBackupSnapshots,
   createLocalBackupCandidate,
   finalizeLocalBackup,
+  localDbUrl,
 } from '../src/local-backup.js';
 import { formatSnapshotId } from '../src/fingerprint.js';
 import { parseLocalBackupArgs, LOCAL_BACKUP_USAGE } from './args.js';
@@ -75,18 +87,18 @@ function resolveLocalBackupDeps(deps) {
 }
 
 /**
- * The full local backup run. Every external adapter is injectable; `options`
- * is the validated `{ environment }` from the CLI parser.
+ * The full local backup run. Every external adapter is injectable; the
+ * single local stack and the `local` store label are FIXED constants and
+ * never come from any caller option.
  */
 export async function runBackupLocal({
-  options,
   env = process.env,
   repoRoot = REPOSITORY_ROOT,
   logger = createLogger({ stream: process.stderr }),
   deps = {},
 } = {}) {
   const d = resolveLocalBackupDeps(deps);
-  const cfg = d.loadConfig({ environment: options.environment, vars: env, root: repoRoot });
+  const cfg = d.loadConfig({ environment: LOCAL_STACK_ENVIRONMENT, vars: env, root: repoRoot });
   const fragtrack = d.doValidateWorkdir({ fragtrackWorkdir: cfg.fragtrackWorkdir, repoRoot });
   const executables = d.doResolveExecutables({
     lookup: d.lookup,
@@ -103,17 +115,20 @@ export async function runBackupLocal({
     run: d.run,
   });
 
+  // The canonical snapshot id is captured AFTER the exclusive store lock is
+  // held (run start), never at CLI entry: the lock serializes full runs, so
+  // two same-second ids can only arise if two COMPLETE runs finish within
+  // one wall-clock second; changed same-second content then still fails
+  // closed with a retry hint instead of ever overwriting a completed
+  // snapshot.
+  const store = d.doOpenStore({ repoRoot, environment: LOCAL_STORE_ENVIRONMENT });
   const snapshotId = formatSnapshotId(d.now());
-  const store = d.doOpenStore({ repoRoot, environment: cfg.environment });
   let workspace = null;
   let candidate = null;
   let result = null;
   let operationError = null;
   try {
-    const existing = await d.doScan({
-      environmentDir: store.environmentDir,
-      environment: cfg.environment,
-    });
+    const existing = await d.doScan({ environmentDir: store.environmentDir });
     workspace = createBackupWorkspace();
     candidate = d.doCreateCandidate({ environmentDir: store.environmentDir });
 
@@ -136,7 +151,7 @@ export async function runBackupLocal({
       outDir: workspace.outDir,
       pkgDir: candidate.pkgDir,
       snapshotId,
-      environment: cfg.environment,
+      environment: LOCAL_STORE_ENVIRONMENT,
       sourceProjectRef: cfg.projectRef,
       format: PLAINTEXT_FORMAT, // plaintext parts; no age binary, no ENCRYPT_KEY
       executables,
@@ -146,7 +161,7 @@ export async function runBackupLocal({
     });
 
     await d.doValidate(candidate.pkgDir, {
-      expectedEnvironment: cfg.environment,
+      expectedEnvironment: LOCAL_STORE_ENVIRONMENT,
       expectedSnapshotId: snapshotId,
       expectedProjectRef: cfg.projectRef,
     });
@@ -158,7 +173,7 @@ export async function runBackupLocal({
       environmentDir: store.environmentDir,
       snapshotId,
     });
-    result = { environment: cfg.environment, ...finalized };
+    result = { environment: LOCAL_STORE_ENVIRONMENT, ...finalized };
   } catch (err) {
     operationError = err;
   }
@@ -186,12 +201,11 @@ export async function runBackupLocal({
 
   if (operationError) {
     if (cleanupErrors.length > 0) {
-      const cleanupSummary = cleanupErrors
-        .map((error) => error.message ?? String(error))
-        .join('; ');
+      // Message stays short and parseable; every failure detail is preserved
+      // structurally in the AggregateError's `errors` array.
       throw new AggregateError(
         [operationError, ...cleanupErrors],
-        `${operationError.message}; backup:local cleanup failed: ${cleanupSummary}`,
+        `${operationError.message}; backup:local cleanup also failed`,
         { cause: operationError },
       );
     }
@@ -199,12 +213,14 @@ export async function runBackupLocal({
   }
   if (cleanupErrors.length === 1) throw cleanupErrors[0];
   if (cleanupErrors.length > 1) {
-    const cleanupSummary = cleanupErrors.map((error) => error.message ?? String(error)).join('; ');
-    throw new AggregateError(cleanupErrors, `backup:local cleanup failed: ${cleanupSummary}`);
+    throw new AggregateError(
+      cleanupErrors,
+      `backup:local cleanup failed (${cleanupErrors.length} errors)`,
+    );
   }
 
   logger.status(
-    `backup:local ${cfg.environment}: ${result.changed ? 'created' : 'unchanged'} snapshot ${result.snapshotId} at ${result.path}`,
+    `backup:local: ${result.changed ? 'created' : 'unchanged'} snapshot ${result.snapshotId} at ${result.path}`,
   );
   return result;
 }
@@ -219,7 +235,7 @@ export async function main() {
       process.stdout.write(`${LOCAL_BACKUP_USAGE}\n`);
       return 0;
     }
-    await runBackupLocal({ options: parsed, logger });
+    await runBackupLocal({ logger });
     process.exitCode = 0;
     return 0;
   } catch (err) {

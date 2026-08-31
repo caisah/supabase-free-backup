@@ -6,13 +6,13 @@
  *   vp run restore:production  --source r2|repo|local --backup <snapshot-id>
  *
  * The package alias fixes the target environment (passed as argv[0]).
- * `--source local` reads the private local store (`local-backups/<env>/`)
- * with NO decryption for plaintext snapshots; DECRYPT_KEY is resolved
- * OPTIONALLY (plaintext snapshots never need it), and a pre-refactor
- * age-encrypted local snapshot still restores when DECRYPT_KEY + age are
- * configured. Every verification and read-only preflight completes BEFORE
- * the interactive confirmation gate; nothing destructive runs without the
- * exact phrase. Production additionally requires the exact project ref.
+ * `--source local` reads the single private store (`local-backups/local/`)
+ * with NO decryption — local snapshots are plaintext; DECRYPT_KEY, age, and
+ * R2 credentials are never resolved on this path. Every verification and
+ * read-only preflight completes BEFORE the interactive confirmation gate;
+ * nothing destructive runs without the exact phrase. Production additionally
+ * requires the exact project ref, and a local snapshot whose origin project
+ * differs from the target names the SOURCE ref in the phrase as well.
  */
 
 import fs from 'node:fs';
@@ -36,18 +36,27 @@ import { parseHostedRestoreArgs, HOSTED_RESTORE_USAGE, exitCodeForResult } from 
 
 export { exitCodeForResult };
 
-function expectedPhrase(environment, projectRef) {
-  return environment === 'production' ? `RESTORE production ${projectRef}` : 'RESTORE development';
+/**
+ * The exact confirmation phrase. Production always names the target ref;
+ * a LOCAL-store snapshot additionally names its SOURCE ref when the origin
+ * project differs from the target, so cross-project restores require an
+ * explicit typed acknowledgement of what is being reset and where the data
+ * came from.
+ */
+function expectedPhrase(environment, projectRef, source, sourceProjectRef) {
+  const phrase =
+    environment === 'production' ? `RESTORE production ${projectRef}` : 'RESTORE development';
+  if (source === 'local' && sourceProjectRef && sourceProjectRef !== projectRef) {
+    return `${phrase} from local snapshot ${sourceProjectRef}`;
+  }
+  return phrase;
 }
 
 /**
  * Discover the pinned Supabase CLI and Docker always; age only when
  * `requireAge` is set. No host psql is ever discovered: every hosted
  * PostgreSQL client operation runs psql 17 from the pinned ephemeral
- * Supabase Postgres image (see `PINNED_SUPABASE_POSTGRES_IMAGE`). For
- * repo/r2 sources age is always required; for the local source it is
- * resolved only when DECRYPT_KEY is configured (a legacy encrypted local
- * snapshot needs it; plaintext snapshots never do).
+ * Supabase Postgres image (see `PINNED_SUPABASE_POSTGRES_IMAGE`).
  *
  * The repository-pinned CLI (`node_modules/.bin/supabase`) is resolved
  * FIRST and its exact version is enforced (matching the dump path's
@@ -106,15 +115,24 @@ async function requestHostedConfirmation({
   target,
   source,
   projectRef,
+  sourceProjectRef,
   snapshotId,
   stdErr,
   stdIn,
   doConfirm,
   isTTY,
 }) {
-  stdErr.write(confirmationSummary({ environment: target, source, snapshotId, projectRef }));
+  stdErr.write(
+    confirmationSummary({
+      environment: target,
+      source,
+      snapshotId,
+      projectRef,
+      sourceProjectRef,
+    }),
+  );
   return doConfirm({
-    expected: expectedPhrase(target, projectRef),
+    expected: expectedPhrase(target, projectRef, source, sourceProjectRef),
     input: stdIn,
     output: stdErr,
     isTTY,
@@ -158,9 +176,9 @@ async function prepareHostedRestore({ ctx, d, logger }) {
     cwd: ctx.cwd,
     platform: process.platform,
     run: d.run,
-    // repo/r2 restores always need age; the local source needs it exactly
-    // when DECRYPT_KEY is configured (legacy encrypted snapshots).
-    requireAge: ctx.source !== 'local' || Boolean(ctx.cfg.ageIdentity),
+    // repo/r2 restores always need age; the local source is plaintext-only
+    // and never resolves the age binary.
+    requireAge: ctx.source !== 'local',
   });
   await d.doPreflight({
     dockerPath: executables.dockerPath,
@@ -212,6 +230,7 @@ export async function runRestoreHosted({
       target: ctx.target,
       source: ctx.source,
       projectRef: ctx.cfg.projectRef,
+      sourceProjectRef: prepared.sourceProjectRef,
       snapshotId: prepared.snapshotId,
       stdErr: d.stdErr,
       stdIn: d.stdIn,

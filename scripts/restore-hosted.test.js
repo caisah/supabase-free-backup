@@ -239,6 +239,68 @@ test('restore-hosted: preflight failure prevents everything else', async () => {
   assert.equal(calls.execute, 0);
 });
 
+test('restore-hosted: cross-project local restore requires the snapshot source ref in the phrase', async () => {
+  // A local snapshot may feed any hosted target by operator choice, but the
+  // operator must ACKNOWLEDGE the snapshot's origin when it differs from the
+  // target project: the exact phrase then includes the source ref, so a
+  // development-local snapshot can never be silently confirmed into another
+  // project's production target.
+  const track = { phrase: null };
+  const localRef = 'f0e9d8c7b6a5f4e3d2c1';
+  const { deps } = fakeDeps({
+    doPrepare: async () => ({
+      snapshotId: '2026-08-24T03-17-09Z',
+      dir: '/prepared',
+      dataPath: '/prepared/data.sql',
+      manifest: {},
+      sourceProjectRef: localRef,
+      cleanup: async () => {},
+    }),
+    doConfirm: async ({ expected: e }) => {
+      track.phrase = e;
+      return true;
+    },
+  });
+  await runRestoreHosted({
+    options: hostedOptions({ target: 'production', source: 'local' }),
+    env: {},
+    cwd: '/repo',
+    logger: silentLogger,
+    deps,
+  });
+  assert.equal(
+    track.phrase,
+    `RESTORE production ${REF} from local snapshot ${localRef}`,
+    'cross-project local restore must type the source ref',
+  );
+});
+
+test('restore-hosted: same-project local restore keeps the unchanged phrase', async () => {
+  let phrase = null;
+  const { deps } = fakeDeps({
+    doPrepare: async () => ({
+      snapshotId: '2026-08-24T03-17-09Z',
+      dir: '/prepared',
+      dataPath: '/prepared/data.sql',
+      manifest: {},
+      sourceProjectRef: REF,
+      cleanup: async () => {},
+    }),
+    doConfirm: async ({ expected: e }) => {
+      phrase = e;
+      return true;
+    },
+  });
+  await runRestoreHosted({
+    options: hostedOptions({ source: 'local' }),
+    env: {},
+    cwd: '/repo',
+    logger: silentLogger,
+    deps,
+  });
+  assert.equal(phrase, 'RESTORE development', 'matching refs keep the standard phrase');
+});
+
 test('restore-hosted: local source needs no age binary or R2/age config', async () => {
   const track = { prepare: [], lookups: [], phrase: null };
   const { deps, calls } = fakeDeps({
@@ -296,16 +358,14 @@ test('restore-hosted: local source needs no age binary or R2/age config', async 
   assert.equal(track.prepare[0].agePath, undefined, 'no age path for local');
 });
 
-test('restore-hosted: local source with DECRYPT_KEY resolves age and passes identity to prepare', async () => {
+test('restore-hosted: local source never resolves age or receives an age identity', async () => {
   const track = { prepare: [], lookups: [], phrase: null };
-  const identity = 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ';
   const { deps, calls } = fakeDeps({
     loadConfig: ({ environment, source }) => ({
       environment,
       source,
       dbUrl: DB_URL,
       projectRef: REF,
-      ageIdentity: identity,
     }),
     lookup: (name) => {
       track.lookups.push(name);
@@ -338,41 +398,12 @@ test('restore-hosted: local source with DECRYPT_KEY resolves age and passes iden
   assert.equal(result.source, 'local');
   assert.equal(result.snapshotId, '2026-08-24T03-17-09Z');
   assert.ok(
-    track.lookups.includes('age'),
-    'age must be resolved when DECRYPT_KEY is configured for the local source',
+    !track.lookups.includes('age') && !track.lookups.includes('age.exe'),
+    'age must never be resolved for the plaintext local source',
   );
   assert.equal(track.prepare.length, 1);
-  assert.equal(track.prepare[0].ageIdentity, identity);
-  assert.equal(track.prepare[0].agePath, process.execPath, 'resolved age path reaches prepare');
-});
-
-test('restore-hosted: local source with DECRYPT_KEY but no age binary fails before any target work', async () => {
-  const identity = 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ';
-  const { deps, calls } = fakeDeps({
-    loadConfig: ({ environment, source }) => ({
-      environment,
-      source,
-      dbUrl: DB_URL,
-      projectRef: REF,
-      ageIdentity: identity,
-    }),
-    lookup: (name) => (name === 'age' || name === 'age.exe' ? null : process.execPath),
-  });
-  await assert.rejects(
-    () =>
-      runRestoreHosted({
-        options: hostedOptions({ source: 'local' }),
-        env: {},
-        cwd: '/repo',
-        logger: silentLogger,
-        deps,
-      }),
-    /age executable not found/,
-  );
-  assert.equal(calls.preflight, 0, 'no preflight may run before executable resolution');
-  assert.equal(calls.prepare.length, 0, 'no source work may run');
-  assert.equal(calls.confirm, 0, 'no prompt may appear');
-  assert.equal(calls.execute, 0);
+  assert.equal(track.prepare[0].ageIdentity, undefined);
+  assert.equal(track.prepare[0].agePath, undefined);
 });
 
 test('restore-hosted: local-source skip warnings are reported before confirmation', async () => {

@@ -1030,6 +1030,37 @@ test('hosted: confirmation summary masks the project ref and warns about data lo
   assert.ok(summary.includes('DATA-LOSS'));
 });
 
+test('hosted: local-source summary surfaces the snapshot origin and a cross-project warning', () => {
+  const same = confirmationSummary({
+    environment: 'development',
+    source: 'local',
+    snapshotId: '2026-08-24T03-17-09Z',
+    projectRef: 'a1b2c3d4e5f6a7b8c9d0',
+    sourceProjectRef: 'a1b2c3d4e5f6a7b8c9d0',
+  });
+  assert.ok(same.includes('Source project ref : a1b2c3d4e5f6a7b8c9d0'));
+  assert.ok(!same.includes('DIFFERENT project'), 'same refs must not warn');
+
+  const cross = confirmationSummary({
+    environment: 'production',
+    source: 'local',
+    snapshotId: '2026-08-24T03-17-09Z',
+    projectRef: 'a1b2c3d4e5f6a7b8c9d0',
+    sourceProjectRef: 'f0e9d8c7b6a5f4e3d2c1',
+  });
+  assert.ok(cross.includes('Source project ref : f0e9d8c7b6a5f4e3d2c1'));
+  assert.ok(cross.includes('DIFFERENT project'), 'differing refs must warn');
+  assert.ok(cross.includes('DATA-LOSS'));
+
+  const none = confirmationSummary({
+    environment: 'development',
+    source: 'r2',
+    snapshotId: '2026-08-24T03-17-09Z',
+    projectRef: 'a1b2c3d4e5f6a7b8c9d0',
+  });
+  assert.ok(!none.includes('Source project ref'), 'non-local sources have no source ref line');
+});
+
 test('hosted: trigger names default to the Fragtrack triggers', () => {
   assert.deepEqual(FRAGTRACK_TRIGGERS, [
     'create_account_for_new_user',

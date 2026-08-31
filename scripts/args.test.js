@@ -5,12 +5,10 @@ import {
   parseBackupArgs,
   parseCommitWeeklyArgs,
   parseHostedRestoreArgs,
-  parseLocalRestoreArgs,
   parseLocalBackupArgs,
   BACKUP_USAGE,
   COMMIT_WEEKLY_USAGE,
   HOSTED_RESTORE_USAGE,
-  LOCAL_RESTORE_USAGE,
   LOCAL_BACKUP_USAGE,
 } from './args.js';
 
@@ -25,7 +23,6 @@ test('args: usage text constants are the single CLI grammar', () => {
   assert.match(BACKUP_USAGE, /usage: vp run backup --environment/);
   assert.match(COMMIT_WEEKLY_USAGE, /usage: vp run commit:weekly --staging-dir/);
   assert.match(HOSTED_RESTORE_USAGE, /usage: vp run restore:development\|restore:production/);
-  assert.match(LOCAL_RESTORE_USAGE, /usage: vp run restore:local --environment/);
 });
 
 test('args: backup parses the documented invocation with defaults', () => {
@@ -146,21 +143,6 @@ test('args: hosted restore rejects untrusted source values', () => {
   }
 });
 
-test('args: local restore still rejects the local source', () => {
-  assert.throws(
-    () =>
-      parseLocalRestoreArgs([
-        '--environment',
-        'development',
-        '--source',
-        'local',
-        '--backup',
-        'latest',
-      ]),
-    /r2\|repo/,
-  );
-});
-
 test('args: hosted restore rejects missing, invalid, or duplicated targets', () => {
   assert.throws(() => parseHostedRestoreArgs([]), /development\|production/);
   assert.throws(
@@ -198,88 +180,29 @@ test('args: hosted restore rejects malformed flags', () => {
   );
 });
 
-test('args: local backup parses the documented invocation for both environments', () => {
-  assert.deepEqual(parseLocalBackupArgs(['--environment', 'development']), {
-    environment: 'development',
-  });
-  assert.deepEqual(parseLocalBackupArgs(['--environment', 'production']), {
-    environment: 'production',
-  });
+test('args: local backup parses the bare invocation', () => {
+  // No options exist: the single local stack and the `local` store label are
+  // fixed in the runner; the only valid value is `{}` (or the help marker).
+  assert.deepEqual(parseLocalBackupArgs([]), {});
 });
 
-test('args: local backup help forms bypass required-value validation', () => {
+test('args: local backup help forms', () => {
   assert.deepEqual(parseLocalBackupArgs(['--help']), { help: true });
   assert.deepEqual(parseLocalBackupArgs(['-h']), { help: true });
-  assert.deepEqual(parseLocalBackupArgs(['--environment', 'bad', '--help']), { help: true });
 });
 
 test('args: local backup rejects every malformed-token form before any external work', () => {
-  assert.match(LOCAL_BACKUP_USAGE, /usage: vp run backup:local --environment/);
-  assert.throws(() => parseLocalBackupArgs([]), /--environment/);
-  assert.throws(() => parseLocalBackupArgs(['--environment']), MISSING_VALUE);
-  assert.throws(
-    () => parseLocalBackupArgs(['--environment', 'staging']),
-    /development or production/,
-  );
+  assert.match(LOCAL_BACKUP_USAGE, /^usage: vp run backup:local$/);
+  // The old --environment option no longer exists; every token other than
+  // --help/-h is grammar-invalid and fails closed (never a config error).
+  assert.throws(() => parseLocalBackupArgs(['--environment']), UNKNOWN_OPTION);
+  assert.throws(() => parseLocalBackupArgs(['--environment', 'development']), UNKNOWN_OPTION);
+  assert.throws(() => parseLocalBackupArgs(['--environment', 'staging']), UNKNOWN_OPTION);
   assert.throws(() => parseLocalBackupArgs(['--bogus']), UNKNOWN_OPTION);
-  assert.throws(
-    () => parseLocalBackupArgs(['--environment', 'development', '--bogus']),
-    UNKNOWN_OPTION,
-  );
-  assert.throws(() => parseLocalBackupArgs(['--environment', 'development', 'extra']), POSITIONAL);
+  // Strict parsing: an unknown option is rejected even when --help is present.
+  assert.throws(() => parseLocalBackupArgs(['--bogus', '--help']), UNKNOWN_OPTION);
+  assert.throws(() => parseLocalBackupArgs(['extra']), POSITIONAL);
   assert.throws(() => parseLocalBackupArgs(['--', '--environment', 'development']), POSITIONAL);
-  // No output-path option may be introduced on this command.
-  assert.throws(
-    () => parseLocalBackupArgs(['--environment', 'development', '--out', '/tmp/x']),
-    UNKNOWN_OPTION,
-  );
-});
-
-test('args: local restore parses the documented invocation', () => {
-  assert.deepEqual(
-    parseLocalRestoreArgs(['--environment', 'development', '--source', 'r2', '--backup', 'latest']),
-    { environment: 'development', source: 'r2', backup: 'latest' },
-  );
-  assert.deepEqual(
-    parseLocalRestoreArgs(['--environment', 'production', '--source', 'repo', '--backup', ID]),
-    { environment: 'production', source: 'repo', backup: ID },
-  );
-});
-
-test('args: local restore help forms', () => {
-  assert.deepEqual(parseLocalRestoreArgs(['--help']), { help: true });
-  assert.deepEqual(parseLocalRestoreArgs(['-h']), { help: true });
-});
-
-test('args: local restore rejects malformed input', () => {
-  assert.throws(() => parseLocalRestoreArgs([]), /requires --environment/);
-  assert.throws(
-    () => parseLocalRestoreArgs(['--environment', 'x', '--source', 'r2', '--backup', 'latest']),
-    /development\|production/,
-  );
-  assert.throws(
-    () =>
-      parseLocalRestoreArgs([
-        '--environment',
-        'development',
-        '--source',
-        's3',
-        '--backup',
-        'latest',
-      ]),
-    /r2\|repo/,
-  );
-  assert.throws(
-    () => parseLocalRestoreArgs(['--environment', 'development', '--source', 'r2']),
-    /--backup/,
-  );
-  assert.throws(
-    () => parseLocalRestoreArgs(['--environment', 'development', '--source', 'r2', '--bogus']),
-    UNKNOWN_OPTION,
-  );
-  assert.throws(
-    () => parseLocalRestoreArgs(['--environment', 'development', '--source', 'r2', 'extra']),
-    POSITIONAL,
-  );
-  assert.throws(() => parseLocalRestoreArgs(['--', '--environment', 'development']), POSITIONAL);
+  // No output-path or other value option may be introduced on this command.
+  assert.throws(() => parseLocalBackupArgs(['--out', '/tmp/x']), UNKNOWN_OPTION);
 });

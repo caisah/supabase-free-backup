@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import {
   LOCAL_BACKUP_DIRECTORY_NAME,
   LocalBackupError,
+  localDbUrl,
   assertLocalStackRunning,
   readLocalDatabaseState,
   openLocalBackupStore,
@@ -20,7 +21,13 @@ import {
   createLocalBackupCandidate,
   finalizeLocalBackup,
 } from './local-backup.js';
-import { buildManifest, PLAINTEXT_ARTIFACTS, MANIFEST_NAME } from './snapshot.js';
+import {
+  buildManifest,
+  PLAINTEXT_ARTIFACTS,
+  MANIFEST_NAME,
+  POSTGRES_MAJOR_VERSION,
+} from './snapshot.js';
+import { LOCAL_STORE_ENVIRONMENT } from './config.js';
 import {
   tmpdir,
   writePrivateFile,
@@ -29,7 +36,7 @@ import {
   AGE_RECIPIENT_2,
 } from './test-fixtures.js';
 
-const ENV = 'development';
+const ENV = LOCAL_STORE_ENVIRONMENT;
 const REF = 'a1b2c3d4e5f6a7b8c9d0';
 const ID = '2026-08-24T03-17-09Z';
 const ID_OLDER = '2026-08-23T03-17-09Z';
@@ -79,6 +86,12 @@ function storeFor(root, environment = ENV) {
   return openLocalBackupStore({ repoRoot: root, environment });
 }
 
+test('local-backup: the fixture db url derives only from the local port', () => {
+  // The local fixture URL is a fixed localhost/postgres:postgres formatter
+  // owned by the local-backup path (never part of the exported stack API).
+  assert.equal(localDbUrl(55322), 'postgresql://postgres:postgres@127.0.0.1:55322/postgres');
+});
+
 test('local-backup: store creates private root and environment directories', () => {
   const root = tmpdir('bp-lb-store-');
   const store = storeFor(root);
@@ -108,7 +121,7 @@ test(
       () => storeFor(publicRoot),
       (err) => err instanceof LocalBackupError && /permissions/.test(err.message),
     );
-    assert.ok(!fs.existsSync(path.join(rootPath, '.lock-development')));
+    assert.ok(!fs.existsSync(path.join(rootPath, '.lock-local')));
 
     const publicEnvironment = tmpdir('bp-lb-store-');
     const privateRoot = path.join(publicEnvironment, LOCAL_BACKUP_DIRECTORY_NAME);
@@ -120,7 +133,7 @@ test(
       () => storeFor(publicEnvironment),
       (err) => err instanceof LocalBackupError && /permissions/.test(err.message),
     );
-    assert.ok(!fs.existsSync(path.join(privateRoot, '.lock-development')));
+    assert.ok(!fs.existsSync(path.join(privateRoot, '.lock-local')));
 
     fs.rmSync(publicRoot, { recursive: true, force: true });
     fs.rmSync(publicEnvironment, { recursive: true, force: true });
@@ -161,7 +174,30 @@ test('local-backup: symlink or non-directory root/environment paths are rejected
   fs.rmSync(symlinkTarget, { recursive: true, force: true });
 });
 
-test('local-backup: same-environment lock excludes and releases; environments are independent', () => {
+test('local-backup: store boundary rejects every non-fixed environment label', () => {
+  const root = tmpdir('bp-lb-store-');
+  for (const bad of ['development', 'production', '../../escape']) {
+    assert.throws(
+      () => openLocalBackupStore({ repoRoot: root, environment: bad }),
+      (err) => {
+        assert.ok(err instanceof LocalBackupError, bad);
+        assert.ok(/fixed single store/.test(err.message), bad);
+        return true;
+      },
+    );
+  }
+  assert.ok(
+    !fs.existsSync(path.join(root, 'local-backups')),
+    'nothing may be created for a rejected environment',
+  );
+  // The fixed single store still opens normally.
+  const store = storeFor(root);
+  store.release();
+  assert.ok(!fs.existsSync(path.join(root, 'local-backups', '.lock-local')));
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('local-backup: same fixed store excludes concurrent lock holders and releases idempotently', () => {
   const root = tmpdir('bp-lb-store-');
   const first = storeFor(root);
   try {
@@ -169,27 +205,20 @@ test('local-backup: same-environment lock excludes and releases; environments ar
       () => storeFor(root),
       (err) => {
         assert.ok(err instanceof LocalBackupError);
-        assert.ok(err.message.includes('.lock-development'), err.message);
+        assert.ok(err.message.includes('.lock-local'), err.message);
         return true;
       },
     );
-    // A different environment lock is never blocked.
-    const second = openLocalBackupStore({ repoRoot: root, environment: 'production' });
-    try {
-      assert.ok(fs.existsSync(path.join(root, 'local-backups', '.lock-production')));
-    } finally {
-      second.release();
-    }
   } finally {
     first.release();
   }
-  // After release, the same environment can be locked again (idempotent release).
+  // After release, the store can be locked again (idempotent release).
   const third = storeFor(root);
   third.release();
   third.release(); // idempotent
   const fourth = storeFor(root);
   fourth.release();
-  assert.ok(!fs.existsSync(path.join(root, 'local-backups', '.lock-development')));
+  assert.ok(!fs.existsSync(path.join(root, 'local-backups', '.lock-local')));
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -225,7 +254,7 @@ test('local-backup: setup failure after lock acquisition still releases the lock
     (err) => err instanceof LocalBackupError,
   );
   // The failed open must have released its lock.
-  assert.ok(!fs.existsSync(path.join(root, 'local-backups', '.lock-development')));
+  assert.ok(!fs.existsSync(path.join(root, 'local-backups', '.lock-local')));
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -271,21 +300,35 @@ test('local-backup: stale owned candidates are removed; symlinks and files are r
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('local-backup: assertLocalStackRunning is read-only and requires the exact SELECT 1', async () => {
+test('local-backup: assertLocalStackRunning is read-only and requires live container, SELECT 1, and the pinned Postgres major', async () => {
   const calls = [];
   const run = async ({ command, args }) => {
     calls.push({ command, args });
-    if (args.includes('cant-write')) throw new Error('no such command');
+    const joined = args.join(' ');
+    if (joined.includes('inspect')) return { stdout: 'true\n' };
+    if (joined.includes('server_version_num')) {
+      return { stdout: `${POSTGRES_MAJOR_VERSION}0006\n` };
+    }
     return { stdout: '1\n' };
   };
-  await assertLocalStackRunning(validateFsArgs({ run }));
-  assert.equal(calls.length, 1);
-  assert.equal(path.basename(calls[0].command), 'docker');
-  assert.deepEqual(calls[0].args.slice(0, 3), ['exec', 'supabase_db_fragtrack', 'psql']);
-  const joined = calls[0].args.join(' ');
-  for (const lifecycle of ['start', 'stop', 'reset', 'db reset', 'migrate']) {
-    assert.ok(!joined.includes(lifecycle), `must not invoke lifecycle command ${lifecycle}`);
+  const result = await assertLocalStackRunning(validateFsArgs({ run }));
+  assert.equal(result.ok, true);
+  assert.equal(calls.length, 3, 'container probe, SELECT 1, and version probe');
+  for (const call of calls) {
+    assert.equal(path.basename(call.command), 'docker');
+    const joined = call.args.join(' ');
+    for (const lifecycle of ['start', 'stop', 'reset', 'db reset', 'migrate']) {
+      assert.ok(!joined.includes(lifecycle), `must not invoke lifecycle command ${lifecycle}`);
+    }
   }
+  const inspect = calls[0];
+  assert.equal(inspect.args[0], 'inspect');
+  assert.ok(inspect.args.includes('{{.State.Running}}'));
+  assert.ok(inspect.args.includes('supabase_db_fragtrack'));
+  const version = calls[2];
+  assert.deepEqual(version.args.slice(0, 3), ['exec', 'supabase_db_fragtrack', 'psql']);
+  assert.ok(version.args.at(-1).includes('server_version_num'));
+
   // Offline stack: connection failure surfaces a static LocalBackupError.
   await assert.rejects(
     () =>
@@ -298,7 +341,7 @@ test('local-backup: assertLocalStackRunning is read-only and requires the exact 
       }),
     (err) => {
       assert.ok(err instanceof LocalBackupError);
-      assert.match(err.message, /start the local stack/);
+      assert.ok(/start the local stack/.test(err.message));
       assert.ok(err.cause, 'connection failure must keep its cause');
       return true;
     },
@@ -313,6 +356,71 @@ test('local-backup: assertLocalStackRunning is read-only and requires the exact 
       }),
     (err) => err instanceof LocalBackupError && /start the local stack/.test(err.message),
   );
+});
+
+test('local-backup: assertLocalStackRunning rejects a missing or stopped container with a targeted error', async () => {
+  await assert.rejects(
+    () =>
+      assertLocalStackRunning({
+        dockerPath: '/bin/docker',
+        dbContainer: 'supabase_db_wrongname',
+        run: async (opts) => {
+          if (opts.args.includes('inspect')) {
+            throw new Error('no such container');
+          }
+          return { stdout: '1\n' };
+        },
+      }),
+    (err) => {
+      assert.ok(err instanceof LocalBackupError);
+      assert.match(err.message, /supabase_db_wrongname/);
+      assert.ok(!err.message.includes('credentials'), 'no data leaks');
+      return true;
+    },
+  );
+});
+
+test('local-backup: assertLocalStackRunning rejects a running server whose major version is not pinned', async () => {
+  await assert.rejects(
+    () =>
+      assertLocalStackRunning({
+        dockerPath: '/bin/docker',
+        dbContainer: 'supabase_db_fragtrack',
+        run: async (opts) => {
+          const joined = opts.args.join(' ');
+          if (joined.includes('inspect')) return { stdout: 'true\n' };
+          if (joined.includes('server_version_num')) return { stdout: '150006\n' };
+          return { stdout: '1\n' };
+        },
+      }),
+    (err) => {
+      assert.ok(err instanceof LocalBackupError);
+      assert.match(err.message, /PostgreSQL major/);
+      assert.ok(err.message.includes(String(POSTGRES_MAJOR_VERSION)));
+      assert.ok(err.stage === 'connect' || err.stage === 'version');
+      return true;
+    },
+  );
+});
+
+test('local-backup: candidate parent honors the private mode regardless of umask', async () => {
+  const root = tmpdir('bp-lb-cand-');
+  const store = storeFor(root);
+  const previous = process.umask(0o022);
+  let candidate = null;
+  try {
+    candidate = createLocalBackupCandidate({ environmentDir: store.environmentDir });
+    assert.equal(
+      fs.statSync(candidate.candidateDir).mode & 0o777,
+      0o700,
+      'candidate parent must be 0700 even under umask 022',
+    );
+    fs.rmSync(candidate.candidateDir, { recursive: true, force: true });
+  } finally {
+    process.umask(previous);
+    store.release();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('local-backup: database state token covers mutations, relations, sequences, and roles', async () => {
@@ -350,17 +458,11 @@ test('local-backup: scan returns valid snapshots newest first and ignores nothin
   const root = tmpdir('bp-lb-scan-');
   const store = storeFor(root);
   try {
-    assert.deepEqual(
-      await scanLocalBackupSnapshots({ environmentDir: store.environmentDir, environment: ENV }),
-      [],
-    );
+    assert.deepEqual(await scanLocalBackupSnapshots({ environmentDir: store.environmentDir }), []);
     await makeSnapshot(store.environmentDir, ID_OLDER, { contentSha256: 'a'.repeat(64) });
     await makeSnapshot(store.environmentDir, ID, { contentSha256: 'b'.repeat(64) });
     await makeSnapshot(store.environmentDir, ID_OLDEST, { contentSha256: 'c'.repeat(64) });
-    const scanned = await scanLocalBackupSnapshots({
-      environmentDir: store.environmentDir,
-      environment: ENV,
-    });
+    const scanned = await scanLocalBackupSnapshots({ environmentDir: store.environmentDir });
     assert.deepEqual(
       scanned.map((s) => s.snapshotId),
       [ID, ID_OLDER, ID_OLDEST],
@@ -382,14 +484,14 @@ test(
       const snapshot = await makeSnapshot(store.environmentDir, ID);
       fs.chmodSync(snapshot.dir, 0o755);
       await assert.rejects(
-        () => scanLocalBackupSnapshots({ environmentDir: store.environmentDir, environment: ENV }),
+        () => scanLocalBackupSnapshots({ environmentDir: store.environmentDir }),
         (err) => err instanceof LocalBackupError && /permissions/.test(err.message),
       );
 
       fs.chmodSync(snapshot.dir, 0o700);
       fs.chmodSync(path.join(snapshot.dir, 'roles.sql'), 0o644);
       await assert.rejects(
-        () => scanLocalBackupSnapshots({ environmentDir: store.environmentDir, environment: ENV }),
+        () => scanLocalBackupSnapshots({ environmentDir: store.environmentDir }),
         (err) => err instanceof LocalBackupError && /permissions/.test(err.message),
       );
     } finally {
@@ -407,7 +509,7 @@ test('local-backup: scan rejects malformed, mismatched, unknown, and symlink ent
     const good = await makeSnapshot(store.environmentDir, ID);
     fs.appendFileSync(path.join(good.dir, MANIFEST_NAME), '{"tampered":true}');
     await assert.rejects(
-      () => scanLocalBackupSnapshots({ environmentDir: store.environmentDir, environment: ENV }),
+      () => scanLocalBackupSnapshots({ environmentDir: store.environmentDir }),
       (err) => err instanceof LocalBackupError || err.name === 'SnapshotError',
     );
     fs.rmSync(good.dir, { recursive: true, force: true });
@@ -415,7 +517,7 @@ test('local-backup: scan rejects malformed, mismatched, unknown, and symlink ent
     // Environment mismatch.
     await makeSnapshot(store.environmentDir, ID, { environment: 'production' });
     await assert.rejects(
-      () => scanLocalBackupSnapshots({ environmentDir: store.environmentDir, environment: ENV }),
+      () => scanLocalBackupSnapshots({ environmentDir: store.environmentDir }),
       (err) => err instanceof LocalBackupError || err.name === 'SnapshotError',
     );
     const mismatch = path.join(store.environmentDir, ID);
@@ -424,7 +526,7 @@ test('local-backup: scan rejects malformed, mismatched, unknown, and symlink ent
     // Non-canonical directory.
     fs.mkdirSync(path.join(store.environmentDir, 'not-a-snapshot'), { mode: 0o700 });
     await assert.rejects(
-      () => scanLocalBackupSnapshots({ environmentDir: store.environmentDir, environment: ENV }),
+      () => scanLocalBackupSnapshots({ environmentDir: store.environmentDir }),
       (err) => err instanceof LocalBackupError,
     );
     fs.rmdirSync(path.join(store.environmentDir, 'not-a-snapshot'));
@@ -432,7 +534,7 @@ test('local-backup: scan rejects malformed, mismatched, unknown, and symlink ent
     // Unknown file.
     writePrivateFile(path.join(store.environmentDir, 'notes.txt'), 'x');
     await assert.rejects(
-      () => scanLocalBackupSnapshots({ environmentDir: store.environmentDir, environment: ENV }),
+      () => scanLocalBackupSnapshots({ environmentDir: store.environmentDir }),
       (err) => err instanceof LocalBackupError,
     );
     fs.unlinkSync(path.join(store.environmentDir, 'notes.txt'));
@@ -440,7 +542,7 @@ test('local-backup: scan rejects malformed, mismatched, unknown, and symlink ent
     // Unknown directory.
     fs.mkdirSync(path.join(store.environmentDir, 'random-dir'), { mode: 0o700 });
     await assert.rejects(
-      () => scanLocalBackupSnapshots({ environmentDir: store.environmentDir, environment: ENV }),
+      () => scanLocalBackupSnapshots({ environmentDir: store.environmentDir }),
       (err) => err instanceof LocalBackupError,
     );
     fs.rmdirSync(path.join(store.environmentDir, 'random-dir'));
@@ -448,7 +550,7 @@ test('local-backup: scan rejects malformed, mismatched, unknown, and symlink ent
     // Symlink into a snapshot-shaped name.
     fs.symlinkSync(good.dir, path.join(store.environmentDir, ID));
     await assert.rejects(
-      () => scanLocalBackupSnapshots({ environmentDir: store.environmentDir, environment: ENV }),
+      () => scanLocalBackupSnapshots({ environmentDir: store.environmentDir }),
       (err) => err instanceof LocalBackupError,
     );
   } finally {
@@ -704,24 +806,16 @@ test('local-backup: unchanged branches never delete the candidate and remove onl
   }
 });
 
-test('local-backup: no cross-environment reads, locks, or deletion', async () => {
+test('local-backup: the fixed store scan and publication stay within the single label', async () => {
   const root = tmpdir('bp-lb-store-');
-  const dev = storeFor(root, 'development');
-  const prod = openLocalBackupStore({ repoRoot: root, environment: 'production' });
+  const store = storeFor(root);
   try {
-    await makeSnapshot(dev.environmentDir, ID, { contentSha256: 'a'.repeat(64) });
-    const devScanned = await scanLocalBackupSnapshots({
-      environmentDir: dev.environmentDir,
-      environment: 'development',
-    });
-    assert.equal(devScanned.length, 1);
-    const prodScanned = await scanLocalBackupSnapshots({
-      environmentDir: prod.environmentDir,
-      environment: 'production',
-    });
-    assert.deepEqual(prodScanned, [], 'production must not see development snapshots');
-    // Finalizing production never touches the development directory.
-    const candidate = createLocalBackupCandidate({ environmentDir: prod.environmentDir });
+    await makeSnapshot(store.environmentDir, ID, { contentSha256: 'a'.repeat(64) });
+    const scanned = await scanLocalBackupSnapshots({ environmentDir: store.environmentDir });
+    assert.equal(scanned.length, 1);
+    assert.equal(scanned[0].snapshotId, ID);
+    // Publication targets only the store's environment directory.
+    const candidate = createLocalBackupCandidate({ environmentDir: store.environmentDir });
     fs.mkdirSync(candidate.pkgDir, { mode: 0o700 });
     writePrivateFile(path.join(candidate.pkgDir, 'roles.sql'), 'x');
     const result = await finalizeLocalBackup({
@@ -731,19 +825,22 @@ test('local-backup: no cross-environment reads, locks, or deletion', async () =>
         sourceProjectRef: REF,
         encryption: { recipient: AGE_RECIPIENT_1 },
       },
-      existingSnapshots: [],
-      environmentDir: prod.environmentDir,
-      snapshotId: ID,
+      existingSnapshots: scanned,
+      environmentDir: store.environmentDir,
+      snapshotId: ID_OLDER,
     });
     assert.equal(result.changed, true);
-    const devAfter = fs.readdirSync(dev.environmentDir);
+    assert.equal(
+      fs.readdirSync(store.environmentDir).filter((e) => !e.startsWith('.candidate-')).length,
+      1,
+      'only the newly published snapshot remains',
+    );
     assert.ok(
-      devAfter.includes(ID) && devAfter.length === 1,
-      'development snapshots untouched by production publication',
+      fs.existsSync(path.join(store.environmentDir, ID_OLDER)),
+      'new snapshot published in the single store',
     );
   } finally {
-    dev.release();
-    prod.release();
+    store.release();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

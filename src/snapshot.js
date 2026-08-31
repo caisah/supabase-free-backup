@@ -19,7 +19,8 @@ import { pipeline } from 'node:stream/promises';
 import { endWritable, sha256Readable } from './stream.js';
 import { reportProgressSafely, ordinal } from './progress.js';
 import { z } from 'zod';
-import { ENVIRONMENTS, REPOSITORY_ROOT } from './config.js';
+import { ENVIRONMENTS, LOCAL_STORE_ENVIRONMENT, REPOSITORY_ROOT } from './config.js';
+import { PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE } from './local-store.js';
 import {
   ENCRYPTION_FORMAT,
   PLAINTEXT_FORMAT,
@@ -147,15 +148,18 @@ export function buildManifest({
 }
 
 /**
- * Shared format normalization: a missing `encryption.format` means
- * age-x25519. NOTE: this deliberately diverges from `rowDataCodec`, which
- * THROWS on unrecognized formats — `formatOf` must keep defaulting so the
- * hosted RHS partial object `{ contentSha256, encryption: { recipient } }`
- * (pre-format manifests) keeps comparing equal. A third format must update
- * both paths together.
+ * Shared format normalization for content comparison. The single source of
+ * truth for "what formats exist" is the ROW_DATA_CODECS registry in
+ * encryption.js: a missing `encryption.format` means the legacy age-x25519
+ * default (pre-format manifests), and any other FORMAT STRING is taken
+ * verbatim as its own identity — adding a third codec to the registry
+ * automatically joins format comparison here with NO second path to keep in
+ * sync. Unregistered format strings (unvalidated input) therefore compare as
+ * themselves and can never silently equal a registered format.
  */
 function formatOf(m) {
-  return m.encryption?.format === PLAINTEXT_FORMAT ? PLAINTEXT_FORMAT : ENCRYPTION_FORMAT;
+  if (m.encryption?.format === undefined) return ENCRYPTION_FORMAT;
+  return m.encryption.format;
 }
 
 /**
@@ -279,10 +283,14 @@ const FILE_ENTRY_SCHEMA = z
   .strict();
 
 /** Immutable base manifest schema (structural fields only). */
+// The environment enum is deliberately extended with the single local-store
+// label: local snapshots are real repository artifacts consumed by hosted
+// restores. Downstream consumers that validate manifests against the two
+// hosted environments must accept the third label.
 const MANIFEST_BASE_SCHEMA = z
   .object({
     formatVersion: z.literal(1),
-    environment: z.enum(ENVIRONMENTS),
+    environment: z.enum([...ENVIRONMENTS, LOCAL_STORE_ENVIRONMENT]),
     sourceProjectRef: z.string().regex(/^[a-z0-9]{20}$/),
     snapshotId: z.string(),
     createdAt: z.string(),
@@ -479,7 +487,7 @@ function createPackagingPaths(destDir) {
   }
   ensurePrivateDir(destDir, 0o700);
   const tmpDir = path.join(destDir, '.packaging-tmp');
-  ensurePrivateDir(tmpDir, 0o700);
+  ensurePrivateDir(tmpDir, PRIVATE_DIRECTORY_MODE);
   return { tmpDir, partsDir: destDir };
 }
 
@@ -558,7 +566,7 @@ async function copyPlaintextArtifacts({ sourceDir, destDir, onProgress }) {
     onProgress?.(`starting plaintext-artifact copy ${ordinal(i, total)}: ${artifact}`);
     await pipeline(
       fs.createReadStream(path.join(sourceDir, artifact)),
-      createWriteStream(path.join(destDir, artifact), { mode: 0o600 }),
+      createWriteStream(path.join(destDir, artifact), { mode: PRIVATE_FILE_MODE }),
     );
     onProgress?.(`completed plaintext-artifact copy ${ordinal(i, total)}: ${artifact}`);
   }
@@ -698,8 +706,8 @@ async function sizeAndHash(filePath, entry) {
 }
 
 async function combineStreams(streams, output) {
-  ensurePrivateDir(path.dirname(output), 0o700);
-  const out = createWriteStream(output, { mode: 0o600 });
+  ensurePrivateDir(path.dirname(output), PRIVATE_DIRECTORY_MODE);
+  const out = createWriteStream(output, { mode: PRIVATE_FILE_MODE });
   try {
     for (const stream of streams) {
       await pipeline(stream, out, { end: false });
@@ -725,12 +733,12 @@ async function copyVerifiedPlaintext({ sourceDir, destDir }) {
   for (const artifact of PLAINTEXT_ARTIFACTS) {
     await pipeline(
       fs.createReadStream(path.join(sourceDir, artifact)),
-      createWriteStream(path.join(destDir, artifact), { mode: 0o600 }),
+      createWriteStream(path.join(destDir, artifact), { mode: PRIVATE_FILE_MODE }),
     );
   }
   await pipeline(
     fs.createReadStream(path.join(sourceDir, MANIFEST_NAME)),
-    createWriteStream(path.join(destDir, MANIFEST_NAME), { mode: 0o600 }),
+    createWriteStream(path.join(destDir, MANIFEST_NAME), { mode: PRIVATE_FILE_MODE }),
   );
 }
 
@@ -801,9 +809,9 @@ export async function unpackAndVerify(opts) {
   if (fs.existsSync(opts.destDir)) {
     throw new SnapshotError([`destination already exists: ${path.basename(opts.destDir)}`]);
   }
-  ensurePrivateDir(opts.destDir, 0o700);
+  ensurePrivateDir(opts.destDir, PRIVATE_DIRECTORY_MODE);
   const tmpDir = path.join(opts.destDir, '.unpack-tmp');
-  ensurePrivateDir(tmpDir, 0o700);
+  ensurePrivateDir(tmpDir, PRIVATE_DIRECTORY_MODE);
 
   try {
     // Copy verified plaintext artifacts + manifest into the prepared dir.

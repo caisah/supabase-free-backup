@@ -7,6 +7,10 @@
  * this module exists so the NON-destructive restore preparation layer can
  * enforce the store's trust boundary without transitively loading the
  * destructive restore pipelines.
+ *
+ * Mode policy is POSIX-only by design: on Windows the checks are skipped
+ * because DACLs (not 0700/0600 modes) enforce the trust boundary. This is a
+ * documented OS-dependent fail-closed boundary, not an oversight.
  */
 
 import fs from 'node:fs';
@@ -15,6 +19,15 @@ import path from 'node:path';
 export const LOCAL_BACKUP_DIRECTORY_NAME = 'local-backups';
 export const PRIVATE_DIRECTORY_MODE = 0o700;
 export const PRIVATE_FILE_MODE = 0o600;
+
+/** Order snapshots newest-first by descending canonical snapshot id. The
+ * single shared comparator for every local-store listing (backup-side scan,
+ * restore-side listing, publish comparison). */
+export function sortSnapshotsNewestFirst(snapshots) {
+  return [...snapshots].sort((a, b) =>
+    a.snapshotId < b.snapshotId ? 1 : a.snapshotId > b.snapshotId ? -1 : 0,
+  );
+}
 
 /**
  * Human-readable problem when `dir` is not a real (non-symlink) private 0700

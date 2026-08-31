@@ -6,7 +6,6 @@ import path from 'node:path';
 import {
   loadBackupConfig,
   loadHostedRestoreConfig,
-  loadLocalRestoreConfig,
   loadLocalBackupConfig,
   classifyDbUrl,
   ConfigError,
@@ -188,13 +187,6 @@ test('config: variables the operation does not consume never conflict', () => {
     },
   });
   assert.equal(repoCfg.bucket, 'production');
-  const localCfg = loadLocalRestoreConfig({
-    environment: 'development',
-    source: 'repo',
-    root,
-    vars: { CLOUDFLARE_ACCOUNT_ID: 'ffffffffffffffffffffffffffffffff' },
-  });
-  assert.equal(localCfg.accountId, '0123456789abcdef0123456789abcdef', 'file value wins');
   // Consumed variables still conflict exactly as before.
   assert.throws(
     () =>
@@ -556,33 +548,6 @@ test('config: age recipient and identity shape are validated without echoing val
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('config: PROJECT_WORKDIR resolves relative to the repository root', () => {
-  const root = makeRoot();
-  devFile(root, { PROJECT_WORKDIR: '../fragtrack-proj' });
-  const cfg = loadLocalRestoreConfig({
-    environment: 'development',
-    source: 'repo',
-    root,
-    vars: {},
-  });
-  assert.equal(path.relative(root, cfg.fragtrackWorkdir), '../fragtrack-proj');
-  assert.equal(path.resolve(root, '../fragtrack-proj'), cfg.fragtrackWorkdir);
-  fs.rmSync(root, { recursive: true, force: true });
-});
-
-test('config: local restore defaults PROJECT_WORKDIR to ../fragtrack', () => {
-  const root = makeRoot();
-  devFile(root, { PROJECT_WORKDIR: undefined });
-  const cfg = loadLocalRestoreConfig({
-    environment: 'development',
-    source: 'repo',
-    root,
-    vars: {},
-  });
-  assert.equal(cfg.fragtrackWorkdir, path.join(root, '..', 'fragtrack'));
-  fs.rmSync(root, { recursive: true, force: true });
-});
-
 test('config: local backup succeeds with only its own requirements', () => {
   const root = makeRoot();
   devFile(root);
@@ -716,9 +681,9 @@ test('config: local backup consumed disagreements conflict; unused ones never do
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('config: hosted local source resolves DECRYPT_KEY when present but never requires it', () => {
+test('config: hosted local source never consumes DECRYPT_KEY (legacy encrypted-local path removed)', () => {
   const root = makeRoot();
-  devFile(root); // the default file carries a valid DECRYPT_KEY
+  devFile(root); // the default file carries a valid DECRYPT_KEY in the dotenv
   const cfg = loadHostedRestoreConfig({
     environment: 'development',
     source: 'local',
@@ -727,35 +692,20 @@ test('config: hosted local source resolves DECRYPT_KEY when present but never re
   });
   assert.equal(
     cfg.ageIdentity,
-    'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ',
-    'a configured DECRYPT_KEY must reach the local-source restore path',
+    undefined,
+    'the legacy encrypted-local compatibility path is removed; local snapshots are plaintext',
   );
-  assert.equal(cfg.environment, 'development');
-  assert.equal(cfg.projectRef, REF_DEV);
-
-  // No DECRYPT_KEY anywhere: plaintext local restores must still work.
-  devFile(root, { DECRYPT_KEY: undefined });
-  const without = loadHostedRestoreConfig({
+  assert.ok(!Object.hasOwn(cfg, 'ageIdentity'), 'age identity is never exposed for local');
+  // DECRYPT_KEY is not consumed, so a conflicting process export is NOT a
+  // conflict for the local source (the variable is out of scope).
+  const cfg2 = loadHostedRestoreConfig({
     environment: 'development',
     source: 'local',
     root,
-    vars: {},
+    vars: { DECRYPT_KEY: 'AGE-SECRET-KEY-1ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ' },
   });
-  assert.equal(without.ageIdentity, undefined);
-  assert.ok(!Object.hasOwn(without, 'ageIdentity'), 'absent identity is not exposed');
-
-  // Once consumed, DECRYPT_KEY disagreements are conflicts (names only).
-  devFile(root);
-  assert.throws(
-    () =>
-      loadHostedRestoreConfig({
-        environment: 'development',
-        source: 'local',
-        root,
-        vars: { DECRYPT_KEY: 'AGE-SECRET-KEY-1ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ' },
-      }),
-    (err) => err instanceof ConfigError && err.message.includes(`${CONFLICT_PREFIX} DECRYPT_KEY`),
-  );
+  assert.equal(cfg2.ageIdentity, undefined);
+  assert.equal(cfg2.projectRef, REF_DEV);
   fs.rmSync(root, { recursive: true, force: true });
 });
 

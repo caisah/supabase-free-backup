@@ -19,6 +19,7 @@ import { Readable } from 'node:stream';
 import { urlPassword } from './config.js';
 import { PINNED_SUPABASE_POSTGRES_IMAGE } from './database.js';
 import { POSTGRES_MAJOR_VERSION } from './snapshot.js';
+import { psqlOutputLines } from './process.js';
 
 export class HostedRestoreError extends Error {
   constructor(message, { cause, stage } = {}) {
@@ -270,10 +271,7 @@ export async function psqlQuery({
     stderr: 'collect',
     signal,
   });
-  return (res.stdout ?? '')
-    .split('\n')
-    .map((l) => l.trim())
-    .filter(Boolean);
+  return psqlOutputLines(res.stdout);
 }
 
 /** Read-only connectivity preflight: image/version, then a live target. */
@@ -599,18 +597,37 @@ function readLineOnce(input) {
 }
 
 /** CHECK.js-style readable summary for the confirmation gate. */
-export function confirmationSummary({ environment, source, snapshotId, projectRef }) {
+export function confirmationSummary({
+  environment,
+  source,
+  snapshotId,
+  projectRef,
+  sourceProjectRef,
+}) {
   const maskedRef = projectRef
     ? `${projectRef.slice(0, 4)}****${projectRef.slice(-4)}`
     : '(unknown)';
-  return [
+  const lines = [
     `Target environment : ${environment}`,
     `Source             : ${source}`,
     `Snapshot           : ${snapshotId}`,
     `Project ref        : ${maskedRef}`,
+  ];
+  // Local-store snapshots carry their ORIGIN project; it must never be
+  // hidden, because a local snapshot may be restored into any hosted target.
+  if (source === 'local' && sourceProjectRef) {
+    lines.push(`Source project ref : ${sourceProjectRef}`);
+  }
+  if (source === 'local' && sourceProjectRef && sourceProjectRef !== projectRef) {
+    lines.push('');
+    lines.push('!!! WARNING: this snapshot comes from a DIFFERENT project than the target.');
+    lines.push("!!! The exact phrase includes the snapshot's source ref: type it to confirm.");
+  }
+  lines.push(
     '',
     '!!! DATA-LOSS WARNING: this command RESETS the hosted database and replaces',
     '!!! all of its contents with the verified snapshot.',
     '',
-  ].join('\n');
+  );
+  return lines.join('\n');
 }
