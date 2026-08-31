@@ -6,16 +6,19 @@
   "type": "module",
   "scripts": {
     "lint": "vp lint",
+    "fmt": "vp fmt",
+    "fmt:check": "vp fmt --check",
     "test": "node --test --test-skip-pattern=integration",
     "test:integration": "node --test --test-name-pattern=integration --test-concurrency=1",
-    "check": "vp check && vp run test",
+    "check": "vp check && npm run test",
     "preflight": "node --input-type=module -e \"import('./src/runtime.js').then(m => m.assertNodeVersion())\"",
     "backup": "node scripts/backup.js",
     "backup:local": "node scripts/backup-local.js",
     "restore:development": "node scripts/restore-hosted.js development",
     "restore:production": "node scripts/restore-hosted.js production",
     "github:configure": "node scripts/configure-github.js",
-    "commit:weekly": "node scripts/commit-weekly.js"
+    "commit:weekly": "node scripts/commit-weekly.js",
+    "generate-age-keys": "node scripts/generate-age-keys.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.900.0",
