@@ -1,6 +1,6 @@
 # Supabase DB (free) backup
 
-Encrypted logical backups of the **development** and **production** Fragtrack
+Encrypted logical backups of the **development** and **production**
 Supabase databases, stored in Cloudflare R2 (7-day rolling window) and in this
 Git repository (permanent, dated), with verified restore commands for hosted
 targets (restore sources: R2, Git repository, or the private local store).
@@ -68,7 +68,7 @@ flowchart TD
 | `repository.js`                                      | Reading/writing dated snapshot dirs in Git                                                                                                                                                |
 | `restore.js`                                         | Shared verification: manifest schema, sizes, SHA-256, part order, codec-aware row-data restore (decryption only for age snapshots), aggregate fingerprint; sources: repo, R2, local store |
 | `hosted-restore.js`                                  | Hosted restore: Dockerized psql client (pinned ephemeral image), reset target, apply verified snapshot in one transaction                                                                 |
-| `local-stack.js`                                     | Read-only local-stack helpers: Fragtrack workdir parsing/validation and the psql probe used by `backup:local`                                                                             |
+| `local-stack.js`                                     | Read-only local-stack helpers: workdir parsing/validation and the psql probe used by `backup:local`                                                                                       |
 | `local-backup.js`                                    | Local store: private tree/lock, read-only stability guard, crash-durable publish-before-retention                                                                                         |
 | `runtime.js`, `stream.js`, `process.js`, `logger.js` | Node runtime gate, streaming, subprocess, logging utilities                                                                                                                               |
 
@@ -161,10 +161,10 @@ Arguments pass through directly — no `--` separator (`npm run backup -- --envi
 | Script                                                                                                            | Purpose                                                                         |
 | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
 | `npm run backup -- --environment development\|production`                                                         | Dump, fingerprint, upload changed snapshot to R2, run retention                 |
-| `npm run backup:local -- --environment development\|production`                                                   | Package the ALREADY-RUNNING local Fragtrack DB into `local-backups/<env>/`      |
+| `npm run backup:local -- --environment development\|production`                                                   | Package the ALREADY-RUNNING local <workdir> DB into `local-backups/<env>/`      |
 | `npm run restore:development -- --source r2\|repo\|local --backup latest\|<snapshot-id>`                          | Restore into hosted development DB                                              |
 | `npm run restore:production -- --source r2\|repo\|local --backup latest\|<snapshot-id>`                           | Restore into hosted production DB (maintenance window required)                 |
-| `npm run restore:local -- --environment development\|production --source r2\|repo --backup latest\|<snapshot-id>` | Restore either hosted snapshot into the local `../fragtrack` stack              |
+| `npm run restore:local -- --environment development\|production --source r2\|repo --backup latest\|<snapshot-id>` | Restore either hosted snapshot into the local `<workdir>` stack                 |
 | `npm run github:configure [OWNER/REPO]`                                                                           | Validate local env files, sync GitHub Environments                              |
 | `npm run generate-age-keys`                                                                                       | Generate age X25519 key pair and write to existing `.env.*.local` files         |
 | `npm run commit:weekly -- --staging-dir <path> --repo-root .`                                                     | Weekly Git snapshot commit (used by the workflow; runnable locally on `master`) |
@@ -216,7 +216,7 @@ flowchart LR
 ### Local backup (`backup:local`)
 
 `npm run backup:local -- --environment <development|production>` packages the
-**already-running local Supabase stack** owned by the sibling Fragtrack project
+**already-running local Supabase stack** owned by the sibling project
 into a private, repository-local store. It reuses the exact dump, fingerprint,
 gzip + plaintext part splitting, and manifest pipeline as the hosted backup,
 but never encrypts (no age binary, no `ENCRYPT_KEY`), never touches R2, and
