@@ -168,7 +168,7 @@ function createHostedRestoreContext({ options, env, cwd, d }) {
  * the snapshot source. Ordering is contract: no source work before preflight.
  */
 async function prepareHostedRestore({ ctx, d, logger }) {
-  logger.addSecret(ctx.cfg.dbUrl);
+  logger.addSecret(ctx.cfg.sharedPoolerUrl);
   logger.addSecret(ctx.cfg.accessKeyId);
   logger.addSecret(ctx.cfg.secretAccessKey);
   const executables = await resolveHostedRestoreExecutables({
@@ -183,7 +183,7 @@ async function prepareHostedRestore({ ctx, d, logger }) {
   await d.doPreflight({
     dockerPath: executables.dockerPath,
     postgresImage: d.postgresImage,
-    dbUrl: ctx.cfg.dbUrl,
+    dbUrl: ctx.cfg.sharedPoolerUrl,
     run: d.run,
   });
   const adapter = createRestoreAdapter({
@@ -244,7 +244,14 @@ export async function runRestoreHosted({
 
     await d.doExecute({
       environment: ctx.target,
-      config: { ...ctx.cfg, repoRoot: ctx.cwd },
+      // Explicit adapter config at the boundary: only the fields the
+      // lower-level execute layer consumes, never a spread of unrelated
+      // secret-bearing config.
+      config: {
+        environment: ctx.cfg.environment,
+        dbUrl: ctx.cfg.sharedPoolerUrl,
+        repoRoot: ctx.cwd,
+      },
       prepared,
       dockerPath: executables.dockerPath,
       postgresImage: d.postgresImage,
@@ -267,7 +274,7 @@ export async function runRestoreHosted({
 /** CLI entry point: parse, run, and map the result to the exit code. */
 export async function main() {
   assertNodeVersion();
-  const logger = createLogger({ stream: process.stderr, secrets: [process.env.SUPABASE_DB_URL] });
+  const logger = createLogger({ stream: process.stderr });
   try {
     const parsed = parseHostedRestoreArgs(process.argv.slice(2));
     if (parsed.help) {

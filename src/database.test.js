@@ -17,7 +17,7 @@ import { POSTGRES_MAJOR_VERSION } from './snapshot.js';
 import { tmpdir, writePrivateFile, fileMode } from './test-fixtures.js';
 
 const DB_URL =
-  'postgresql://postgres.a1b2c3d4e5f6a7b8c9d0:the-password@aws-0-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require';
+  'postgresql://postgres.a1b2c3d4e5f6a7b8c9d0:the-password@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require';
 
 /** Create an executable stand-in so preflight existence checks pass. */
 function makeSupabaseBin(root) {

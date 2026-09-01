@@ -7,7 +7,7 @@ import {
   loadBackupConfig,
   loadHostedRestoreConfig,
   loadLocalBackupConfig,
-  classifyDbUrl,
+  classifySharedPoolerUrl,
   ConfigError,
   CONFLICT_PREFIX,
   urlPassword,
@@ -17,6 +17,17 @@ import {
 const REF_DEV = 'a1b2c3d4e5f6a7b8c9d0';
 const REF_PROD = 'f0e9d8c7b6a5f4e3d2c1';
 const PASSWORD = 'the-ultimate-secret-password';
+const POOLER_HOST = 'aws-0-us-east-1.pooler.supabase.com';
+
+function sharedPoolerUrl(projectRef, overrides = {}) {
+  const {
+    user = `postgres.${projectRef}`,
+    host = POOLER_HOST,
+    port = '5432',
+    sslmode = 'require',
+  } = overrides;
+  return `postgresql://${user}:${PASSWORD}@${host}:${port}/postgres?sslmode=${sslmode}`;
+}
 
 function makeRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'bp-config-'));
@@ -34,7 +45,7 @@ function devFile(root, overrides = {}) {
   writeEnv(root, 'development', {
     BACKUP_ENVIRONMENT: 'development',
     SUPABASE_PROJECT_REF: REF_DEV,
-    SUPABASE_DB_URL: `postgresql://postgres.${REF_DEV}:${PASSWORD}@aws-0-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require`,
+    SUPABASE_SHARED_POOLER_URL: sharedPoolerUrl(REF_DEV),
     CLOUDFLARE_ACCOUNT_ID: '0123456789abcdef0123456789abcdef',
     R2_BUCKET: 'development',
     R2_ACCESS_KEY_ID: 'dev-access-key-12345',
@@ -44,6 +55,17 @@ function devFile(root, overrides = {}) {
     PROJECT_WORKDIR: '../project',
     ...overrides,
   });
+}
+
+/** Assert an error message is static: names only, no URL fragments/passwords/refs. */
+function assertNoLeak(error, password = PASSWORD, ref = REF_DEV) {
+  const msg = error.message;
+  assert.ok(!msg.includes(password), 'password leaked');
+  assert.ok(!msg.includes(ref), 'project ref leaked');
+  assert.ok(!msg.includes('pooler.supabase.com'), 'host leaked');
+  assert.ok(!msg.includes('supabase.co'), 'direct host leaked');
+  assert.ok(!msg.includes('postgresql://'), 'URL leaked');
+  assert.ok(!msg.includes('@'), 'URL userinfo leaked');
 }
 
 test('config: dotenv values load for the selected environment only', () => {
@@ -62,7 +84,7 @@ test('config: dotenv values load for the selected environment only', () => {
       assert.ok(err instanceof ConfigError);
       const msg = err.message;
       assert.ok(msg.includes('SUPABASE_PROJECT_REF'), msg);
-      assert.ok(msg.includes('SUPABASE_DB_URL'), msg);
+      assert.ok(msg.includes('SUPABASE_SHARED_POOLER_URL'), msg);
       assert.ok(!msg.includes(REF_DEV), 'project ref leaked');
       assert.ok(!msg.includes(PASSWORD), 'password leaked');
       return true;
@@ -82,13 +104,16 @@ test('config: differing process and dotenv values are rejected as CONFLICT (name
         root,
         vars: {
           SUPABASE_PROJECT_REF: overriddenRef,
-          SUPABASE_DB_URL: `postgresql://postgres.${overriddenRef}:override-password@aws-0-eu-west-1.pooler.supabase.com:6543/postgres?sslmode=require`,
+          SUPABASE_SHARED_POOLER_URL: sharedPoolerUrl(overriddenRef, {
+            host: 'aws-0-eu-west-1.pooler.supabase.com',
+            port: '5432',
+          }),
         },
       }),
     (err) => {
       assert.ok(err instanceof ConfigError);
       assert.ok(err.message.includes(`${CONFLICT_PREFIX} SUPABASE_PROJECT_REF`), err.message);
-      assert.ok(err.message.includes(`${CONFLICT_PREFIX} SUPABASE_DB_URL`), err.message);
+      assert.ok(err.message.includes(`${CONFLICT_PREFIX} SUPABASE_SHARED_POOLER_URL`), err.message);
       assert.ok(!err.message.includes(overriddenRef), 'process value leaked');
       assert.ok(!err.message.includes('override-password'), 'process password leaked');
       assert.ok(!err.message.includes(PASSWORD), 'file value leaked');
@@ -229,7 +254,7 @@ test('config: a present dotenv file that omits CLOUDFLARE_ACCOUNT_ID fails close
     vars: {
       BACKUP_ENVIRONMENT: 'development',
       SUPABASE_PROJECT_REF: REF_DEV,
-      SUPABASE_DB_URL: `postgresql://postgres.${REF_DEV}:${PASSWORD}@aws-0-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require`,
+      SUPABASE_SHARED_POOLER_URL: sharedPoolerUrl(REF_DEV),
       CLOUDFLARE_ACCOUNT_ID: accountId,
       R2_BUCKET: 'development',
       R2_ACCESS_KEY_ID: 'dev-access-key-12345',
@@ -295,12 +320,12 @@ test('config: CLOUDFLARE_ACCOUNT_ID falls back to the process export only when N
 
 test('config: missing variables identify names, not values', () => {
   const root = makeRoot();
-  devFile(root, { SUPABASE_DB_URL: undefined });
+  devFile(root, { SUPABASE_SHARED_POOLER_URL: undefined });
   assert.throws(
     () => loadBackupConfig({ environment: 'development', root, vars: {} }),
     (err) => {
       assert.ok(err instanceof ConfigError);
-      assert.ok(err.message.includes('SUPABASE_DB_URL'));
+      assert.ok(err.message.includes('SUPABASE_SHARED_POOLER_URL'));
       assert.ok(!err.message.includes('postgres'));
       assert.ok(!err.message.includes(PASSWORD));
       return true;
@@ -322,12 +347,11 @@ test('config: mismatched bucket/environment fails', () => {
     },
   );
   // The fixed mapping also rejects the complementary mismatch.
-  devFile(root, { R2_BUCKET: 'development', BACKUP_ENVIRONMENT: 'development' });
   const prod = makeRoot();
   writeEnv(prod, 'production', {
     BACKUP_ENVIRONMENT: 'production',
     SUPABASE_PROJECT_REF: REF_PROD,
-    SUPABASE_DB_URL: `postgresql://postgres.${REF_PROD}:${PASSWORD}@aws-0-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require`,
+    SUPABASE_SHARED_POOLER_URL: sharedPoolerUrl(REF_PROD),
     CLOUDFLARE_ACCOUNT_ID: '0123456789abcdef0123456789abcdef',
     R2_BUCKET: 'development',
     R2_ACCESS_KEY_ID: 'prod-access-key-12345',
@@ -342,16 +366,16 @@ test('config: mismatched bucket/environment fails', () => {
   fs.rmSync(prod, { recursive: true, force: true });
 });
 
-test('config: mismatched project ref / DB URL fails', () => {
+test('config: mismatched project ref / shared pooler URL fails', () => {
   const root = makeRoot();
   devFile(root, {
-    SUPABASE_DB_URL: `postgresql://postgres.${REF_PROD}:${PASSWORD}@aws-0-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require`,
+    SUPABASE_SHARED_POOLER_URL: sharedPoolerUrl(REF_PROD),
   });
   assert.throws(
     () => loadBackupConfig({ environment: 'development', root, vars: {} }),
     (err) => {
       assert.ok(err instanceof ConfigError);
-      assert.ok(err.message.includes('SUPABASE_DB_URL'), err.message);
+      assert.ok(err.message.includes('SUPABASE_SHARED_POOLER_URL'), err.message);
       assert.ok(!err.message.includes(REF_PROD));
       assert.ok(!err.message.includes(PASSWORD));
       return true;
@@ -361,112 +385,247 @@ test('config: mismatched project ref / DB URL fails', () => {
 });
 
 test('config: urlPassword extracts the embedded password and never throws', () => {
-  const dbUrl = `postgresql://postgres.${REF_DEV}:${PASSWORD}@aws-0-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require`;
+  const dbUrl = sharedPoolerUrl(REF_DEV);
   assert.equal(urlPassword(dbUrl), PASSWORD);
   assert.equal(urlPassword('not a url at all'), null);
   // A URL without a password yields an empty string (falsy, filtered by callers).
   assert.equal(urlPassword(`postgresql://postgres.${REF_DEV}@db.example.com:5432/postgres`), '');
 });
 
-test('config: direct and pooler URLs validate correctly', () => {
-  const direct = `postgres://postgres:${PASSWORD}@db.${REF_DEV}.supabase.co:5432/postgres?sslmode=require`;
-  const pooler = `postgresql://postgres.${REF_DEV}:${PASSWORD}@aws-0-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require`;
-  const legacyPooler = `postgresql://postgres.${REF_DEV}:${PASSWORD}@db.${REF_DEV}.supabase.co:6543/postgres?sslmode=require`;
-  const root = makeRoot();
-  for (const dbUrl of [direct, pooler, legacyPooler]) {
-    devFile(root, { SUPABASE_DB_URL: dbUrl });
-    const cfg = loadBackupConfig({ environment: 'development', root, vars: {} });
-    assert.equal(cfg.dbUrl, dbUrl);
+test('config: classifySharedPoolerUrl accepts the canonical Session forms', () => {
+  // Explicit port 5432.
+  let res = classifySharedPoolerUrl(
+    `postgresql://postgres.${REF_DEV}:${PASSWORD}@aws-1-eu-west-3.pooler.supabase.com:5432/postgres?sslmode=require`,
+    REF_DEV,
+  );
+  assert.deepEqual(res, { ok: true });
+  // Omitted port resolves to the effective PostgreSQL port 5432.
+  res = classifySharedPoolerUrl(
+    `postgres://postgres.${REF_DEV}:${PASSWORD}@aws-1-eu-central-1.pooler.supabase.com/postgres?sslmode=verify-ca`,
+    REF_DEV,
+  );
+  assert.deepEqual(res, { ok: true });
+  // Every secure sslmode is accepted.
+  for (const sslmode of ['require', 'verify-ca', 'verify-full']) {
+    res = classifySharedPoolerUrl(sharedPoolerUrl(REF_DEV, { sslmode }), REF_DEV);
+    assert.equal(res.ok, true, sslmode);
   }
-  fs.rmSync(root, { recursive: true, force: true });
+  // Host case normalization: uppercase host still classifies.
+  res = classifySharedPoolerUrl(
+    `postgresql://postgres.${REF_DEV}:${PASSWORD}@AWS-1-EU-WEST-3.POOLER.SUPABASE.COM:5432/postgres?sslmode=require`,
+    REF_DEV,
+  );
+  assert.equal(res.ok, true);
+  // Exact project-ref match in the username is required.
+  res = classifySharedPoolerUrl(sharedPoolerUrl(REF_DEV, { user: `postgres.${REF_DEV}` }), REF_DEV);
+  assert.equal(res.ok, true);
 });
 
-test('config: classifyDbUrl reports every failure code without echoing the URL', () => {
+test('config: classifySharedPoolerUrl reports every failure code without echoing the URL', () => {
   const mk = (user, host, port, ssl = '?sslmode=require') =>
     `postgresql://${user}:${PASSWORD}@${host}:${port}/postgres${ssl}`;
   const cases = [
     ['unparsable', 'not a url at all::'],
     [
       'scheme',
-      `https://postgres.${REF_DEV}:${PASSWORD}@pooler.supabase.com:6543/postgres?sslmode=require`,
+      `https://postgres.${REF_DEV}:${PASSWORD}@pooler.supabase.com:5432/postgres?sslmode=require`,
     ],
-    ['ssl', mk('postgres', `db.${REF_DEV}.supabase.co`, 5432, '')],
-    [
-      'username',
-      `postgresql://:${PASSWORD}@db.${REF_DEV}.supabase.co:5432/postgres?sslmode=require`,
-    ],
-    ['password', `postgresql://postgres@db.${REF_DEV}.supabase.co:5432/postgres?sslmode=require`],
+    ['ssl', mk(`postgres.${REF_DEV}`, POOLER_HOST, 5432, '')],
+    ['ssl', mk(`postgres.${REF_DEV}`, POOLER_HOST, 5432, '?sslmode=disable')],
+    ['ssl', mk(`postgres.${REF_DEV}`, POOLER_HOST, 5432, '?sslmode=allow')],
+    ['ssl', mk(`postgres.${REF_DEV}`, POOLER_HOST, 5432, '?sslmode=prefer')],
+    ['ssl', mk(`postgres.${REF_DEV}`, POOLER_HOST, 5432, '?sslmode=unknown')],
+    ['username', `postgresql://:${PASSWORD}@${POOLER_HOST}:5432/postgres?sslmode=require`],
+    ['password', `postgresql://postgres.${REF_DEV}@${POOLER_HOST}:5432/postgres?sslmode=require`],
     ['host', mk('postgres', 'my-own-db.example.com', 5432)],
-    ['pooler-port', mk(`postgres.${REF_DEV}`, 'aws-0-us-east-1.pooler.supabase.com', 5432)],
+    // Direct supabase.co hosts (5432 direct and 6543 legacy pooler form).
+    ['host', mk('postgres', `db.${REF_DEV}.supabase.co`, 5432)],
+    ['host', mk(`postgres.${REF_DEV}`, `db.${REF_DEV}.supabase.co`, 6543)],
+    // A transaction user on the transaction port reports the user form first.
+    ['transaction-pooler', mk(`postgres.${REF_DEV}.transaction`, POOLER_HOST, 6543)],
+    ['pooler-port', mk(`postgres.${REF_DEV}`, POOLER_HOST, 6543)],
+    ['transaction-pooler', mk(`postgres.${REF_DEV}.transaction`, POOLER_HOST, 5432)],
+    // libpq parses query options and lets later values override earlier
+    // connection settings, so anything beyond exactly one sslmode is unsafe.
     [
-      'transaction-pooler',
-      mk(`postgres.${REF_DEV}.transaction`, 'aws-0-us-east-1.pooler.supabase.com', 6543),
+      'params',
+      mk(`postgres.${REF_DEV}`, POOLER_HOST, 5432, '?sslmode=require&host=evil.example.com'),
     ],
-    ['pooler-user', mk('someone-else', 'aws-0-us-east-1.pooler.supabase.com', 6543)],
+    ['params', mk(`postgres.${REF_DEV}`, POOLER_HOST, 5432, '?sslmode=require&port=6543')],
+    ['params', mk(`postgres.${REF_DEV}`, POOLER_HOST, 5432, '?sslmode=require&sslmode=disable')],
+    [
+      'params',
+      mk(`postgres.${REF_DEV}`, POOLER_HOST, 5432, '?sslmode=require&dbname=other_database'),
+    ],
+    ['params', mk(`postgres.${REF_DEV}`, POOLER_HOST, 5432, '?sslmode=require&foo=1')],
+    [
+      'params',
+      `postgresql://postgres.${REF_DEV}:${PASSWORD}@${POOLER_HOST}:5432/postgres?host=evil.example.com`,
+    ],
+    // A comma-separated authority is a libpq multi-host list, not one host.
+    [
+      'multihost',
+      mk(`postgres.${REF_DEV}`, 'evil.example.com,aws-0-us-east-1.pooler.supabase.com', 5432),
+    ],
+    // Only the canonical /postgres database is accepted.
+    [
+      'dbname',
+      `postgresql://postgres.${REF_DEV}:${PASSWORD}@${POOLER_HOST}:5432/other_database?sslmode=require`,
+    ],
+    ['dbname', `postgresql://postgres.${REF_DEV}:${PASSWORD}@${POOLER_HOST}:5432?sslmode=require`],
+    ['dbname', `postgresql://postgres.${REF_DEV}:${PASSWORD}@${POOLER_HOST}:5432/?sslmode=require`],
+    ['pooler-user', mk('postgres', POOLER_HOST, 5432)],
+    ['pooler-user', mk(`postgres.${REF_PROD}`, POOLER_HOST, 5432)],
+    ['pooler-user', mk(`postgres.${REF_DEV}.session`, POOLER_HOST, 5432)],
+    ['pooler-user', mk('someone-else', POOLER_HOST, 5432)],
   ];
   for (const [code, input] of cases) {
-    assert.deepEqual(classifyDbUrl(input, REF_DEV), { ok: false, code }, code);
+    assert.deepEqual(classifySharedPoolerUrl(input, REF_DEV), { ok: false, code }, code);
   }
 });
 
-test('config: classifyDbUrl recognizes direct and pooler kinds', () => {
-  const PW = PASSWORD;
-  assert.equal(
-    classifyDbUrl(
-      `postgres://postgres:${PW}@db.${REF_DEV}.supabase.co:5432/postgres?sslmode=require`,
-      REF_DEV,
-    ).kind,
-    'direct',
-  );
-  assert.equal(
-    classifyDbUrl(
-      `postgresql://postgres.${REF_DEV}.session:${PW}@aws-0-eu-west-1.pooler.supabase.com:6543/postgres?sslmode=require`,
-      REF_DEV,
-    ).kind,
-    'pooler',
-  );
-  assert.equal(
-    classifyDbUrl(
-      `postgresql://postgres.${REF_DEV}:${PW}@db.${REF_DEV}.supabase.co:6543/postgres?sslmode=require`,
-      REF_DEV,
-    ).kind,
-    'pooler',
-  );
-  // Mismatched project ref in the username is still a valid pooler shape for
-  // the supplied ref only when the ref matches the username.
-  assert.equal(
-    classifyDbUrl(
-      `postgresql://postgres.${REF_DEV}:${PW}@aws-0-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require`,
-      REF_DEV,
-    ).ok,
-    true,
-  );
-});
-
-test('config: transaction pooler, non-SSL, and foreign hosts are rejected', () => {
-  const txPooler = `postgresql://postgres.${REF_DEV}.transaction:${PASSWORD}@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require`;
-  const noSsl = `postgresql://postgres.${REF_DEV}:${PASSWORD}@aws-0-us-east-1.pooler.supabase.com:6543/postgres`;
-  const sslDisabled = `postgresql://postgres.${REF_DEV}:${PASSWORD}@aws-0-us-east-1.pooler.supabase.com:6543/postgres?sslmode=disable`;
-  const foreign = `postgresql://postgres.${REF_DEV}:${PASSWORD}@my-own-db.example.com:5432/postgres?sslmode=require`;
-  const httpScheme = `https://postgres.${REF_DEV}:${PASSWORD}@pooler.supabase.com:6543/postgres?sslmode=require`;
-  const unparsable = `not a url at all::`;
+test('config: every rejected hosted URL fails configuration without leaking', () => {
   const root = makeRoot();
-  for (const dbUrl of [txPooler, noSsl, sslDisabled, foreign, httpScheme, unparsable]) {
-    devFile(root, { SUPABASE_DB_URL: dbUrl });
+  // One representative case per failure class; the exhaustive matrix lives at
+  // the classifier layer. Effective-target invariants (multi-host, query
+  // overrides, wrong database) are covered here because they are the
+  // user-facing gate.
+  const cases = [
+    {
+      name: 'transaction pooler',
+      url: sharedPoolerUrl(REF_DEV, { user: `postgres.${REF_DEV}.transaction` }),
+    },
+    { name: 'plain postgres user', url: sharedPoolerUrl(REF_DEV, { user: 'postgres' }) },
+    { name: 'transaction port 6543', url: sharedPoolerUrl(REF_DEV, { port: '6543' }) },
+    {
+      name: 'direct 5432',
+      url: `postgres://postgres:${PASSWORD}@db.${REF_DEV}.supabase.co:5432/postgres?sslmode=require`,
+    },
+    { name: 'foreign host', url: sharedPoolerUrl(REF_DEV, { host: 'my-own-db.example.com' }) },
+    { name: 'ssl disable', url: sharedPoolerUrl(REF_DEV, { sslmode: 'disable' }) },
+    {
+      name: 'query override',
+      url: sharedPoolerUrl(REF_DEV, { sslmode: 'require&host=evil.example.com' }),
+    },
+    {
+      name: 'multi-host authority',
+      url: `postgresql://postgres.${REF_DEV}:${PASSWORD}@evil.example.com,${POOLER_HOST}:5432/postgres?sslmode=require`,
+    },
+    {
+      name: 'wrong database path',
+      url: `postgresql://postgres.${REF_DEV}:${PASSWORD}@${POOLER_HOST}:5432/other_database?sslmode=require`,
+    },
+    { name: 'unparsable', url: 'not a url at all::' },
+    {
+      name: 'missing password',
+      url: `postgresql://postgres.${REF_DEV}@${POOLER_HOST}:5432/postgres?sslmode=require`,
+    },
+  ];
+  for (const { name, url } of cases) {
+    devFile(root, { SUPABASE_SHARED_POOLER_URL: url });
     assert.throws(
       () => loadBackupConfig({ environment: 'development', root, vars: {} }),
       (err) => {
-        assert.ok(err instanceof ConfigError, dbUrl);
-        assert.ok(err.message.includes('SUPABASE_DB_URL'), dbUrl);
-        if (dbUrl.includes('@')) {
-          assert.ok(!err.message.includes(dbUrl.split('@')[1]), 'url leaked');
-        }
-        assert.ok(!err.message.includes(PASSWORD), 'password leaked');
+        assert.ok(err instanceof ConfigError, name);
+        assert.ok(err.message.includes('SUPABASE_SHARED_POOLER_URL'), name);
+        assertNoLeak(err, PASSWORD, REF_DEV);
         return true;
       },
-      dbUrl,
+      name,
     );
   }
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: the legacy SUPABASE_DB_URL variable is rejected by every hosted consumer', () => {
+  const legacy = `postgresql://postgres.${REF_DEV}:${PASSWORD}@${POOLER_HOST}:6543/postgres?sslmode=require`;
+  const root = makeRoot();
+  // Backup (file source).
+  devFile(root, { SUPABASE_DB_URL: legacy });
+  assert.throws(
+    () => loadBackupConfig({ environment: 'development', root, vars: {} }),
+    (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(
+        err.message.includes('UNSUPPORTED SUPABASE_DB_URL (rename to SUPABASE_SHARED_POOLER_URL)'),
+        err.message,
+      );
+      assertNoLeak(err);
+      return true;
+    },
+  );
+  // Hosted restore sources (r2/repo/local).
+  for (const source of ['r2', 'repo', 'local']) {
+    assert.throws(
+      () => loadHostedRestoreConfig({ environment: 'development', source, root, vars: {} }),
+      (err) => {
+        assert.ok(err instanceof ConfigError, source);
+        assert.ok(err.message.includes('UNSUPPORTED SUPABASE_DB_URL'), source);
+        return true;
+      },
+      source,
+    );
+  }
+  // Process source for a hosted consumer, with the new variable also present:
+  // stale configuration must still fail (the check is not scoped to absence).
+  devFile(root, {
+    SUPABASE_DB_URL: undefined,
+    SUPABASE_SHARED_POOLER_URL: sharedPoolerUrl(REF_DEV),
+  });
+  assert.throws(
+    () =>
+      loadBackupConfig({
+        environment: 'development',
+        root,
+        vars: {
+          SUPABASE_DB_URL: legacy,
+          SUPABASE_SHARED_POOLER_URL: sharedPoolerUrl(REF_DEV),
+        },
+      }),
+    (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(
+        err.message.includes('UNSUPPORTED SUPABASE_DB_URL (rename to SUPABASE_SHARED_POOLER_URL)'),
+        err.message,
+      );
+      assertNoLeak(err);
+      return true;
+    },
+  );
+  // The old variable alone, new field absent entirely.
+  assert.throws(
+    () =>
+      loadBackupConfig({
+        environment: 'development',
+        root,
+        vars: {
+          SUPABASE_PROJECT_REF: REF_DEV,
+          SUPABASE_DB_URL: legacy,
+        },
+      }),
+    (err) => err instanceof ConfigError && err.message.includes('UNSUPPORTED SUPABASE_DB_URL'),
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: loadLocalBackupConfig ignores hosted URL fields entirely', () => {
+  const root = makeRoot();
+  devFile(root, {
+    SUPABASE_DB_URL: `postgresql://postgres.${REF_DEV}:${PASSWORD}@${POOLER_HOST}:6543/postgres?sslmode=require`,
+    SUPABASE_SHARED_POOLER_URL: 'not-a-valid-pooler-url',
+  });
+  const cfg = loadLocalBackupConfig({
+    environment: 'development',
+    root,
+    vars: {
+      SUPABASE_DB_URL: 'another-stale-value',
+      SUPABASE_SHARED_POOLER_URL: 'also-not-valid',
+    },
+  });
+  assert.equal(cfg.environment, 'development');
+  assert.equal(cfg.projectRef, REF_DEV);
+  assert.ok(!Object.hasOwn(cfg, 'sharedPoolerUrl'), 'hosted URL must not be exposed');
+  assert.ok(!Object.hasOwn(cfg, 'dbUrl'), 'legacy key must not be exposed');
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -562,7 +721,8 @@ test('config: local backup succeeds with only its own requirements', () => {
 test('config: local backup returns only consumed fields', () => {
   const root = makeRoot();
   devFile(root, {
-    SUPABASE_DB_URL: 'not-a-url',
+    SUPABASE_SHARED_POOLER_URL: 'not-a-url',
+    SUPABASE_DB_URL: 'legacy-not-a-url',
     CLOUDFLARE_ACCOUNT_ID: 'not-an-account-id',
     R2_ACCESS_KEY_ID: 'x',
     R2_SECRET_ACCESS_KEY: 'y',
@@ -575,7 +735,8 @@ test('config: local backup returns only consumed fields', () => {
     environment: 'development',
     root,
     vars: {
-      SUPABASE_DB_URL: 'also-not-a-url',
+      SUPABASE_SHARED_POOLER_URL: 'also-not-a-url',
+      SUPABASE_DB_URL: 'also-legacy',
       R2_ACCESS_KEY_ID: 'z',
       R2_SECRET_ACCESS_KEY: 'q',
       R2_BUCKET: 'not-development',
@@ -590,6 +751,7 @@ test('config: local backup returns only consumed fields', () => {
     projectWorkdir: path.resolve(root, '../project'),
   });
   for (const name of [
+    'sharedPoolerUrl',
     'dbUrl',
     'accountId',
     'bucket',
@@ -722,10 +884,7 @@ test('config: hosted local-source restore consumes only ref, URL, and environmen
   });
   assert.equal(cfg.environment, 'development');
   assert.equal(cfg.projectRef, REF_DEV);
-  assert.equal(
-    cfg.dbUrl,
-    `postgresql://postgres.${REF_DEV}:${PASSWORD}@aws-0-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require`,
-  );
+  assert.equal(cfg.sharedPoolerUrl, sharedPoolerUrl(REF_DEV));
   assert.equal(cfg.projectWorkdir, undefined);
   for (const name of [
     'accountId',
@@ -741,12 +900,12 @@ test('config: hosted local-source restore consumes only ref, URL, and environmen
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('config: hosted local source requires target URL and ref, and ignores R2 disagreements', () => {
+test('config: hosted local source requires shared pooler URL and ref, and ignores R2 disagreements', () => {
   const root = makeRoot();
-  devFile(root, { SUPABASE_DB_URL: undefined });
+  devFile(root, { SUPABASE_SHARED_POOLER_URL: undefined });
   assert.throws(
     () => loadHostedRestoreConfig({ environment: 'development', source: 'local', root, vars: {} }),
-    (err) => err instanceof ConfigError && err.message.includes('SUPABASE_DB_URL'),
+    (err) => err instanceof ConfigError && err.message.includes('SUPABASE_SHARED_POOLER_URL'),
   );
   devFile(root, { SUPABASE_PROJECT_REF: undefined });
   assert.throws(
@@ -777,6 +936,27 @@ test('config: unknown environment values are rejected', () => {
     () => loadBackupConfig({ environment: 'staging', root, vars: {} }),
     (err) => err instanceof ConfigError && err.message.includes('environment'),
   );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: process-only hosted configuration works without any dotenv file', () => {
+  const root = makeRoot();
+  const cfg = loadBackupConfig({
+    environment: 'development',
+    root,
+    vars: {
+      BACKUP_ENVIRONMENT: 'development',
+      SUPABASE_PROJECT_REF: REF_DEV,
+      SUPABASE_SHARED_POOLER_URL: sharedPoolerUrl(REF_DEV),
+      CLOUDFLARE_ACCOUNT_ID: '0123456789abcdef0123456789abcdef',
+      R2_BUCKET: 'development',
+      R2_ACCESS_KEY_ID: 'dev-access-key-12345',
+      R2_SECRET_ACCESS_KEY: 'dev-secret-key-abcdefghijklmnop',
+      ENCRYPT_KEY: 'age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+    },
+  });
+  assert.equal(cfg.sharedPoolerUrl, sharedPoolerUrl(REF_DEV));
+  assert.equal(cfg.environment, 'development');
   fs.rmSync(root, { recursive: true, force: true });
 });
 

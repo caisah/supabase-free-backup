@@ -48,6 +48,21 @@ const R2_SECRET_MIN = 16;
 const AGE_RECIPIENT_SHAPE = /^age1[a-z0-9]{38,65}$/;
 const AGE_IDENTITY_SHAPE = /^AGE-SECRET-KEY-[A-Z0-9]{30,100}$/;
 
+/** The only SSL modes accepted for hosted connections. */
+const SECURE_SSL_MODES = new Set(['require', 'verify-ca', 'verify-full']);
+
+/** Host suffix of the Shared Session Pooler endpoint. */
+const POOLER_HOST_SUFFIX = '.pooler.supabase.com';
+
+/** The only port the Shared Session Pooler listens on. */
+const SHARED_POOLER_PORT = '5432';
+
+/** The only database path the dashboard pooler contract exposes. */
+const POOLER_DATABASE_PATH = '/postgres';
+
+/** Literal legacy hosted-connection variable name (hard-cutover gate only). */
+export const LEGACY_DB_URL_VARIABLE = 'SUPABASE_DB_URL';
+
 /** Stable diagnostic keyword for source disagreements; shared with tests. */
 export const CONFLICT_PREFIX = 'CONFLICT';
 
@@ -82,8 +97,16 @@ function parseDbUrl(input) {
   if (parsed.protocol !== 'postgres:' && parsed.protocol !== 'postgresql:') {
     return { ok: false, code: 'scheme' };
   }
-  const sslmode = parsed.searchParams.get('sslmode');
-  if (sslmode == null || ['disable', 'allow', 'prefer'].includes(sslmode)) {
+  // libpq parses the query as connection options and lets later values
+  // override earlier ones, so the WHATWG view of the URL must not be
+  // trusted: no parameter other than exactly one sslmode is allowed.
+  const params = [...parsed.searchParams];
+  const hasOnlySslmode = params.length === 1 && params[0][0] === 'sslmode';
+  if (params.length > 0 && !hasOnlySslmode) {
+    return { ok: false, code: 'params' };
+  }
+  const sslmode = hasOnlySslmode ? params[0][1] : null;
+  if (sslmode == null || !SECURE_SSL_MODES.has(sslmode)) {
     return { ok: false, code: 'ssl' };
   }
   let user;
@@ -97,52 +120,35 @@ function parseDbUrl(input) {
   return { ok: true, user, parsed };
 }
 
-/** Project-specific supabase.co host: direct (5432/postgres) or legacy pooler (6543). */
-function classifyDirectHost({ parsed, user, projectRef }) {
-  const host = parsed.hostname.toLowerCase();
-  const port = parsed.port || '5432';
-  const directHost = `db.${projectRef}.supabase.co`;
-
-  if (host === directHost && port === '5432' && user === 'postgres') {
-    return { ok: true, kind: 'direct', parsed };
-  }
-  if (host === directHost && port === '6543' && user === `postgres.${projectRef}`) {
-    return { ok: true, kind: 'pooler', parsed };
-  }
-  return null;
-}
-
-/** Session-pooler host classification: port, and user form checks. */
-function classifyPoolerHost({ parsed, user, projectRef }) {
-  const host = parsed.hostname.toLowerCase();
-  const port = parsed.port || '5432';
-  if (!host.endsWith('.pooler.supabase.com')) return null;
-  if (port !== '6543') return { ok: false, code: 'pooler-port' };
-  if (user === `postgres.${projectRef}` || user === `postgres.${projectRef}.session`) {
-    return { ok: true, kind: 'pooler', parsed };
-  }
-  if (user === `postgres.${projectRef}.transaction`) {
-    return { ok: false, code: 'transaction-pooler' };
-  }
-  return { ok: false, code: 'pooler-user' };
-}
-
 /**
- * Classify a Supabase PostgreSQL connection URL against a project reference.
- * Never includes any part of the URL in its return values.
+ * Classify a hosted Supabase connection URL against a project reference as a
+ * Shared Session Pooler connection. Only the one canonical form is accepted:
+ * `postgres://postgres.<project-ref>:<password>@<pool>.pooler.supabase.com:5432/postgres?sslmode=...`
+ * with exactly one secure sslmode parameter, no multi-host authority, and the
+ * canonical `/postgres` database. Static failure codes only; never includes
+ * any part of the URL or a derived host.
  */
-export function classifyDbUrl(input, projectRef) {
+export function classifySharedPoolerUrl(input, projectRef) {
   const parsed = parseDbUrl(input);
   if (!parsed.ok) return { ok: false, code: parsed.code };
-  const direct = classifyDirectHost({ parsed: parsed.parsed, user: parsed.user, projectRef });
-  if (direct) return direct;
-  const pooler = classifyPoolerHost({ parsed: parsed.parsed, user: parsed.user, projectRef });
-  if (pooler) return pooler;
-  return { ok: false, code: 'host' };
+  const { user, parsed: url } = parsed;
+  const host = url.hostname.toLowerCase();
+  const port = url.port || SHARED_POOLER_PORT;
+  // A comma-separated authority is a libpq multi-host list: the suffix check
+  // below would pass while libpq connects to the first listed host.
+  if (host.includes(',')) return { ok: false, code: 'multihost' };
+  // libpq derives the target database from the path; a different database
+  // would let backup/restore protect the wrong target.
+  if (url.pathname !== POOLER_DATABASE_PATH) return { ok: false, code: 'dbname' };
+  if (!host.endsWith(POOLER_HOST_SUFFIX)) return { ok: false, code: 'host' };
+  if (user.endsWith('.transaction')) return { ok: false, code: 'transaction-pooler' };
+  if (port !== SHARED_POOLER_PORT) return { ok: false, code: 'pooler-port' };
+  if (user !== `postgres.${projectRef}`) return { ok: false, code: 'pooler-user' };
+  return { ok: true };
 }
 
-const DB_URL_PROBLEM =
-  'INVALID SUPABASE_DB_URL (must be a Supabase session-pooler or matching direct URL with SSL)';
+const SHARED_POOLER_URL_PROBLEM =
+  'INVALID SUPABASE_SHARED_POOLER_URL (must be a Supabase Shared Session Pooler URL on port 5432 for the matching project reference, with a secure sslmode)';
 
 // Zod-backed per-variable schemas. Every message is static: variable names only.
 function fieldSchema(name, options = {}) {
@@ -168,7 +174,7 @@ const VARIABLE_SCHEMAS = {
     shape: PROJECT_REF_SHAPE,
     hint: 'expected 20 lowercase alphanumeric characters',
   }),
-  SUPABASE_DB_URL: fieldSchema('SUPABASE_DB_URL'),
+  SUPABASE_SHARED_POOLER_URL: fieldSchema('SUPABASE_SHARED_POOLER_URL'),
   [CLOUDFLARE_ACCOUNT_ID]: fieldSchema(CLOUDFLARE_ACCOUNT_ID, {
     shape: ACCOUNT_ID_SHAPE,
     hint: 'expected 32 hexadecimal characters',
@@ -242,7 +248,7 @@ function collectConflictProblems({ requirements, filePath, vars, fileValues }) {
 function conflictScopedNames(requirements) {
   const names = ['BACKUP_ENVIRONMENT'];
   if (requirements.projectRef) names.push('SUPABASE_PROJECT_REF');
-  if (requirements.dbUrl) names.push('SUPABASE_DB_URL');
+  if (requirements.sharedPoolerUrl) names.push('SUPABASE_SHARED_POOLER_URL');
   if (requirements.accountId) names.push(CLOUDFLARE_ACCOUNT_ID);
   if (requirements.r2) names.push('R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET');
   if (requirements.ageRecipient) names.push('ENCRYPT_KEY');
@@ -291,8 +297,8 @@ function collectRequirementProblems({ requirements, resolved }) {
   if (requirements.projectRef && !resolved.SUPABASE_PROJECT_REF) {
     problems.push('MISSING SUPABASE_PROJECT_REF');
   }
-  if (requirements.dbUrl && !resolved.SUPABASE_DB_URL) {
-    problems.push('MISSING SUPABASE_DB_URL');
+  if (requirements.sharedPoolerUrl && !resolved.SUPABASE_SHARED_POOLER_URL) {
+    problems.push('MISSING SUPABASE_SHARED_POOLER_URL');
   }
   if (requirements.accountId && !resolved.CLOUDFLARE_ACCOUNT_ID) {
     problems.push('MISSING CLOUDFLARE_ACCOUNT_ID');
@@ -314,7 +320,23 @@ function collectRequirementProblems({ requirements, resolved }) {
   return problems;
 }
 
-/** Cross-field checks: bucket/environment mapping and DB URL classification. */
+/**
+ * Hard-cutover diagnostic for the legacy hosted-connection variable. Runs
+ * only when the selected operation consumes a hosted Shared Pooler URL;
+ * inspects BOTH process and dotenv sources; never resolves or returns the
+ * old value; fails even when the new field is also present so stale
+ * configuration cannot silently linger. Reports variable names only.
+ */
+function collectLegacyVariableProblems({ requirements, vars, fileValues }) {
+  if (!requirements.sharedPoolerUrl) return [];
+  const present =
+    (typeof vars[LEGACY_DB_URL_VARIABLE] === 'string' && vars[LEGACY_DB_URL_VARIABLE].length > 0) ||
+    (typeof fileValues[LEGACY_DB_URL_VARIABLE] === 'string' &&
+      fileValues[LEGACY_DB_URL_VARIABLE].length > 0);
+  return present ? ['UNSUPPORTED SUPABASE_DB_URL (rename to SUPABASE_SHARED_POOLER_URL)'] : [];
+}
+
+/** Cross-field checks: bucket/environment mapping and Shared Pooler URL classification. */
 function collectCrossFieldProblems({ environment, requirements, resolved }) {
   const problems = [];
   if (
@@ -324,9 +346,12 @@ function collectCrossFieldProblems({ environment, requirements, resolved }) {
   ) {
     problems.push('INVALID R2_BUCKET (must equal the selected environment)');
   }
-  if (resolved.SUPABASE_DB_URL && resolved.SUPABASE_PROJECT_REF) {
-    const classified = classifyDbUrl(resolved.SUPABASE_DB_URL, resolved.SUPABASE_PROJECT_REF);
-    if (!classified.ok) problems.push(DB_URL_PROBLEM);
+  if (resolved.SUPABASE_SHARED_POOLER_URL && resolved.SUPABASE_PROJECT_REF) {
+    const classified = classifySharedPoolerUrl(
+      resolved.SUPABASE_SHARED_POOLER_URL,
+      resolved.SUPABASE_PROJECT_REF,
+    );
+    if (!classified.ok) problems.push(SHARED_POOLER_URL_PROBLEM);
   }
   return problems;
 }
@@ -361,7 +386,7 @@ function buildOperationConfig({ environment, requirements, resolved, projectWork
   const config = {
     environment,
     projectRef: resolved.SUPABASE_PROJECT_REF,
-    dbUrl: resolved.SUPABASE_DB_URL ? resolved.SUPABASE_DB_URL : undefined,
+    sharedPoolerUrl: resolved.SUPABASE_SHARED_POOLER_URL,
     accountId: resolved.CLOUDFLARE_ACCOUNT_ID,
     bucket: resolved.R2_BUCKET,
     accessKeyId: resolved.R2_ACCESS_KEY_ID,
@@ -377,7 +402,7 @@ function buildOperationConfig({ environment, requirements, resolved, projectWork
 
   const scoped = { environment };
   if (requirements.projectRef) scoped.projectRef = config.projectRef;
-  if (requirements.dbUrl) scoped.dbUrl = config.dbUrl;
+  if (requirements.sharedPoolerUrl) scoped.sharedPoolerUrl = config.sharedPoolerUrl;
   if (requirements.accountId) {
     scoped.accountId = config.accountId;
     scoped.r2Endpoint = config.r2Endpoint;
@@ -395,7 +420,7 @@ function buildOperationConfig({ environment, requirements, resolved, projectWork
 
 const BACKUP_REQUIREMENTS = {
   projectRef: true,
-  dbUrl: true,
+  sharedPoolerUrl: true,
   accountId: true,
   r2: true,
   ageRecipient: true,
@@ -410,11 +435,11 @@ const LOCAL_BACKUP_REQUIREMENTS = {
 
 const HOSTED_RESTORE_REQUIREMENTS = {
   r2: { ...BACKUP_REQUIREMENTS, ageIdentity: true },
-  repo: { projectRef: true, dbUrl: true, ageRecipient: true, ageIdentity: true },
+  repo: { projectRef: true, sharedPoolerUrl: true, ageRecipient: true, ageIdentity: true },
   // Plaintext local-store snapshots need target URL + ref only; the local
   // path is plaintext-only (the legacy encrypted-local compatibility claim
   // was removed together with the pre-single-store layout).
-  local: { projectRef: true, dbUrl: true, consumedOnly: true },
+  local: { projectRef: true, sharedPoolerUrl: true, consumedOnly: true },
 };
 
 function loadDotenvValues(filePath) {
@@ -485,7 +510,8 @@ export function loadOperationConfig({
   const resolved = resolveConfigFields({ vars, fileValues, fieldNames });
 
   // Problem ordering is contract: shape, source conflicts, selected
-  // environment, requirements, then cross-field relationships.
+  // environment, requirements, legacy-variable gate, then cross-field
+  // relationships.
   const problems = shapeProblems(resolved);
   problems.push(...collectConflictProblems({ requirements, filePath, vars, fileValues }));
   if (filePresent) {
@@ -493,6 +519,7 @@ export function loadOperationConfig({
   }
   problems.push(...selectedEnvironmentProblems({ environment, resolved }));
   problems.push(...collectRequirementProblems({ requirements, resolved }));
+  problems.push(...collectLegacyVariableProblems({ requirements, vars, fileValues }));
   problems.push(...collectCrossFieldProblems({ environment, requirements, resolved }));
 
   if (problems.length > 0) {

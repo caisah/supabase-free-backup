@@ -155,7 +155,7 @@ test('generate-age-keys: preserves existing content when appending keys', async 
   const root = tmpdir('age-keys-content-');
   const content = `BACKUP_ENVIRONMENT=development
 SUPABASE_PROJECT_REF=a1b2c3d4e5f6a7b8c9d0
-SUPABASE_DB_URL=postgresql://example.com
+SUPABASE_SHARED_POOLER_URL=postgresql://example.com
 `;
   writeEnvFile(root, 'development', content);
 

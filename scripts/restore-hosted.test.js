@@ -17,7 +17,7 @@ function runCli(name, args) {
 }
 
 const REF = 'a1b2c3d4e5f6a7b8c9d0';
-const DB_URL = `postgresql://postgres.${REF}:the-password@aws-0-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require`;
+const DB_URL = `postgresql://postgres.${REF}:the-password@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require`;
 
 function captureStream() {
   let text = '';
@@ -40,7 +40,7 @@ function fakeDeps(overrides = {}) {
       return {
         environment,
         source,
-        dbUrl: DB_URL,
+        sharedPoolerUrl: DB_URL,
         projectRef: REF,
         accountId: '0123456789abcdef0123456789abcdef',
         bucket: environment,
@@ -307,7 +307,7 @@ test('restore-hosted: local source needs no age binary or R2/age config', async 
     loadConfig: ({ environment, source }) => ({
       environment,
       source,
-      dbUrl: DB_URL,
+      sharedPoolerUrl: DB_URL,
       projectRef: REF,
     }),
     lookup: (name) => {
@@ -364,7 +364,7 @@ test('restore-hosted: local source never resolves age or receives an age identit
     loadConfig: ({ environment, source }) => ({
       environment,
       source,
-      dbUrl: DB_URL,
+      sharedPoolerUrl: DB_URL,
       projectRef: REF,
     }),
     lookup: (name) => {
@@ -438,7 +438,7 @@ test('restore-hosted: a local-source prepare failure surfaces the RestoreError',
     loadConfig: ({ environment, source }) => ({
       environment,
       source,
-      dbUrl: DB_URL,
+      sharedPoolerUrl: DB_URL,
       projectRef: REF,
     }),
     lookup: (name) => (name === 'age' || name === 'age.exe' ? null : process.execPath),
@@ -550,6 +550,17 @@ test('restore-hosted: preflight and execute receive the resolved Docker path and
   assert.equal(received.execute.dockerPath, fakeDockerPath);
   assert.equal(received.execute.postgresImage, PINNED_SUPABASE_POSTGRES_IMAGE);
   assert.equal(received.execute.supabasePath, process.execPath);
+  // The sharedPoolerUrl config field is mapped at the boundary to the generic
+  // lower-level dbUrl for both preflight and execute; no unrelated secret-
+  // bearing config is spread into the execute adapter.
+  assert.equal(received.execute.config.environment, 'development');
+  assert.equal(received.execute.config.dbUrl, DB_URL);
+  assert.equal(received.execute.config.repoRoot, '/repo');
+  assert.deepEqual(Object.keys(received.execute.config).sort(), [
+    'dbUrl',
+    'environment',
+    'repoRoot',
+  ]);
   const legacyKey = ['psql', 'Path'].join(''); // legacy seam name must not appear as a literal
   assert.ok(
     !(legacyKey in received.preflight) && !(legacyKey in received.execute),

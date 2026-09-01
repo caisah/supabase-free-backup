@@ -28,7 +28,7 @@ by storing daily (for the last week) db snapshots in Cloudflare R2 and a weekly 
 
 1. Create a separate private GitHub repository from this source. (A public fork remains public and cannot run backups.)
 2. Create `.env.production.local` and, if needed, `.env.development.local`; only production is mandatory. See [Configuration](#configuration).
-3. Set the required GitHub Actions variables and secrets (or use `github:configure` script).
+3. Set the required GitHub Actions variables and secrets (or use `github:configure` script). `github:configure` validates every local file first, inventories existing GitHub Environment secret names without reading values, upserts the approved variables/secrets, and finally deletes the legacy `SUPABASE_DB_URL` secret from each environment only after every environment completed all upserts (see [Supabase connection migration](#supabase-connection-migration)).
 
 ## Architecture
 
@@ -59,7 +59,7 @@ flowchart TD
 
 | Module (`src/`)                                      | Responsibility                                                                                                                                                                            |
 | ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `config.js`                                          | dotenv + process env loading, validation (session-pooler URL, bucket/env match)                                                                                                           |
+| `config.js`                                          | dotenv + process env loading, validation (Shared Session Pooler URL, bucket/env match, legacy-variable gate)                                                                             |
 | `database.js`                                        | Pinned Supabase CLI dump/diff, `supabase db reset` execution                                                                                                                              |
 | `backup.js`                                          | Shared dump/package mechanics: executable preflight, private workspace, dump-then-package                                                                                                 |
 | `snapshot.js`                                        | Snapshot packaging (encrypted or plaintext row-data codec) and the `manifest.json` written last (marks completion)                                                                        |
@@ -117,7 +117,7 @@ Configuration values (see [.env.example](.env.example)):
 | `BACKUPS_ENABLED`                           | GitHub Actions opt-in                       | must be set to `true` to enable automatic jobs; not consumed by local commands;                                              |
 | `BACKUP_ENVIRONMENT`                        | `development` \| `production`               | must match target (development for env.development.local & production from env.production.local)                             |
 | `SUPABASE_PROJECT_REF`                      | supabase project reference                  | the unique 20-character identifier for your Supabase project, shown as the last part of your dashboard URL (after /project/) |
-| `SUPABASE_DB_URL`                           | **session-pooler or matching direct**       | postgres://<USER>:<PASSWORD>@<HOST>:<PORT>/<DATABASE>?sslmode=require                                                        |
+| `SUPABASE_SHARED_POOLER_URL`                         | **Supabase Shared Session Pooler URL**     | copy the Session pooler value from Dashboard > Connect > Session pooler (`postgresql://postgres.<project-ref>:<password>@aws-<pool>-<region>.pooler.supabase.com:5432/postgres?sslmode=require`); direct `db.<...>.supabase.co` URLs and transaction-mode port `6543` are rejected; the legacy `SUPABASE_DB_URL` name is rejected |
 | `CLOUDFLARE_ACCOUNT_ID`                     | Cloudflare account id                       |                                                                                                                              |
 | `R2_BUCKET`                                 | R2 bucket                                   | must equal the environment (production \| development)                                                                       |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 credentials (scoped to the bucket)       |                                                                                                                              |
@@ -273,11 +273,66 @@ preflight with the install hint. Hosted read-only preflight,
 reset/apply pipeline, and confirmation phrases are unchanged (production still
 requires `RESTORE production <project-ref>`).
 
+## Supabase connection migration
+
+All hosted backup/restore commands consume the **Shared Session Pooler** in
+Session mode exclusively, under the single external contract
+`SUPABASE_SHARED_POOLER_URL`:
+
+- only `SUPABASE_SHARED_POOLER_URL` configures hosted operations; there is no
+  fallback to the legacy `SUPABASE_DB_URL`;
+- direct `db.<project-ref>.supabase.co` URLs, transaction-pooler forms, and
+  port `6543` are rejected by config validation;
+- any hosted operation facing the literal `SUPABASE_DB_URL` variable (in the
+  dotenv file or the process environment) fails with a static
+  `UNSUPPORTED SUPABASE_DB_URL (rename to SUPABASE_SHARED_POOLER_URL)` error,
+  even when the new name is also present;
+- local `backup:local` never consumes hosted URL fields.
+
+The Shared Session Pooler exposes the IPv4 connectivity the default Docker
+bridge requires for the Dockerized `psql` 17 restore client — direct project
+hosts advertise IPv6, which the bridge cannot reach. Copy the Session pooler
+value from [Supabase Dashboard → Connect → Session
+pooler](https://supabase.com/docs/guides/database/connecting-to-postgres) and
+set `sslmode=require` (or `verify-ca`/`verify-full`). Note that `require`
+encrypts but does not authenticate the server; on untrusted networks prefer
+`verify-full` (with the CA reachable by `psql`), which also validates the
+server hostname.
+
+Zero-downtime rollout for an existing deployment:
+
+1. Rename the legacy variable in **every local dotenv file**
+   (`.env.development.local`, `.env.production.local`):
+   `SUPABASE_DB_URL` → `SUPABASE_SHARED_POOLER_URL`. Local runs fail with a
+   static `UNSUPPORTED SUPABASE_DB_URL` error until the rename is done.
+2. Pre-stage `SUPABASE_SHARED_POOLER_URL` as an Environment secret
+   (development and production) while keeping `SUPABASE_DB_URL` in place:
+   `gh secret set SUPABASE_SHARED_POOLER_URL --env <environment> --repo <owner/repo>`
+   with the value on stdin.
+3. Deploy the changed workflow (which consumes only
+   `secrets.SUPABASE_SHARED_POOLER_URL`) to `master`.
+4. Once the new workflow is active, run `npm run github:configure -- <owner/repo>`.
+   It upserts every current value for every configured environment **before**
+   deleting the legacy secret; deletion runs only where the pre-mutation
+   inventory showed `SUPABASE_DB_URL` existed, so a rerun after partial
+   deletion converges without attempting to delete absent secrets. A failed
+   upsert leaves every legacy secret untouched. Only environment-scoped
+   secrets are deleted; a repo-level `SUPABASE_DB_URL` secret (if any) must
+   be removed manually: `gh secret delete SUPABASE_DB_URL --repo <owner/repo>`.
+5. Verify by listing secret **names only**, never values:
+   `gh secret list --env <environment> --repo <owner/repo>` must show
+   `SUPABASE_SHARED_POOLER_URL` in both environments and no `SUPABASE_DB_URL`.
+
+Deletion reference:
+[GitHub CLI — deleting an environment secret](https://cli.github.com/manual/gh_secret_delete).
+
 ## References
 
 - [Supabase automated backups (CLI)](https://supabase.com/docs/guides/backups/automated-backups)
 - [Supabase CLI backup/restore guide](https://supabase.com/docs/guides/cli/managing-config)
 - [Supabase local development backups](https://supabase.com/docs/guides/local-development/cli/local-backups)
+- [Supabase — connecting to PostgreSQL (Session pooler)](https://supabase.com/docs/guides/database/connecting-to-postgres)
 - [Cloudflare R2 S3 JavaScript SDK](https://developers.cloudflare.com/r2/examples/aws-sdk-js-v3/)
 - [GitHub Actions — Scheduled workflows](https://docs.github.com/en/actions/reference/events-that-trigger-workflows#schedule)
+- [GitHub CLI — `gh secret delete`](https://cli.github.com/manual/gh_secret_delete)
 - [age encryption format](https://age-encryption.org/)

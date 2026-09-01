@@ -84,7 +84,8 @@ export class BoundedTail {
   }
 }
 
-const TRUNCATED_MARKER = { stdout: '[stdout truncated] ', stderr: '[stderr truncated] ' };
+/** Capture truncation markers; shared with consumers that fail closed on them. */
+export const TRUNCATED_MARKER = { stdout: '[stdout truncated] ', stderr: '[stderr truncated] ' };
 
 /** Tail a buffer and keep the truncation marker inside `maxBytes`. */
 function markerTail(marker, buffer, maxBytes) {

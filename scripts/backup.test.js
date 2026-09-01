@@ -21,7 +21,7 @@ import {
 } from '../src/test-fixtures.js';
 
 const REF = 'a1b2c3d4e5f6a7b8c9d0';
-const DB_URL = `postgresql://postgres.${REF}:the-password@aws-0-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require`;
+const DB_URL = `postgresql://postgres.${REF}:the-password@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require`;
 const ID = '2026-08-24T03-17-09Z';
 
 /** Logger backed by the real redacting createLogger; captures every line. */
@@ -58,7 +58,7 @@ function sha256Sync(filePath) {
 const BASE_CONFIG = {
   BACKUP_ENVIRONMENT: 'development',
   SUPABASE_PROJECT_REF: REF,
-  SUPABASE_DB_URL: DB_URL,
+  SUPABASE_SHARED_POOLER_URL: DB_URL,
   CLOUDFLARE_ACCOUNT_ID: '0123456789abcdef0123456789abcdef',
   R2_BUCKET: 'development',
   R2_ACCESS_KEY_ID: 'access-key-12345',
@@ -181,7 +181,7 @@ function backupDeps({
     loadConfig: ({ environment, vars: _vars, root: _root }) => ({
       environment,
       projectRef: REF,
-      dbUrl: DB_URL,
+      sharedPoolerUrl: DB_URL,
       accountId: BASE_CONFIG.CLOUDFLARE_ACCOUNT_ID,
       bucket: BASE_CONFIG.R2_BUCKET,
       accessKeyId: BASE_CONFIG.R2_ACCESS_KEY_ID,
@@ -408,6 +408,25 @@ test('backup: changed content uploads once', async () => {
   });
   assert.equal(result.r2Changed, true);
   assert.equal(calls.uploads, 1);
+});
+
+test('backup: the validated shared pooler URL reaches the lower-level dump as dbUrl', async () => {
+  const { deps, calls } = backupDeps({ contentSha256: 'd'.repeat(64), recipient: AGE_RECIPIENT_1 });
+  let receivedDbUrl = null;
+  await runBackup({
+    options: { environment: 'development', stagingDir: null },
+    env: {},
+    cwd: '/repo',
+    logger: silentLogger(),
+    deps: {
+      ...deps,
+      doDump: async (opts) => {
+        calls.dump += 1;
+        receivedDbUrl = opts.dbUrl;
+      },
+    },
+  });
+  assert.equal(receivedDbUrl, DB_URL, 'the exact validated shared pooler URL must flow as dbUrl');
 });
 
 test('backup: recipient change forces upload even with identical content', async () => {

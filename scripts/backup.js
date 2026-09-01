@@ -266,7 +266,7 @@ function resolveBackupDeps(deps) {
 /** Dump/package, inspect R2, and compare with the newest valid snapshot. */
 async function dumpAndInspectR2(ctx) {
   const { manifest, contentSha256 } = await dumpAndPackageSnapshot({
-    dbUrl: ctx.cfg.dbUrl,
+    dbUrl: ctx.cfg.sharedPoolerUrl,
     cwd: ctx.cwd,
     outDir: ctx.outDir,
     pkgDir: ctx.pkgDir,
@@ -413,7 +413,7 @@ async function prepareBackupContext({ options, env, cwd, logger, d, onProgress }
   onProgress('starting configuration load');
   const cfg = d.loadConfig({ environment, vars: env, root: cwd });
   onProgress('completed configuration load');
-  logger.addSecret(cfg.dbUrl);
+  logger.addSecret(cfg.sharedPoolerUrl);
   logger.addSecret(cfg.accessKeyId);
   logger.addSecret(cfg.secretAccessKey);
   logger.addSecret(cfg.projectRef);
@@ -543,7 +543,7 @@ export async function runBackup({
 /** CLI entry point: the only place raw argv is parsed. */
 export async function main() {
   assertNodeVersion();
-  const logger = createLogger({ stream: process.stderr, secrets: [process.env.SUPABASE_DB_URL] });
+  const logger = createLogger({ stream: process.stderr });
   try {
     const parsed = parseBackupArgs(process.argv.slice(2));
     if (parsed.help) {
