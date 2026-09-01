@@ -46,6 +46,18 @@ export const HOSTED_RESTORE_SCHEMA_ARTIFACTS = Object.freeze([
   'migration-history-schema.sql',
 ]);
 
+const SUPABASE_MANAGED_TRIGGER_STATEMENTS = new Set([
+  'CREATE TRIGGER enforce_bucket_name_length_trigger BEFORE INSERT OR UPDATE OF name ON storage.buckets FOR EACH ROW EXECUTE FUNCTION storage.enforce_bucket_name_length();',
+  'CREATE TRIGGER protect_buckets_delete BEFORE DELETE ON storage.buckets FOR EACH STATEMENT EXECUTE FUNCTION storage.protect_delete();',
+  'CREATE TRIGGER protect_objects_delete BEFORE DELETE ON storage.objects FOR EACH STATEMENT EXECUTE FUNCTION storage.protect_delete();',
+  'CREATE TRIGGER update_objects_updated_at BEFORE UPDATE ON storage.objects FOR EACH ROW EXECUTE FUNCTION storage.update_updated_at_column();',
+]);
+
+const MIGRATION_HISTORY_PRIMARY_KEY_SQL =
+  'ALTER TABLE ONLY "supabase_migrations"."schema_migrations"\n    ADD CONSTRAINT "schema_migrations_pkey" PRIMARY KEY ("version");';
+const DROP_MIGRATION_HISTORY_PRIMARY_KEY_SQL =
+  'ALTER TABLE ONLY "supabase_migrations"."schema_migrations"\n    DROP CONSTRAINT IF EXISTS "schema_migrations_pkey";';
+
 /**
  * Prepare roles in ONE pass and report how many canonical CREATE ROLE
  * statements were commented because the role already exists on the target.
@@ -53,18 +65,22 @@ export const HOSTED_RESTORE_SCHEMA_ARTIFACTS = Object.freeze([
 function prepareRolesFileWithCount({
   rolesSql,
   existingRoles = [],
-  marker = '-- already exists on target; skipped by db-backup restore',
+  marker = 'already exists on target; skipped by db-backup restore',
 }) {
   const existing = new Set(existingRoles);
   const lines = rolesSql.split(/\r?\n/);
   const out = [];
   let skipped = 0;
   for (const line of lines) {
+    if (line.trim() === 'GRANT SET ON PARAMETER "log_min_messages" TO "supabase_realtime_admin";') {
+      out.push(`-- managed by hosted Supabase; ${line.trim()}`);
+      continue;
+    }
     const match = CREATE_ROLE_LINE.exec(line);
     if (match) {
       const role = match[1].replaceAll('""', '"');
       if (existing.has(role)) {
-        out.push(`-- ${marker}\n${line}`);
+        out.push(`-- ${marker}\n-- ${line}`);
         skipped += 1;
         continue;
       }
@@ -84,8 +100,9 @@ function prepareRolesFileWithCount({
 
 /**
  * Strictly prepare the roles file for the TARGET database: comment ONLY the
- * canonical `CREATE ROLE "x";` statements whose roles already exist; preserve
- * every ALTER ROLE/GRANT line; reject any other CREATE ROLE syntax.
+ * canonical `CREATE ROLE "x";` statements whose roles already exist and the
+ * local-stack parameter grant managed by hosted Supabase; preserve every other
+ * ALTER ROLE/GRANT line; reject any other CREATE ROLE syntax.
  *
  * @param {{rolesSql:string, existingRoles:string[], marker?:string}} opts
  */
@@ -110,7 +127,140 @@ export function generateCleanupSql({ dataSql }) {
  * file into memory. Same semantics; read failures reject.
  */
 export async function generateCleanupSqlFromFile({ dataPath }) {
-  const scanner = createCleanupScanner();
+  return (await scanDataDumpFile({ dataPath })).cleanupSql;
+}
+
+const COPY_HEADER = /^COPY "((?:[^"]|"")+)"\."((?:[^"]|"")+)"(?: \((.*)\))? FROM stdin;$/;
+const SETVAL_LINE = /^SELECT pg_catalog\.setval\('"((?:[^"]|"")+)"\."((?:[^"]|"")+)"', .*\);$/;
+const TARGET_MANAGED_DATA_SCHEMAS = new Set(['auth', 'storage', 'supabase_functions']);
+
+function objectKey(schema, name) {
+  return JSON.stringify([schema, name]);
+}
+
+function decodeIdentifier(identifier) {
+  return identifier.replaceAll('""', '"');
+}
+
+function parseCopyHeader(line) {
+  const match = COPY_HEADER.exec(line);
+  if (!match) {
+    throw new HostedRestoreError(`malformed COPY target in data dump: ${line.slice(0, 60)}`, {
+      stage: 'cleanup',
+    });
+  }
+  const columns = [];
+  if (match[3] !== undefined) {
+    const column = /"((?:[^"]|"")+)"(?:, |$)/y;
+    while (column.lastIndex < match[3].length) {
+      const parsed = column.exec(match[3]);
+      if (!parsed) {
+        throw new HostedRestoreError(`malformed COPY columns in data dump: ${line.slice(0, 60)}`, {
+          stage: 'cleanup',
+        });
+      }
+      columns.push(decodeIdentifier(parsed[1]));
+    }
+  }
+  return {
+    schema: decodeIdentifier(match[1]),
+    table: decodeIdentifier(match[2]),
+    columns,
+  };
+}
+
+function parseSetval(line) {
+  const match = SETVAL_LINE.exec(line);
+  return match
+    ? { schema: decodeIdentifier(match[1]), sequence: decodeIdentifier(match[2]) }
+    : null;
+}
+
+/**
+ * Shared single-pass data scanner. Besides cleanup SQL, a hosted scan can
+ * identify empty COPY blocks and sequence state for managed objects absent
+ * from the target. Non-empty incompatible data fails before target reset.
+ */
+function createCleanupScanner({ targetRelations, targetSequences } = {}) {
+  const seen = new Set();
+  const truncates = [];
+  const skippedRelations = new Set();
+  const skippedSequences = new Set();
+  let activeCopy = null;
+  return {
+    skippedRelations,
+    skippedSequences,
+    push(line) {
+      if (activeCopy) {
+        if (line === '\\.') {
+          if (activeCopy.problem) {
+            skippedRelations.add(objectKey(activeCopy.schema, activeCopy.table));
+          }
+          activeCopy = null;
+          return;
+        }
+        if (activeCopy.problem) {
+          throw new HostedRestoreError(
+            `cannot restore non-empty managed data for "${activeCopy.schema}"."${activeCopy.table}": ${activeCopy.problem}`,
+            { stage: 'compatibility' },
+          );
+        }
+        return;
+      }
+      if (line.startsWith('COPY ')) {
+        const header = parseCopyHeader(line);
+        let problem = null;
+        let relationExists = true;
+        if (targetRelations && TARGET_MANAGED_DATA_SCHEMAS.has(header.schema)) {
+          const targetColumns = targetRelations.get(objectKey(header.schema, header.table));
+          if (!targetColumns) {
+            problem = 'relation does not exist on the target';
+            relationExists = false;
+          } else {
+            const missing = header.columns.filter((column) => !targetColumns.has(column));
+            if (missing.length > 0) problem = `target is missing columns: ${missing.join(', ')}`;
+          }
+        }
+        activeCopy = { ...header, problem };
+        if (!relationExists || header.schema === 'public') return;
+        const key = objectKey(header.schema, header.table);
+        if (seen.has(key)) return;
+        seen.add(key);
+        truncates.push(
+          `TRUNCATE TABLE "${header.schema.replaceAll('"', '""')}"."${header.table.replaceAll('"', '""')}" CASCADE;`,
+        );
+        return;
+      }
+      const setval = parseSetval(line);
+      if (setval && targetSequences && TARGET_MANAGED_DATA_SCHEMAS.has(setval.schema)) {
+        const key = objectKey(setval.schema, setval.sequence);
+        if (targetSequences.has(key)) return;
+        const emptyMissingHooks =
+          setval.schema === 'supabase_functions' &&
+          setval.sequence === 'hooks_id_seq' &&
+          skippedRelations.has(objectKey('supabase_functions', 'hooks'));
+        if (!emptyMissingHooks) {
+          throw new HostedRestoreError(
+            `cannot restore managed sequence "${setval.schema}"."${setval.sequence}": sequence does not exist on the target`,
+            { stage: 'compatibility' },
+          );
+        }
+        skippedSequences.add(key);
+      }
+    },
+    result() {
+      if (activeCopy) {
+        throw new HostedRestoreError('unterminated COPY data block in data dump', {
+          stage: 'cleanup',
+        });
+      }
+      return `${truncates.join('\n')}\n`;
+    },
+  };
+}
+
+async function scanDataDumpFile({ dataPath, targetRelations, targetSequences }) {
+  const scanner = createCleanupScanner({ targetRelations, targetSequences });
   const lines = readline.createInterface({
     input: fs.createReadStream(dataPath),
     crlfDelay: Infinity,
@@ -120,53 +270,10 @@ export async function generateCleanupSqlFromFile({ dataPath }) {
   } finally {
     lines.close();
   }
-  return scanner.result();
-}
-
-/**
- * Shared single-pass COPY-header scanner for the in-memory and streaming
- * cleanup builders; throws HostedRestoreError on malformed input.
- */
-function createCleanupScanner() {
-  const COPY_HEADER = /^COPY "((?:[^"]|"")+)"\."((?:[^"]|"")+)"(?: \(.*\))? FROM stdin;$/;
-  const seen = new Set();
-  const truncates = [];
-  let inCopyData = false;
   return {
-    push(line) {
-      if (inCopyData) {
-        if (line === '\\.') inCopyData = false;
-        return;
-      }
-      if (!line.startsWith('COPY ')) return;
-      const match = COPY_HEADER.exec(line);
-      if (!match) {
-        throw new HostedRestoreError(`malformed COPY target in data dump: ${line.slice(0, 60)}`, {
-          stage: 'cleanup',
-        });
-      }
-      inCopyData = true;
-      const schema = match[1].replaceAll('""', '"');
-      const table = match[2].replaceAll('""', '"');
-      // Public-schema tables are freshly replaced by the clean step in both
-      // hosted (db reset) and local (DROP SCHEMA public) restores; TRUNCATE
-      // has no IF EXISTS, so they are excluded from the truncate list.
-      if (schema === 'public') return;
-      const target = `${schema}.${table}`;
-      if (seen.has(target)) return;
-      seen.add(target);
-      truncates.push(
-        `TRUNCATE TABLE "${schema.replaceAll('"', '""')}"."${table.replaceAll('"', '""')}" CASCADE;`,
-      );
-    },
-    result() {
-      if (inCopyData) {
-        throw new HostedRestoreError('unterminated COPY data block in data dump', {
-          stage: 'cleanup',
-        });
-      }
-      return `${truncates.join('\n')}\n`;
-    },
+    cleanupSql: scanner.result(),
+    skippedRelations: scanner.skippedRelations,
+    skippedSequences: scanner.skippedSequences,
   };
 }
 
@@ -274,6 +381,61 @@ export async function psqlQuery({
   return psqlOutputLines(res.stdout);
 }
 
+const TARGET_MANAGED_DATA_OBJECTS_QUERY = `
+SELECT json_build_object(
+  'kind', CASE WHEN c.relkind = 'S' THEN 'sequence' ELSE 'relation' END,
+  'schema', c.relnamespace::regnamespace::name,
+  'name', c.relname,
+  'columns', COALESCE((
+    SELECT json_agg(a.attname ORDER BY a.attnum)
+    FROM pg_attribute AS a
+    WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+  ), '[]'::json)
+)::text
+FROM pg_class AS c
+WHERE c.relkind IN ('r', 'p', 'S')
+  AND c.relnamespace::regnamespace::name IN ('auth', 'storage', 'supabase_functions')
+ORDER BY c.relnamespace::regnamespace::name, c.relname`;
+
+async function readTargetManagedDataObjects({ dockerPath, postgresImage, dbUrl, run, signal }) {
+  const lines = await psqlQuery({
+    dockerPath,
+    postgresImage,
+    dbUrl,
+    query: TARGET_MANAGED_DATA_OBJECTS_QUERY,
+    run,
+    signal,
+  });
+  const relations = new Map();
+  const sequences = new Set();
+  for (const line of lines) {
+    let item;
+    try {
+      item = JSON.parse(line);
+    } catch {
+      throw new HostedRestoreError('target catalog probe returned malformed data', {
+        stage: 'preflight',
+      });
+    }
+    if (
+      !item ||
+      !['relation', 'sequence'].includes(item.kind) ||
+      typeof item.schema !== 'string' ||
+      typeof item.name !== 'string' ||
+      !Array.isArray(item.columns) ||
+      !item.columns.every((column) => typeof column === 'string')
+    ) {
+      throw new HostedRestoreError('target catalog probe returned malformed data', {
+        stage: 'preflight',
+      });
+    }
+    const key = objectKey(item.schema, item.name);
+    if (item.kind === 'sequence') sequences.add(key);
+    else relations.set(key, new Set(item.columns));
+  }
+  return { relations, sequences };
+}
+
 /** Read-only connectivity preflight: image/version, then a live target. */
 export async function readOnlyPreflight({
   dockerPath,
@@ -299,32 +461,71 @@ export async function readOnlyPreflight({
 }
 
 /**
- * Generate and write the private auxiliary SQL (prepared roles + cleanup) into
- * the prepared workspace with mode 0600. Returns the role/cleanup paths and
- * the truncated-table count for the result summary. The cleanup pass streams
- * the data dump line by line so multi-gigabyte restores never buffer the
- * whole file in memory.
+ * Generate private target-adapted SQL (roles, managed delta, migration
+ * history, cleanup) in the prepared workspace with mode 0600. The cleanup
+ * pass streams multi-gigabyte row data; the schema metadata stays bounded by
+ * verified snapshot limits.
  */
 async function prepareHostedAuxiliaryFiles({
   prepared,
   recentRoles,
+  targetDataObjects,
   writeFile = fs.writeFileSync,
 }) {
   const rolesSql = fs.readFileSync(path.join(prepared.dir, 'roles.sql'), 'utf8');
   const rolesPrepared = prepareRolesFileWithCount({ rolesSql, existingRoles: recentRoles });
-  const cleanupSql = await generateCleanupSqlFromFile({ dataPath: prepared.dataPath });
+  // Remote reset preserves Supabase-owned Storage triggers, so the managed
+  // delta must retain only project-owned auth/storage changes.
+  // ponytail: these files are bounded at 512 MiB; stream the rewrites if
+  // managed schema deltas ever approach that limit.
+  const managedSql = fs.readFileSync(path.join(prepared.dir, 'managed-schema.sql'), 'utf8');
+  const managedPreparedSql = managedSql
+    .split(/\r?\n/)
+    .map((line) =>
+      SUPABASE_MANAGED_TRIGGER_STATEMENTS.has(line.trim())
+        ? `-- managed by hosted Supabase; ${line.trim()}`
+        : line,
+    )
+    .join('\n');
+  // Remote reset truncates but preserves this table and primary key. Replace
+  // the key transactionally before replaying its canonical dumped definition.
+  const migrationHistorySql = fs.readFileSync(
+    path.join(prepared.dir, 'migration-history-schema.sql'),
+    'utf8',
+  );
+  const migrationHistoryPreparedSql = migrationHistorySql.replace(
+    MIGRATION_HISTORY_PRIMARY_KEY_SQL,
+    `${DROP_MIGRATION_HISTORY_PRIMARY_KEY_SQL}\n\n${MIGRATION_HISTORY_PRIMARY_KEY_SQL}`,
+  );
+  const dataScan = await scanDataDumpFile({
+    dataPath: prepared.dataPath,
+    targetRelations: targetDataObjects.relations,
+    targetSequences: targetDataObjects.sequences,
+  });
+  const cleanupSql = dataScan.cleanupSql;
   const auxDir = path.join(prepared.dir, '.restore-aux');
   fs.mkdirSync(auxDir, { mode: 0o700 });
   const rolesFile = path.join(auxDir, 'roles.prepared.sql');
+  const managedFile = path.join(auxDir, 'managed-schema.prepared.sql');
+  const migrationHistoryFile = path.join(auxDir, 'migration-history-schema.prepared.sql');
   const cleanupFile = path.join(auxDir, 'cleanup.sql');
-  writeFile(rolesFile, rolesPrepared.sql);
-  writeFile(cleanupFile, cleanupSql);
-  fs.chmodSync(rolesFile, 0o600);
-  fs.chmodSync(cleanupFile, 0o600);
+  for (const [file, sql] of [
+    [rolesFile, rolesPrepared.sql],
+    [managedFile, managedPreparedSql],
+    [migrationHistoryFile, migrationHistoryPreparedSql],
+    [cleanupFile, cleanupSql],
+  ]) {
+    writeFile(file, sql);
+    fs.chmodSync(file, 0o600);
+  }
   const cleanupLines = cleanupSql.trim();
   return {
     rolesFile,
+    managedFile,
+    migrationHistoryFile,
     cleanupFile,
+    skippedRelations: dataScan.skippedRelations,
+    skippedSequences: dataScan.skippedSequences,
     rolesSkipped: rolesPrepared.skipped,
     truncatedTables: cleanupLines ? cleanupLines.split('\n').length : 0,
   };
@@ -344,24 +545,83 @@ async function resetHostedDatabase({ supabasePath, repoRoot, dbUrl, secretArgs, 
 }
 
 /**
- * Lazy restore stdin stream: one file at a time, chunked with backpressure,
- * each file closed before a single newline separator advances the sequence.
- * The multi-gigabyte data file is never buffered in full and nothing is ever
- * bind-mounted into the client container.
+ * Lazy restore stdin stream: one file at a time with backpressure, each file
+ * closed before a newline separator advances the sequence. When target schema
+ * drift requires filtering empty managed COPY blocks, row data remains
+ * line-streamed and is never buffered in full. Nothing is bind-mounted.
  */
-export function createRestoreInputStream(filePaths) {
-  return Readable.from(restoreFileGenerator(filePaths));
+export function createRestoreInputStream(
+  filePaths,
+  { dataPath, skippedRelations = new Set(), skippedSequences = new Set() } = {},
+) {
+  return Readable.from(
+    restoreFileGenerator(filePaths, { dataPath, skippedRelations, skippedSequences }),
+  );
 }
 
-async function* restoreFileGenerator(filePaths) {
+async function* restoreFileGenerator(filePaths, filter) {
   for (const filePath of filePaths) {
-    const file = fs.createReadStream(filePath);
-    try {
-      for await (const chunk of file) yield chunk;
-    } finally {
-      file.destroy();
+    if (
+      filePath === filter.dataPath &&
+      (filter.skippedRelations.size > 0 || filter.skippedSequences.size > 0)
+    ) {
+      yield* filteredDataFileGenerator(filePath, filter);
+    } else {
+      const file = fs.createReadStream(filePath);
+      try {
+        for await (const chunk of file) yield chunk;
+      } finally {
+        file.destroy();
+      }
     }
     yield Buffer.from('\n');
+  }
+}
+
+async function* filteredDataFileGenerator(dataPath, { skippedRelations, skippedSequences }) {
+  const lines = readline.createInterface({
+    input: fs.createReadStream(dataPath),
+    crlfDelay: Infinity,
+  });
+  let activeCopy = null;
+  try {
+    for await (const line of lines) {
+      if (activeCopy) {
+        if (line === '\\.') {
+          if (!activeCopy.skip) yield Buffer.from('\\.\n');
+          activeCopy = null;
+        } else if (activeCopy.skip) {
+          throw new HostedRestoreError(
+            `refusing to discard non-empty managed data for "${activeCopy.schema}"."${activeCopy.table}"`,
+            { stage: 'compatibility' },
+          );
+        } else {
+          yield Buffer.from(`${line}\n`);
+        }
+        continue;
+      }
+      if (line.startsWith('COPY ')) {
+        const header = parseCopyHeader(line);
+        activeCopy = {
+          ...header,
+          skip: skippedRelations.has(objectKey(header.schema, header.table)),
+        };
+        if (!activeCopy.skip) yield Buffer.from(`${line}\n`);
+        continue;
+      }
+      const setval = parseSetval(line);
+      if (setval && skippedSequences.has(objectKey(setval.schema, setval.sequence))) {
+        continue;
+      }
+      yield Buffer.from(`${line}\n`);
+    }
+  } finally {
+    lines.close();
+  }
+  if (activeCopy) {
+    throw new HostedRestoreError('unterminated COPY data block in data dump', {
+      stage: 'compatibility',
+    });
   }
 }
 
@@ -384,12 +644,25 @@ async function applyHostedRestore({
   run,
   signal,
 }) {
-  const input = createRestoreInputStream([
-    aux.rolesFile,
-    ...HOSTED_RESTORE_SCHEMA_ARTIFACTS.map((name) => path.join(prepared.dir, name)),
-    aux.cleanupFile,
-    prepared.dataPath,
-  ]);
+  const schemaOverrides = {
+    'managed-schema.sql': aux.managedFile,
+    'migration-history-schema.sql': aux.migrationHistoryFile,
+  };
+  const input = createRestoreInputStream(
+    [
+      aux.rolesFile,
+      ...HOSTED_RESTORE_SCHEMA_ARTIFACTS.map(
+        (name) => schemaOverrides[name] ?? path.join(prepared.dir, name),
+      ),
+      aux.cleanupFile,
+      prepared.dataPath,
+    ],
+    {
+      dataPath: prepared.dataPath,
+      skippedRelations: aux.skippedRelations,
+      skippedSequences: aux.skippedSequences,
+    },
+  );
   const delivery = trackInputDelivery(input);
   try {
     await run({
@@ -499,7 +772,7 @@ export async function executeHostedRestore({
   const repoRoot = config.repoRoot ?? process.cwd();
   const secretArgs = [dbUrl, urlPassword(dbUrl)].filter(Boolean);
 
-  // 1. Duplicate-role preparation against the live target (read-only query).
+  // 1. Read-only target catalog probes and fail-closed compatibility preparation.
   const recentRoles = await psqlQuery({
     dockerPath,
     postgresImage,
@@ -508,7 +781,19 @@ export async function executeHostedRestore({
     run,
     signal,
   });
-  const aux = await prepareHostedAuxiliaryFiles({ prepared, recentRoles, writeFile });
+  const targetDataObjects = await readTargetManagedDataObjects({
+    dockerPath,
+    postgresImage,
+    dbUrl,
+    run,
+    signal,
+  });
+  const aux = await prepareHostedAuxiliaryFiles({
+    prepared,
+    recentRoles,
+    targetDataObjects,
+    writeFile,
+  });
 
   // 2. Clean the target (`db reset` from this repository's minimal workdir).
   await resetHostedDatabase({ supabasePath, repoRoot, dbUrl, secretArgs, run, signal });
@@ -589,6 +874,11 @@ function readLineOnce(input) {
       input.removeListener('data', onData);
       input.removeListener('end', onEnd);
       input.removeListener('error', onError);
+      // The gate reads stdin exactly once. A still-flowing interactive input
+      // (TTY) keeps a pending read handle on the event loop, so the CLI would
+      // hang after the confirmation is answered instead of exiting. Pausing
+      // stops that read; the caller never reads stdin again.
+      if (typeof input.pause === 'function') input.pause();
     };
     input.on('data', onData);
     input.on('end', onEnd);

@@ -25,7 +25,7 @@ import { tmpdir, writePrivateFile } from './test-fixtures.js';
 import { confirmExactPhrase } from './hosted-restore.js';
 
 const DB_URL =
-  'postgresql://postgres.a1b2c3d4e5f6a7b8c9d0:the-password@aws-0-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require';
+  'postgresql://postgres.a1b2c3d4e5f6a7b8c9d0:the-password@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require';
 
 const ROLES_SQL = [
   'SET statement_timeout = 0;',
@@ -249,7 +249,8 @@ test('hosted: duplicate roles are commented narrowly, others untouched', () => {
   const out = prepareRolesFile({ rolesSql: ROLES_SQL, existingRoles: ['anon'] });
   const lines = out.split('\n');
   const anonCreate = lines.findIndex((l) => l.includes('CREATE ROLE "anon"'));
-  assert.ok(lines[anonCreate - 1].startsWith('-- '), 'existing role CREATE is commented');
+  assert.ok(lines[anonCreate - 1].includes('already exists on target'));
+  assert.ok(lines[anonCreate].startsWith('-- '), 'existing role CREATE is commented');
   assert.ok(
     lines.some((l) => l.includes('ALTER ROLE "anon"')),
     'ALTER preserved',
@@ -266,6 +267,17 @@ test('hosted: duplicate roles are commented narrowly, others untouched', () => {
     lines.some((l) => l.includes('GRANT USAGE')),
     'grants preserved',
   );
+});
+
+test('hosted: local managed parameter grant is commented and other grants are preserved', () => {
+  const managed = 'GRANT SET ON PARAMETER "log_min_messages" TO "supabase_realtime_admin";';
+  const custom = 'GRANT SET ON PARAMETER "work_mem" TO "app_custom";';
+  const lines = prepareRolesFile({
+    rolesSql: `${managed}\n${custom}\n`,
+    existingRoles: [],
+  }).split('\n');
+  assert.equal(lines[0], `-- managed by hosted Supabase; ${managed}`);
+  assert.equal(lines[1], custom);
 });
 
 test('hosted: unexpected role creation syntax fails instead of broad replacement', () => {
@@ -579,6 +591,90 @@ test('hosted: psqlQuery never prints the URL or password', async () => {
   assert.deepEqual(lines, ['a', 'b']);
 });
 
+test('hosted: non-empty incompatible managed data fails before reset', async () => {
+  const root = tmpdir('bp-hosted-');
+  const prepared = { dir: root, dataPath: path.join(root, 'data.sql') };
+  for (const [name, sql] of [
+    ['roles.sql', 'RESET ALL;\n'],
+    ['schema.sql', '-- schema\n'],
+    ['managed-schema.sql', ''],
+    ['migration-history-schema.sql', ''],
+    ['data.sql', 'COPY "storage"."future_table" ("id") FROM stdin;\n1\n\\.\n'],
+  ]) {
+    writePrivateFile(path.join(root, name), sql);
+  }
+  let reset = false;
+  const run = async (opts) => {
+    if (opts.args[1] === 'reset') reset = true;
+    const cIdx = opts.args.indexOf('-c');
+    const query = cIdx === -1 ? '' : opts.args[cIdx + 1];
+    if (query.includes("c.relkind IN ('r', 'p', 'S')")) {
+      return {
+        stdout: `${JSON.stringify({
+          kind: 'relation',
+          schema: 'storage',
+          name: 'future_table',
+          columns: ['different_column'],
+        })}\n`,
+      };
+    }
+    return { stdout: '' };
+  };
+  await assert.rejects(
+    () =>
+      executeHostedRestore({
+        config: { dbUrl: DB_URL, environment: 'development', repoRoot: root },
+        prepared,
+        dockerPath: '/docker',
+        supabasePath: '/supabase',
+        run,
+        logger: { status: () => {} },
+      }),
+    (err) =>
+      err instanceof HostedRestoreError &&
+      err.stage === 'compatibility' &&
+      /missing columns/.test(err.message),
+  );
+  assert.equal(reset, false, 'incompatible non-empty data must fail before target reset');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('hosted: missing managed sequence state fails before reset', async () => {
+  const root = tmpdir('bp-hosted-');
+  const prepared = { dir: root, dataPath: path.join(root, 'data.sql') };
+  for (const [name, sql] of [
+    ['roles.sql', 'RESET ALL;\n'],
+    ['schema.sql', '-- schema\n'],
+    ['managed-schema.sql', ''],
+    ['migration-history-schema.sql', ''],
+    ['data.sql', `SELECT pg_catalog.setval('"auth"."missing_id_seq"', 1, false);\n`],
+  ]) {
+    writePrivateFile(path.join(root, name), sql);
+  }
+  let reset = false;
+  const run = async (opts) => {
+    if (opts.args[1] === 'reset') reset = true;
+    return { stdout: '' };
+  };
+  await assert.rejects(
+    () =>
+      executeHostedRestore({
+        config: { dbUrl: DB_URL, environment: 'development', repoRoot: root },
+        prepared,
+        dockerPath: '/docker',
+        supabasePath: '/supabase',
+        run,
+        logger: { status: () => {} },
+      }),
+    (err) =>
+      err instanceof HostedRestoreError &&
+      err.stage === 'compatibility' &&
+      /sequence does not exist/.test(err.message),
+  );
+  assert.equal(reset, false, 'missing sequence state must fail before target reset');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test('hosted: executeHostedRestore restores in one Dockerized transaction streaming the exact ordered files', async () => {
   const root = tmpdir('bp-hosted-');
   const prepared = {
@@ -591,9 +687,42 @@ test('hosted: executeHostedRestore restores in one Dockerized transaction stream
     path.join(prepared.dir, 'schema.sql'),
     '-- SCHEMA_MARKER\nCREATE TABLE public.t();\n',
   );
-  writePrivateFile(path.join(prepared.dir, 'managed-schema.sql'), '-- MANAGED_MARKER\n');
-  writePrivateFile(path.join(prepared.dir, 'migration-history-schema.sql'), '-- HISTORY_MARKER\n');
-  writePrivateFile(prepared.dataPath, '-- DATA_MARKER\nCOPY "public"."t" FROM stdin;\n1\n\\.\n');
+  const customManagedTrigger =
+    'CREATE TRIGGER custom_auth_trigger AFTER INSERT ON auth.users FOR EACH ROW EXECUTE FUNCTION public.custom_auth_trigger();';
+  const supabaseManagedTriggers = [
+    'CREATE TRIGGER enforce_bucket_name_length_trigger BEFORE INSERT OR UPDATE OF name ON storage.buckets FOR EACH ROW EXECUTE FUNCTION storage.enforce_bucket_name_length();',
+    'CREATE TRIGGER protect_buckets_delete BEFORE DELETE ON storage.buckets FOR EACH STATEMENT EXECUTE FUNCTION storage.protect_delete();',
+    'CREATE TRIGGER protect_objects_delete BEFORE DELETE ON storage.objects FOR EACH STATEMENT EXECUTE FUNCTION storage.protect_delete();',
+    'CREATE TRIGGER update_objects_updated_at BEFORE UPDATE ON storage.objects FOR EACH ROW EXECUTE FUNCTION storage.update_updated_at_column();',
+  ];
+  writePrivateFile(
+    path.join(prepared.dir, 'managed-schema.sql'),
+    `-- MANAGED_MARKER\n${customManagedTrigger}\n${supabaseManagedTriggers.join('\n')}\n`,
+  );
+  writePrivateFile(
+    path.join(prepared.dir, 'migration-history-schema.sql'),
+    '-- HISTORY_MARKER\nALTER TABLE ONLY "supabase_migrations"."schema_migrations"\n    ADD CONSTRAINT "schema_migrations_pkey" PRIMARY KEY ("version");\n',
+  );
+  writePrivateFile(
+    prepared.dataPath,
+    [
+      '-- DATA_MARKER',
+      'COPY "public"."t" FROM stdin;',
+      'COPY row data',
+      '\\.',
+      'COPY "storage"."buckets" ("id") FROM stdin;',
+      '\\.',
+      'COPY "storage"."iceberg_namespaces" ("id") FROM stdin;',
+      '\\.',
+      'COPY "storage"."objects" ("source_only_column") FROM stdin;',
+      '\\.',
+      'COPY "supabase_functions"."hooks" ("id") FROM stdin;',
+      '\\.',
+      `SELECT pg_catalog.setval('"auth"."refresh_tokens_id_seq"', 30, true);`,
+      `SELECT pg_catalog.setval('"supabase_functions"."hooks_id_seq"', 1, false);`,
+      '',
+    ].join('\n'),
+  );
 
   const calls = [];
   const streamed = [];
@@ -609,6 +738,31 @@ test('hosted: executeHostedRestore restores in one Dockerized transaction stream
     const query = cIdx !== -1 ? opts.args[cIdx + 1] : null;
     if (query === 'SELECT 1') return { stdout: '1\n' };
     if (query?.startsWith('SELECT rolname')) return { stdout: 'postgres\nanon\napp_custom\n' };
+    if (query?.includes("c.relkind IN ('r', 'p', 'S')")) {
+      return {
+        stdout: [
+          JSON.stringify({
+            kind: 'sequence',
+            schema: 'auth',
+            name: 'refresh_tokens_id_seq',
+            columns: [],
+          }),
+          JSON.stringify({
+            kind: 'relation',
+            schema: 'storage',
+            name: 'buckets',
+            columns: ['id'],
+          }),
+          JSON.stringify({
+            kind: 'relation',
+            schema: 'storage',
+            name: 'objects',
+            columns: ['id'],
+          }),
+          '',
+        ].join('\n'),
+      };
+    }
     if (query?.includes('pg_namespace')) return { stdout: '1\n' };
     if (query?.includes('pg_trigger'))
       return { stdout: 'create_account_for_new_user\ncleanup_deleted_user_vouches\n' };
@@ -671,20 +825,50 @@ test('hosted: executeHostedRestore restores in one Dockerized transaction stream
     stream.indexOf('-- already exists on target') < positions[0],
     'the prepared roles file (with commented duplicates) must lead the stream',
   );
+  const streamLines = stream.split('\n');
+  assert.ok(streamLines.includes(customManagedTrigger), 'project-owned trigger must be restored');
+  for (const statement of supabaseManagedTriggers) {
+    assert.ok(
+      streamLines.includes(`-- managed by hosted Supabase; ${statement}`),
+      'Supabase-owned trigger must be commented',
+    );
+    assert.ok(!streamLines.includes(statement), 'Supabase-owned trigger must not be recreated');
+  }
+  const historyDrop = stream.indexOf('DROP CONSTRAINT IF EXISTS "schema_migrations_pkey"');
+  const historyAdd = stream.indexOf('ADD CONSTRAINT "schema_migrations_pkey"');
+  assert.ok(
+    historyDrop > positions[2] && historyAdd > historyDrop,
+    'reset-preserved migration primary key must be replaced before its dumped definition',
+  );
+  assert.ok(stream.includes('COPY row data'), 'COPY-shaped row data must remain untouched');
+  assert.ok(stream.includes('TRUNCATE TABLE "storage"."buckets" CASCADE;'));
+  assert.ok(stream.includes('COPY "storage"."buckets" ("id") FROM stdin;'));
+  assert.ok(stream.includes('TRUNCATE TABLE "storage"."objects" CASCADE;'));
+  assert.ok(!stream.includes('COPY "storage"."objects"'));
+  assert.ok(stream.includes(`setval('"auth"."refresh_tokens_id_seq"'`));
+  assert.ok(!stream.includes('COPY "storage"."iceberg_namespaces"'));
+  assert.ok(!stream.includes('COPY "supabase_functions"."hooks"'));
+  assert.ok(!stream.includes(`setval('"supabase_functions"."hooks_id_seq"'`));
 
-  // The prepared roles file comments only existing CREATE ROLE statements and
-  // keeps ALTER/GRANT lines; the auxiliary files are private (0600).
+  // The prepared roles file comments existing CREATE ROLE statements; the
+  // auxiliary files are private (0600).
   const rolesPrepared = fs.readFileSync(
     path.join(prepared.dir, '.restore-aux', 'roles.prepared.sql'),
     'utf8',
   );
   const lines = rolesPrepared.split('\n');
   const anonCreate = lines.findIndex((l) => l.includes('CREATE ROLE "anon"'));
-  assert.ok(lines[anonCreate - 1].startsWith('-- '), 'existing canonical CREATE ROLE commented');
+  assert.ok(lines[anonCreate - 1].includes('already exists on target'));
+  assert.ok(lines[anonCreate].startsWith('-- '), 'existing canonical CREATE ROLE commented');
   assert.ok(lines.find((l) => l.includes('CREATE ROLE "app_custom"')));
   assert.ok(lines.find((l) => l.includes('ALTER ROLE "app_custom" WITH LOGIN')));
   assert.ok(lines.find((l) => l.includes('GRANT USAGE')));
-  for (const name of ['roles.prepared.sql', 'cleanup.sql']) {
+  for (const name of [
+    'roles.prepared.sql',
+    'managed-schema.prepared.sql',
+    'migration-history-schema.prepared.sql',
+    'cleanup.sql',
+  ]) {
     assert.equal(
       fs.statSync(path.join(prepared.dir, '.restore-aux', name)).mode & 0o777,
       0o600,
