@@ -51,13 +51,14 @@ jobs:
             exit 1
           fi
 
-      - name: Set up Vite+ and Node.js (pinned)
-        uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+      - name: Set up Node.js (pinned)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          version: '0.3.0'
           node-version-file: .node-version
-          cache: true
-          run-install: false
+          package-manager-cache: false
+
+      - name: Set up npm (pinned)
+        run: npm install --global npm@12.0.2
 
       - name: Install age
         run: |
@@ -70,10 +71,10 @@ jobs:
         run: docker info >/dev/null
 
       - name: Install dependencies
-        run: vp install --frozen-lockfile
+        run: npm ci
 
       - name: Unit checks (no network/Docker/secrets)
-        run: vp run check
+        run: npm run check
 
       - name: Back up environment (daily)
         if: github.event.schedule != '17 3 * * 0' && github.event.inputs.commit_weekly != 'true'
@@ -87,7 +88,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           R2_BUCKET: ${{ vars.R2_BUCKET }}
           ENCRYPT_KEY: ${{ vars.ENCRYPT_KEY }}
-        run: vp run backup --environment ${{ matrix.environment }}
+        run: npm run backup -- --environment ${{ matrix.environment }}
 
       - name: Back up environment (with weekly staging)
         if: github.event.schedule == '17 3 * * 0' || github.event.inputs.commit_weekly == 'true'
@@ -101,7 +102,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           R2_BUCKET: ${{ vars.R2_BUCKET }}
           ENCRYPT_KEY: ${{ vars.ENCRYPT_KEY }}
-        run: vp run backup --environment ${{ matrix.environment }} --staging-dir ${{ env.STAGING_DIR }}
+        run: npm run backup -- --environment ${{ matrix.environment }} --staging-dir ${{ env.STAGING_DIR }}
 
       - name: Upload weekly staging artifact
         if: (github.event.schedule == '17 3 * * 0' || github.event.inputs.commit_weekly == 'true') && always()
@@ -143,16 +144,17 @@ jobs:
       - name: Update from origin master (ff-only)
         run: git pull --ff-only origin master
 
-      - name: Set up Vite+ and Node.js (pinned)
-        uses: voidzero-dev/setup-vp@1b32467adbe183473499fd9d5d372c3ed9641754 # v1.18.0
+      - name: Set up Node.js (pinned)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          version: '0.3.0'
           node-version-file: .node-version
-          cache: true
-          run-install: false
+          package-manager-cache: false
+
+      - name: Set up npm (pinned)
+        run: npm install --global npm@12.0.2
 
       - name: Install dependencies
-        run: vp install --frozen-lockfile
+        run: npm ci
 
       - name: Merge staged snapshots and copy changed snapshots into backups/
         run: |
@@ -161,7 +163,7 @@ jobs:
           # A partial weekly commit is forbidden: both environments are required.
           test -d /tmp/weekly-staging/development
           test -d /tmp/weekly-staging/production
-          vp run commit:weekly --staging-dir /tmp/weekly-staging --repo-root .
+          npm run commit:weekly -- --staging-dir /tmp/weekly-staging --repo-root .
 
       - name: Stage only backups/
         run: git add backups/
