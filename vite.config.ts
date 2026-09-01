@@ -18,6 +18,7 @@ export default defineConfig({
     sortPackageJson: true,
     ignorePatterns: [
       '**/AGENTS.md',
+      'README.md',
       '.env',
       '.env.*',
       'node_modules/**',
