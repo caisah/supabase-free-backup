@@ -66,6 +66,7 @@ async function packageFixture(root, overrides = {}) {
     sourceProjectRef: overrides.sourceProjectRef ?? REF,
     supabaseCliVersion: overrides.supabaseCliVersion ?? '2.114.0',
     ageRecipient: AGE_RECIPIENT_1,
+    agePath: '/fake/age', // structural tests: never resolve the real age binary
     run: fakeAge,
   });
   return { sourceDir, destDir };
@@ -729,6 +730,7 @@ test('snapshot: injected encryption failure stops the pipeline but still cleans 
         sourceProjectRef: REF,
         supabaseCliVersion: '2.114.0',
         ageRecipient: AGE_RECIPIENT_1,
+        agePath: '/fake/age',
         run: async () => {
           throw new Error('injected encryption failure');
         },
@@ -762,6 +764,7 @@ test('snapshot: packaging cleanup runs even when progress throws', async () => {
         sourceProjectRef: REF,
         supabaseCliVersion: '2.114.0',
         ageRecipient: AGE_RECIPIENT_1,
+        agePath: '/fake/age',
         run: async () => {
           throw new Error('injected encryption failure');
         },
@@ -789,6 +792,7 @@ async function packageSnapshotWithProgress(root, progress) {
     sourceProjectRef: REF,
     supabaseCliVersion: '2.114.0',
     ageRecipient: AGE_RECIPIENT_1,
+    agePath: '/fake/age',
     run: fakeAge,
     onProgress: (message) => progress.push(message),
   });
@@ -809,6 +813,7 @@ test('snapshot: packaging failure removes the destination and intermediates', as
         sourceProjectRef: REF,
         supabaseCliVersion: '2.114.0',
         ageRecipient: AGE_RECIPIENT_1,
+        agePath: '/fake/age',
         run: async () => {
           throw new Error('injected encryption failure');
         },

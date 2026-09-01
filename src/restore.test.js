@@ -70,6 +70,10 @@ async function makePackage(
     supabaseCliVersion: '2.114.0',
     format,
     ageRecipient: format === 'none' ? undefined : AGE_RECIPIENT_1,
+    // A fake path paired with the injected fakeAge run keeps structural
+    // tests independent of a real age binary; tests that run real age
+    // (encryption round-trips) pass no run and resolve the real binary.
+    agePath: format === 'none' ? undefined : run ? '/fake/age' : agePath(),
     run,
   });
   return pkgDir;
@@ -921,7 +925,7 @@ test('restore: a failed identity write removes its temp directory', async () => 
   const root = tmpdir('bp-rest-');
   const repoRoot = path.join(root, 'repo');
   fs.mkdirSync(path.join(repoRoot, 'backups', ENV), { recursive: true, mode: 0o700 });
-  const pkg = await makePackage(root);
+  const pkg = await makePackage(root, { run: fakeAge });
   fs.cpSync(pkg, path.join(repoRoot, 'backups', ENV, ID), { recursive: true });
   // Fail the private identity write AFTER the temp dir was allocated; the
   // identity material must never stay behind on a failed preparation.

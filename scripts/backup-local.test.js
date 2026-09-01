@@ -601,16 +601,22 @@ test('backup-local: bare invocation is grammar-safe and never touches the real l
   // The real `.env.development.local` satisfies config on a developer machine,
   // so a bare CLI spawn with a clean env would execute the REAL dump/package/
   // retention cycle (docker + Supabase CLI + the local store) from a unit
-  // test. Force a deterministic CONFLICT on BACKUP_ENVIRONMENT instead: the
-  // CLI must fail fast at the config gate, report the conflict (names only),
-  // and never run external work or mutate the developer's store.
+  // test. Force a deterministic BACKUP_ENVIRONMENT mismatch instead: when the
+  // dotenv file exists (developer machine) the process value conflicts with
+  // it, and when it is absent (CI) the value is simply invalid. Either way
+  // the CLI must fail fast at the config gate, report the problem (names
+  // only), and never run external work or mutate the developer's store.
   const storeDir = path.join(REPO_ROOT, 'local-backups', LOCAL_STORE_ENVIRONMENT);
   const before = fs.existsSync(storeDir) ? fs.readdirSync(storeDir) : [];
   const res = runCli([], { PATH: process.env.PATH, BACKUP_ENVIRONMENT: 'staging' });
-  assert.notEqual(res.status, 0, 'config gate must fail under the conflicting env');
+  assert.notEqual(res.status, 0, 'config gate must fail under the mismatched env');
   assert.ok(!res.stderr.includes('requires'), 'grammar accepted the bare invocation');
   assert.match(res.stderr, /Backup configuration error/, 'config gate is the failure point');
-  assert.match(res.stderr, /CONFLICT BACKUP_ENVIRONMENT/);
+  assert.match(
+    res.stderr,
+    /(CONFLICT|INVALID) BACKUP_ENVIRONMENT/,
+    'the gate failure must name BACKUP_ENVIRONMENT',
+  );
   assert.ok(!res.stderr.includes('created snapshot'), 'no backup run may be reported');
   const after = fs.existsSync(storeDir) ? fs.readdirSync(storeDir) : [];
   assert.deepEqual(after, before, 'a unit test must never publish into the real store');
