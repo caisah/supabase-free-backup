@@ -17,8 +17,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertNodeVersion } from '../src/runtime.js';
 import { createLogger } from '../src/logger.js';
-import { runCommand, lookupExecutable } from '../src/process.js';
-import { ENVIRONMENTS, REPOSITORY_ROOT, loadBackupConfig } from '../src/config.js';
+import { runCommand, lookupExecutable, TRUNCATED_MARKER } from '../src/process.js';
+import {
+  ENVIRONMENTS,
+  REPOSITORY_ROOT,
+  LEGACY_DB_URL_VARIABLE,
+  loadBackupConfig,
+} from '../src/config.js';
 
 /** Upper bound for a single `github:configure` run. */
 export const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -29,13 +34,18 @@ const EMPTY_ENVIRONMENT_BODY = '{}';
 /**
  * Immutable GitHub-name to validated config-property allowlists. Everything
  * writable is enumerated here so a future config field can never be uploaded
- * implicitly. Variables are written before secrets.
+ * implicitly. Variables are written before secrets. Only the new Shared
+ * Session Pooler secret is ever set; the legacy secret is handled by the
+ * fixed deletion target below.
  */
 export const GITHUB_SECRETS = Object.freeze({
-  SUPABASE_DB_URL: 'dbUrl',
+  SUPABASE_SHARED_POOLER_URL: 'sharedPoolerUrl',
   R2_ACCESS_KEY_ID: 'accessKeyId',
   R2_SECRET_ACCESS_KEY: 'secretAccessKey',
 });
+
+/** Fixed legacy Environment secret that may be DELETED after all upserts. */
+export const LEGACY_SUPABASE_SECRET = LEGACY_DB_URL_VARIABLE;
 
 export const GITHUB_VARIABLES = Object.freeze({
   SUPABASE_PROJECT_REF: 'projectRef',
@@ -125,7 +135,11 @@ export function loadGitHubEnvironmentConfigs({ root, loadConfig = loadBackupConf
     const filePath = envFilePath(root, environment);
     try {
       fs.accessSync(filePath, fs.constants.R_OK);
-    } catch {
+    } catch (err) {
+      // Only a genuinely absent file is skipped; an existing but unreadable
+      // file must fail before any GitHub mutation so one environment cannot
+      // be migrated while the other is silently left behind.
+      if (err.code !== 'ENOENT') throw err;
       continue;
     }
     const config = loadConfig({ environment, root, vars: {} });
@@ -196,9 +210,97 @@ async function setGitHubValue({
   logger.status(`github ${repository}: ${kind} ${name} set on ${environment}`);
 }
 
+/** Parse `gh secret list --json name` stdout (list of { name }) defensively. */
+function parseSecretInventory(stdout) {
+  const text = String(stdout ?? '');
+  if (text.startsWith(TRUNCATED_MARKER.stdout)) {
+    throw new Error(
+      'github configuration failed: the environment secret inventory exceeded the capture limit; refusing to guess which secrets already exist',
+    );
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text || '[]');
+  } catch {
+    throw new Error('github configuration failed: gh secret list returned malformed JSON');
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error('github configuration failed: gh secret list returned an unexpected shape');
+  }
+  const names = new Set();
+  for (const entry of parsed) {
+    if (entry && typeof entry.name === 'string' && entry.name.length > 0) names.add(entry.name);
+  }
+  return names;
+}
+
+/** Read-only inventory of existing secret names for every configured environment. */
+async function inventoryEnvironmentSecrets({
+  environments,
+  existing,
+  ghBin,
+  nameWithOwner,
+  run,
+  root,
+  signal,
+}) {
+  const inventory = {};
+  for (const environment of environments) {
+    // Environments that do not exist yet have no secrets; do not call the
+    // list endpoint before creating them.
+    if (!existing.has(environment)) {
+      inventory[environment] = new Set();
+      continue;
+    }
+    const res = await run({
+      command: ghBin,
+      args: ['secret', 'list', '--env', environment, '--repo', nameWithOwner, '--json', 'name'],
+      stdout: 'collect',
+      stderr: 'collect',
+      cwd: root,
+      signal,
+    });
+    inventory[environment] = parseSecretInventory(res.stdout);
+  }
+  return inventory;
+}
+
+/** Delete the fixed legacy secret for one environment; redact before rethrowing. */
+async function deleteLegacyGitHubSecret({ run, ghBin, environment, repository, logger, signal }) {
+  const args = [
+    'secret',
+    'delete',
+    LEGACY_SUPABASE_SECRET,
+    '--env',
+    environment,
+    '--repo',
+    repository,
+  ];
+  try {
+    await run({
+      command: ghBin,
+      args,
+      stdout: 'collect',
+      stderr: 'collect',
+      signal,
+    });
+  } catch (err) {
+    throw new Error(
+      `github configuration failed: secret ${LEGACY_SUPABASE_SECRET} delete on ${environment}: ${logger.redact(err.message ?? String(err))}`,
+      { cause: sanitizeCause(err, logger) },
+    );
+  }
+  logger.status(`github ${repository}: secret ${LEGACY_SUPABASE_SECRET} deleted on ${environment}`);
+}
+
 /**
  * Full GitHub Environment synchronization. All external commands go through
- * the injected `lookup`/`run` adapters with argument arrays only.
+ * the injected `lookup`/`run` adapters with argument arrays only. Mutation
+ * ordering is a contract: validate all local files -> inspect private
+ * repository -> list environments -> inventory existing environment secret
+ * names -> create missing environments -> upsert every variable and every
+ * new secret for every configured environment -> delete SUPABASE_DB_URL only
+ * where the pre-mutation inventory showed it existed.
  */
 export async function runConfigureGitHub({
   argv = process.argv.slice(2),
@@ -266,7 +368,7 @@ export async function runConfigureGitHub({
       signal,
     });
     const listed = String(list.stdout ?? '');
-    if (listed.startsWith('[stdout truncated]')) {
+    if (listed.startsWith(TRUNCATED_MARKER.stdout)) {
       throw new Error(
         'github configuration failed: the environment listing exceeded the capture limit; refusing to guess which environments already exist',
       );
@@ -277,6 +379,20 @@ export async function runConfigureGitHub({
         .map((line) => line.trim())
         .filter((line) => line.length > 0),
     );
+
+    // Read-only inventory BEFORE any mutation: every existing configured
+    // environment's current secret names. Stops on the first failure so
+    // environment creation, upserts, and deletion never start on a partial
+    // view.
+    const inventory = await inventoryEnvironmentSecrets({
+      environments,
+      existing,
+      ghBin,
+      nameWithOwner,
+      run,
+      root,
+      signal,
+    });
 
     // Create absent environments only; never touch protection on existing ones.
     const createdEnvironments = [];
@@ -339,7 +455,28 @@ export async function runConfigureGitHub({
     if (signal.aborted) {
       throw new Error(`github:configure timed out after ${timeoutMs}ms`);
     }
-    return { repository: nameWithOwner, createdEnvironments, upserts };
+
+    // Deletion phase: no legacy secret is touched until EVERY environment
+    // completed all upserts. Only the fixed legacy name may be deleted, and
+    // only where the pre-mutation inventory showed it existed (absent secrets
+    // are skipped, so reruns converge). A deletion failure stops later
+    // deletions but leaves the replacement secrets installed.
+    const legacySecretDeletions = {};
+    for (const environment of environments) {
+      legacySecretDeletions[environment] = false;
+      if (!inventory[environment].has(LEGACY_SUPABASE_SECRET)) continue;
+      await deleteLegacyGitHubSecret({
+        run,
+        ghBin,
+        environment,
+        repository: nameWithOwner,
+        logger,
+        signal,
+      });
+      legacySecretDeletions[environment] = true;
+    }
+
+    return { repository: nameWithOwner, createdEnvironments, upserts, legacySecretDeletions };
   } catch (err) {
     if (signal.aborted) {
       // A real child-process abort (ProcessAbortedError) or a stall both mean
