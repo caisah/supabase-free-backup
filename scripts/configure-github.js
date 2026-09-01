@@ -310,12 +310,17 @@ export async function runConfigureGitHub({
   platform = process.platform,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 } = {}) {
-  const { loadConfig = loadBackupConfig, lookup = lookupExecutable, run = runCommand } = deps;
+  const {
+    loadConfig = loadBackupConfig,
+    loadEnvConfigs = loadGitHubEnvironmentConfigs,
+    lookup = lookupExecutable,
+    run = runCommand,
+  } = deps;
 
   const parsed = parseConfigureGitHubArgs(argv);
   if (parsed.help) return { help: true };
 
-  const { configs, environments } = loadGitHubEnvironmentConfigs({ root, loadConfig, logger });
+  const { configs, environments } = loadEnvConfigs({ root, loadConfig, logger });
 
   if (environments.length === 0) {
     throw new Error('no .env.*.local files found; nothing to configure');

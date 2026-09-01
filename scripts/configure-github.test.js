@@ -9,6 +9,8 @@ import {
   parseConfigureGitHubArgs,
   loadGitHubEnvironmentConfigs,
   resolveGhBin,
+  GITHUB_SECRETS,
+  GITHUB_VARIABLES,
 } from './configure-github.js';
 import { loadBackupConfig, LEGACY_DB_URL_VARIABLE, REPOSITORY_ROOT } from '../src/config.js';
 import { createLogger } from '../src/logger.js';
@@ -107,6 +109,31 @@ function stubLoadConfig({ environment }) {
 }
 
 /**
+ * Stub for the dotenv file scan: both environments are always configured,
+ * with values coming from the injected loadConfig (never from repository
+ * .env files). Mirrors the real mapping and secret registration.
+ */
+function stubEnvConfigs({ root, loadConfig, logger }) {
+  const configs = {};
+  const environments = [];
+  for (const environment of ['development', 'production']) {
+    const config = loadConfig({ environment, root });
+    const secrets = {};
+    const variables = {};
+    for (const [name, property] of Object.entries(GITHUB_SECRETS)) {
+      secrets[name] = config[property];
+    }
+    for (const [name, property] of Object.entries(GITHUB_VARIABLES)) {
+      variables[name] = config[property];
+    }
+    for (const value of Object.values(secrets)) logger?.addSecret(value);
+    configs[environment] = { secrets, variables };
+    environments.push(environment);
+  }
+  return { configs, environments };
+}
+
+/**
  * Fake gh runner recording every invocation. `script` returns the fake
  * `{ stdout, stderr }` runCommand result; `failAt` makes call N reject;
  * `secretInventory` maps environment -> secret name list for `secret list`.
@@ -156,6 +183,7 @@ function makeDeps(overrides = {}) {
   return {
     deps: {
       loadConfig: overrides.loadConfig ?? loadBackupConfig,
+      loadEnvConfigs: overrides.loadEnvConfigs ?? stubEnvConfigs,
       lookup: () => '/usr/local/bin/gh',
       run: gh.run,
     },
@@ -422,6 +450,7 @@ test('github:configure: rejects a missing gh executable before any command', asy
   const gh = makeGh();
   const deps = {
     loadConfig: stubLoadConfig,
+    loadEnvConfigs: stubEnvConfigs,
     lookup: () => null,
     run: gh.run,
   };
@@ -653,7 +682,7 @@ test('github:configure: inventory completes for every existing environment befor
   const result = await runConfigureGitHub({
     argv: [],
     logger: silentLogger(),
-    deps: { loadConfig: stubLoadConfig, lookup: () => '/gh', run },
+    deps: { loadConfig: stubLoadConfig, loadEnvConfigs: stubEnvConfigs, lookup: () => '/gh', run },
   });
   const listIndexes = order.map((o, i) => (o.startsWith('list:') ? i : -1)).filter((i) => i !== -1);
   assert.deepEqual(listIndexes, [2, 3], `inventory must precede mutation: ${order.join(', ')}`);
@@ -688,7 +717,12 @@ test('github:configure: inventory failure causes zero mutation', async () => {
       runConfigureGitHub({
         argv: [],
         logger: silentLogger(),
-        deps: { loadConfig: stubLoadConfig, lookup: () => '/gh', run },
+        deps: {
+          loadConfig: stubLoadConfig,
+          loadEnvConfigs: stubEnvConfigs,
+          lookup: () => '/gh',
+          run,
+        },
       }),
     /gh secret list failed/,
   );
@@ -722,7 +756,12 @@ test('github:configure: malformed or truncated secret inventory fails closed bef
         runConfigureGitHub({
           argv: [],
           logger: silentLogger(),
-          deps: { loadConfig: stubLoadConfig, lookup: () => '/gh', run },
+          deps: {
+            loadConfig: stubLoadConfig,
+            loadEnvConfigs: stubEnvConfigs,
+            lookup: () => '/gh',
+            run,
+          },
         }),
       /github configuration failed/,
       bad,
@@ -796,7 +835,12 @@ test('github:configure: rerun after a failed partial deletion deletes only the r
     }
     return { stdout: '', stderr: '' };
   };
-  const deps = { loadConfig: stubLoadConfig, lookup: () => '/gh', run };
+  const deps = {
+    loadConfig: stubLoadConfig,
+    loadEnvConfigs: stubEnvConfigs,
+    lookup: () => '/gh',
+    run,
+  };
   await assert.rejects(() => runConfigureGitHub({ argv: [], logger: silentLogger(), deps }));
   assert.ok(state.development.size === 0, 'development legacy secret deleted by the first run');
   assert.ok(state.production.size === 1, 'production legacy secret survives the first run');
@@ -913,6 +957,7 @@ test('github:configure: Windows cmd wrapper is used end to end for list, set, an
     platform: 'win32',
     deps: {
       loadConfig: stubLoadConfig,
+      loadEnvConfigs: stubEnvConfigs,
       lookup: (name) => ({ 'gh.cmd': '/c/gh.cmd' })[name] ?? null,
       run,
     },
@@ -943,7 +988,12 @@ test('github:configure: a truncated environment listing fails closed', async () 
       runConfigureGitHub({
         argv: [],
         logger: silentLogger(),
-        deps: { loadConfig: stubLoadConfig, lookup: () => '/gh', run },
+        deps: {
+          loadConfig: stubLoadConfig,
+          loadEnvConfigs: stubEnvConfigs,
+          lookup: () => '/gh',
+          run,
+        },
       }),
     /capture limit/i,
   );
@@ -967,7 +1017,12 @@ test('github:configure: a stalled gh call is bounded by the timeout', async () =
         argv: [],
         logger: silentLogger(),
         timeoutMs: 20,
-        deps: { loadConfig: stubLoadConfig, lookup: () => '/gh', run },
+        deps: {
+          loadConfig: stubLoadConfig,
+          loadEnvConfigs: stubEnvConfigs,
+          lookup: () => '/gh',
+          run,
+        },
       }),
     /timed out/i,
   );
