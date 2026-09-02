@@ -1,12 +1,13 @@
 /**
- * Read-only local-stack helpers for `backup:local`.
+ * Read-only local-stack helpers for `backup:local` and `restore:local`.
  *
  * Hosts the workdir parsing/validation and the read-only psql probe used by
- * the local backup store. Nothing here starts, stops, resets, or migrates
- * the local stack, and no restore flow exists: a local snapshot carries the
- * store label `local` and NO project ref — the hosted restore target is
- * chosen at RESTORE time (`restore:development|production --source local`)
- * and is never expected on a local snapshot's manifest.
+ * the local backup store and the local restore flow (which lives in
+ * local-restore.js). Nothing here starts, stops, resets, or migrates the
+ * local stack, and a local snapshot carries the store label `local` and NO
+ * project ref — the hosted restore target is chosen at RESTORE time
+ * (`restore:development|production --source local`) and is never expected
+ * on a local snapshot's manifest.
  */
 
 import fs from 'node:fs';
@@ -160,6 +161,7 @@ export async function localPsqlQuery({ dockerPath, dbContainer, query, run, sign
       'exec',
       dbContainer,
       'psql',
+      '-X',
       '-U',
       'postgres',
       '-d',

@@ -32,6 +32,13 @@ export class HostedRestoreError extends Error {
 
 export const PROJECT_TRIGGERS = ['create_account_for_new_user', 'cleanup_deleted_user_vouches'];
 export const CREATE_ROLE_LINE = /^\s*CREATE ROLE "((?:[^"]|"")+)"\s*;\s*$/;
+/**
+ * Canonical pg_dumpall `ALTER ROLE <name> ...` lines, quoted or (for simple
+ * identifiers) unquoted. The semantic guard is NOT this regex: a line is
+ * only commented when its role also exists on the target (the CREATE branch
+ * fails closed on any other syntax, and ALTER mirrors that below).
+ */
+export const ALTER_ROLE_LINE = /^\s*ALTER ROLE (?:"((?:[^"]|"")+)"|([A-Za-z_][A-Za-z0-9_$]*))\s/;
 
 /**
  * Canonical restore ORDER of the plaintext schema artifacts inside the ONE
@@ -59,8 +66,46 @@ const DROP_MIGRATION_HISTORY_PRIMARY_KEY_SQL =
   'ALTER TABLE ONLY "supabase_migrations"."schema_migrations"\n    DROP CONSTRAINT IF EXISTS "schema_migrations_pkey";';
 
 /**
- * Prepare roles in ONE pass and report how many canonical CREATE ROLE
- * statements were commented because the role already exists on the target.
+ * Keep only project-owned auth/storage changes in the managed delta: every
+ * Supabase-managed Storage trigger line is commented, because the target
+ * platform owns those triggers — a hosted `db reset` preserves them and a
+ * fresh local-stack bootstrap creates them — so replaying the canonical
+ * dump would fail with `already exists`.
+ */
+export function prepareManagedSchemaSql(managedSql) {
+  return managedSql
+    .split(/\r?\n/)
+    .map((line) =>
+      SUPABASE_MANAGED_TRIGGER_STATEMENTS.has(line.trim())
+        ? `-- managed by hosted Supabase; ${line.trim()}`
+        : line,
+    )
+    .join('\n');
+}
+
+/**
+ * Replace the canonical migration-history primary-key definition with a
+ * DROP-IF-EXISTS followed by the canonical ADD: every restore target
+ * already owns the constraint (a hosted reset truncates the table but
+ * preserves the key; a local-stack bootstrap creates it), so replaying
+ * the dump verbatim would fail with `already exists`.
+ */
+export function prepareMigrationHistorySql(migrationHistorySql) {
+  return migrationHistorySql.replace(
+    MIGRATION_HISTORY_PRIMARY_KEY_SQL,
+    `${DROP_MIGRATION_HISTORY_PRIMARY_KEY_SQL}\n\n${MIGRATION_HISTORY_PRIMARY_KEY_SQL}`,
+  );
+}
+
+/**
+ * Prepare roles in ONE pass and report how many roles were prepared away
+ * because they already exist on the target. Existing roles keep BOTH their
+ * canonical CREATE ROLE and every paired ALTER ROLE statement commented: a
+ * role that exists on the target is platform- or migration-owned, and the
+ * hosted session (non-superuser pooler) is rejected when it tries to modify
+ * reserved platform roles (e.g. supabase_admin). New roles stay fully
+ * active with their attributes. `skipped` counts roles, not lines, and the
+ * skip marker is emitted once per role.
  */
 function prepareRolesFileWithCount({
   rolesSql,
@@ -70,17 +115,22 @@ function prepareRolesFileWithCount({
   const existing = new Set(existingRoles);
   const lines = rolesSql.split(/\r?\n/);
   const out = [];
+  const marked = new Set();
   let skipped = 0;
   for (const line of lines) {
     if (line.trim() === 'GRANT SET ON PARAMETER "log_min_messages" TO "supabase_realtime_admin";') {
       out.push(`-- managed by hosted Supabase; ${line.trim()}`);
       continue;
     }
-    const match = CREATE_ROLE_LINE.exec(line);
-    if (match) {
-      const role = match[1].replaceAll('""', '"');
+    const createMatch = CREATE_ROLE_LINE.exec(line);
+    if (createMatch) {
+      const role = decodeIdentifier(createMatch[1]);
       if (existing.has(role)) {
-        out.push(`-- ${marker}\n-- ${line}`);
+        if (!marked.has(role)) {
+          out.push(`-- ${marker}`);
+          marked.add(role);
+        }
+        out.push(`-- ${line}`);
         skipped += 1;
         continue;
       }
@@ -93,16 +143,45 @@ function prepareRolesFileWithCount({
         { stage: 'roles' },
       );
     }
+    const alterMatch = ALTER_ROLE_LINE.exec(line);
+    if (alterMatch) {
+      const role = decodeIdentifier(alterMatch[1] ?? alterMatch[2]);
+      if (existing.has(role)) {
+        if (!marked.has(role)) {
+          out.push(`-- ${marker}`);
+          marked.add(role);
+        }
+        out.push(`-- ${line}`);
+        continue;
+      }
+      out.push(line);
+      continue;
+    }
+    if (/^\s*ALTER ROLE\b/.test(line)) {
+      // Symmetric with the CREATE branch: an unrecognized ALTER ROLE shape
+      // must fail during preparation, never silently replay un-commented.
+      throw new HostedRestoreError(
+        'unexpected ALTER ROLE syntax in roles dump; refusing broad replacement',
+        { stage: 'roles' },
+      );
+    }
     out.push(line);
   }
   return { sql: out.join('\n'), skipped };
 }
 
+function decodeIdentifier(identifier) {
+  return identifier.replaceAll('""', '"');
+}
+
 /**
- * Strictly prepare the roles file for the TARGET database: comment ONLY the
- * canonical `CREATE ROLE "x";` statements whose roles already exist and the
- * local-stack parameter grant managed by hosted Supabase; preserve every other
- * ALTER ROLE/GRANT line; reject any other CREATE ROLE syntax.
+ * Strictly prepare the roles file for the TARGET database: comment the
+ * canonical `CREATE ROLE "x";` and every paired ALTER ROLE statement for
+ * roles that already exist (never modifying an existing role: some are
+ * reserved platform roles the hosted non-superuser session cannot alter) and
+ * the local-stack parameter grant managed by hosted Supabase; preserve every
+ * other ALTER ROLE/GRANT line for new roles; reject any other CREATE ROLE
+ * syntax.
  *
  * @param {{rolesSql:string, existingRoles:string[], marker?:string}} opts
  */
@@ -136,10 +215,6 @@ const TARGET_MANAGED_DATA_SCHEMAS = new Set(['auth', 'storage', 'supabase_functi
 
 function objectKey(schema, name) {
   return JSON.stringify([schema, name]);
-}
-
-function decodeIdentifier(identifier) {
-  return identifier.replaceAll('""', '"');
 }
 
 function parseCopyHeader(line) {
@@ -186,10 +261,12 @@ function createCleanupScanner({ targetRelations, targetSequences } = {}) {
   const truncates = [];
   const skippedRelations = new Set();
   const skippedSequences = new Set();
+  const publicTables = new Set();
   let activeCopy = null;
   return {
     skippedRelations,
     skippedSequences,
+    publicTables,
     push(line) {
       if (activeCopy) {
         if (line === '\\.') {
@@ -222,6 +299,9 @@ function createCleanupScanner({ targetRelations, targetSequences } = {}) {
           }
         }
         activeCopy = { ...header, problem };
+        if (header.schema === 'public') {
+          publicTables.add(objectKey(header.schema, header.table));
+        }
         if (!relationExists || header.schema === 'public') return;
         const key = objectKey(header.schema, header.table);
         if (seen.has(key)) return;
@@ -259,7 +339,7 @@ function createCleanupScanner({ targetRelations, targetSequences } = {}) {
   };
 }
 
-async function scanDataDumpFile({ dataPath, targetRelations, targetSequences }) {
+export async function scanDataDumpFile({ dataPath, targetRelations, targetSequences }) {
   const scanner = createCleanupScanner({ targetRelations, targetSequences });
   const lines = readline.createInterface({
     input: fs.createReadStream(dataPath),
@@ -274,6 +354,9 @@ async function scanDataDumpFile({ dataPath, targetRelations, targetSequences }) 
     cleanupSql: scanner.result(),
     skippedRelations: scanner.skippedRelations,
     skippedSequences: scanner.skippedSequences,
+    // Distinct COPY targets in the `public` schema (the verification count
+    // the local restore checks the committed result against).
+    publicTables: scanner.publicTables,
   };
 }
 
@@ -381,7 +464,7 @@ export async function psqlQuery({
   return psqlOutputLines(res.stdout);
 }
 
-const TARGET_MANAGED_DATA_OBJECTS_QUERY = `
+export const TARGET_MANAGED_DATA_OBJECTS_QUERY = `
 SELECT json_build_object(
   'kind', CASE WHEN c.relkind = 'S' THEN 'sequence' ELSE 'relation' END,
   'schema', c.relnamespace::regnamespace::name,
@@ -397,15 +480,12 @@ WHERE c.relkind IN ('r', 'p', 'S')
   AND c.relnamespace::regnamespace::name IN ('auth', 'storage', 'supabase_functions')
 ORDER BY c.relnamespace::regnamespace::name, c.relname`;
 
-async function readTargetManagedDataObjects({ dockerPath, postgresImage, dbUrl, run, signal }) {
-  const lines = await psqlQuery({
-    dockerPath,
-    postgresImage,
-    dbUrl,
-    query: TARGET_MANAGED_DATA_OBJECTS_QUERY,
-    run,
-    signal,
-  });
+/**
+ * Parse the target catalog probe output (one JSON object per line) into
+ * relation->column-set and sequence maps. Malformed lines fail closed: a
+ * corrupted probe could bypass managed-data compatibility checks.
+ */
+export function parseTargetManagedDataObjects(lines) {
   const relations = new Map();
   const sequences = new Set();
   for (const line of lines) {
@@ -436,6 +516,18 @@ async function readTargetManagedDataObjects({ dockerPath, postgresImage, dbUrl, 
   return { relations, sequences };
 }
 
+async function readTargetManagedDataObjects({ dockerPath, postgresImage, dbUrl, run, signal }) {
+  const lines = await psqlQuery({
+    dockerPath,
+    postgresImage,
+    dbUrl,
+    query: TARGET_MANAGED_DATA_OBJECTS_QUERY,
+    run,
+    signal,
+  });
+  return parseTargetManagedDataObjects(lines);
+}
+
 /** Read-only connectivity preflight: image/version, then a live target. */
 export async function readOnlyPreflight({
   dockerPath,
@@ -464,9 +556,11 @@ export async function readOnlyPreflight({
  * Generate private target-adapted SQL (roles, managed delta, migration
  * history, cleanup) in the prepared workspace with mode 0600. The cleanup
  * pass streams multi-gigabyte row data; the schema metadata stays bounded by
- * verified snapshot limits.
+ * verified snapshot limits. Shared by the hosted and local-stack restore
+ * flows against their own target catalogs; the caller supplies the target's
+ * recent roles and managed data objects.
  */
-async function prepareHostedAuxiliaryFiles({
+export async function prepareRestoreAuxiliaryFiles({
   prepared,
   recentRoles,
   targetDataObjects,
@@ -478,24 +572,13 @@ async function prepareHostedAuxiliaryFiles({
   // delta must retain only project-owned auth/storage changes.
   // ponytail: these files are bounded at 512 MiB; stream the rewrites if
   // managed schema deltas ever approach that limit.
-  const managedSql = fs.readFileSync(path.join(prepared.dir, 'managed-schema.sql'), 'utf8');
-  const managedPreparedSql = managedSql
-    .split(/\r?\n/)
-    .map((line) =>
-      SUPABASE_MANAGED_TRIGGER_STATEMENTS.has(line.trim())
-        ? `-- managed by hosted Supabase; ${line.trim()}`
-        : line,
-    )
-    .join('\n');
+  const managedPreparedSql = prepareManagedSchemaSql(
+    fs.readFileSync(path.join(prepared.dir, 'managed-schema.sql'), 'utf8'),
+  );
   // Remote reset truncates but preserves this table and primary key. Replace
   // the key transactionally before replaying its canonical dumped definition.
-  const migrationHistorySql = fs.readFileSync(
-    path.join(prepared.dir, 'migration-history-schema.sql'),
-    'utf8',
-  );
-  const migrationHistoryPreparedSql = migrationHistorySql.replace(
-    MIGRATION_HISTORY_PRIMARY_KEY_SQL,
-    `${DROP_MIGRATION_HISTORY_PRIMARY_KEY_SQL}\n\n${MIGRATION_HISTORY_PRIMARY_KEY_SQL}`,
+  const migrationHistoryPreparedSql = prepareMigrationHistorySql(
+    fs.readFileSync(path.join(prepared.dir, 'migration-history-schema.sql'), 'utf8'),
   );
   const dataScan = await scanDataDumpFile({
     dataPath: prepared.dataPath,
@@ -504,7 +587,7 @@ async function prepareHostedAuxiliaryFiles({
   });
   const cleanupSql = dataScan.cleanupSql;
   const auxDir = path.join(prepared.dir, '.restore-aux');
-  fs.mkdirSync(auxDir, { mode: 0o700 });
+  fs.mkdirSync(auxDir, { recursive: true, mode: 0o700 });
   const rolesFile = path.join(auxDir, 'roles.prepared.sql');
   const managedFile = path.join(auxDir, 'managed-schema.prepared.sql');
   const migrationHistoryFile = path.join(auxDir, 'migration-history-schema.prepared.sql');
@@ -528,6 +611,9 @@ async function prepareHostedAuxiliaryFiles({
     skippedSequences: dataScan.skippedSequences,
     rolesSkipped: rolesPrepared.skipped,
     truncatedTables: cleanupLines ? cleanupLines.split('\n').length : 0,
+    // Distinct public COPY targets in the dump; the local flow verifies the
+    // restored public table count against this set after the transaction.
+    publicTables: dataScan.publicTables,
   };
 }
 
@@ -692,8 +778,11 @@ async function applyHostedRestore({
  * Wrap the lazy restore input so the caller can tell whether ANY SQL was
  * actually delivered to the child before a failure: docker never launching
  * must not be reported as "the transaction was rolled back".
+ *
+ * @param {import('node:stream').Readable} input
+ * @returns {{stream: import('node:stream').Readable, state: {started: boolean}}}
  */
-function trackInputDelivery(input) {
+export function trackInputDelivery(input) {
   const state = { started: false };
   const stream = Readable.from(
     (async function* () {
@@ -788,7 +877,7 @@ export async function executeHostedRestore({
     run,
     signal,
   });
-  const aux = await prepareHostedAuxiliaryFiles({
+  const aux = await prepareRestoreAuxiliaryFiles({
     prepared,
     recentRoles,
     targetDataObjects,

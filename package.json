@@ -16,6 +16,7 @@
     "backup:local": "node scripts/backup-local.js",
     "restore:development": "node scripts/restore-hosted.js development",
     "restore:production": "node scripts/restore-hosted.js production",
+    "restore:local": "node scripts/restore-local.js",
     "reset:development": "node scripts/reset-hosted.js development",
     "reset:production": "node scripts/reset-hosted.js production",
     "reset:local": "node scripts/reset-local.js",

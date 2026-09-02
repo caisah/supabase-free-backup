@@ -22,9 +22,15 @@ export const HOSTED_RESTORE_USAGE =
 export const HOSTED_RESET_USAGE = 'usage: vp run reset:development|reset:production';
 export const LOCAL_BACKUP_USAGE = 'usage: vp run backup:local';
 export const LOCAL_RESET_USAGE = 'usage: vp run reset:local';
+export const LOCAL_RESTORE_USAGE =
+  'usage: vp run restore:local --environment <development|production> --source <r2|repo> --backup <latest|snapshot-id>';
 
 // Hosted restores additionally read the private local snapshot store.
 const HOSTED_RESTORE_SOURCES = ['r2', 'repo', 'local'];
+
+// Local-stack restores read hosted snapshots only; the plaintext local store
+// feeds hosted restores (`restore:development|production --source local`).
+const LOCAL_RESTORE_SOURCES = ['r2', 'repo'];
 
 /** Map a restore result to its CLI exit code: 0 success/help, 2 declined. */
 export function exitCodeForResult(result) {
@@ -57,6 +63,10 @@ const RESTORE_OPTIONS = {
   ...HELP_OPTIONS,
   source: { type: 'string' },
   backup: { type: 'string' },
+};
+const LOCAL_RESTORE_OPTIONS = {
+  ...RESTORE_OPTIONS,
+  environment: { type: 'string' },
 };
 const LOCAL_BACKUP_OPTIONS = {
   ...HELP_OPTIONS,
@@ -143,6 +153,34 @@ export function parseHostedRestoreArgs(argv) {
     throw new Error('restore requires --backup latest|<snapshot-id>');
   }
   return { target, source, backup: values.backup };
+}
+
+/**
+ * Parse the local-restore arguments: `--environment` selects the hosted
+ * snapshot environment, `--source`/`--backup` select the snapshot itself.
+ * @returns {{environment:string, source:string, backup:string}|{help:true}}
+ */
+export function parseLocalRestoreArgs(argv) {
+  const parsed = parseArgs({
+    args: argv,
+    options: LOCAL_RESTORE_OPTIONS,
+    strict: true,
+    allowPositionals: false,
+  });
+  const values = parsed.values;
+  if (values.help) return { help: true };
+  const environment = values.environment;
+  if (environment === undefined || !ENVIRONMENTS.includes(environment)) {
+    throw new Error('restore:local requires --environment development|production');
+  }
+  const source = values.source;
+  if (source === undefined || !LOCAL_RESTORE_SOURCES.includes(source)) {
+    throw new Error('restore:local requires --source r2|repo');
+  }
+  if (values.backup === undefined) {
+    throw new Error('restore:local requires --backup latest|<snapshot-id>');
+  }
+  return { environment, source, backup: values.backup };
 }
 
 /**

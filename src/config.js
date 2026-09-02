@@ -553,6 +553,51 @@ export function loadHostedRestoreConfig({ source, ...opts }) {
   return loadOperationConfig({ ...opts, requirements });
 }
 
+/**
+ * Local-stack restore: hosted snapshot (r2|repo) into the sibling workdir.
+ * Consumes the source credentials of the SELECTED environment (the snapshot
+ * source) but never the hosted connection URL/ref: the target is always the
+ * local stack, so no hosted URL exists on this path. The target workdir is
+ * read from the FIXED local-stack environment (LOCAL_STACK_ENVIRONMENT),
+ * exactly like backup:local/reset:local — selecting a production snapshot
+ * can never redirect the destructive local target to a production workdir.
+ * Restore only decrypts, so the encryption recipient (ENCRYPT_KEY) is
+ * neither required nor consumed.
+ */
+const LOCAL_RESTORE_REQUIREMENTS = {
+  r2: {
+    accountId: true,
+    r2: true,
+    ageIdentity: true,
+    consumedOnly: true,
+  },
+  repo: {
+    ageIdentity: true,
+    consumedOnly: true,
+  },
+};
+
+/**
+ * Local-stack restore (development/production snapshot). The source
+ * credentials resolve from the selected environment; PROJECT_WORKDIR is
+ * resolved from the FIXED local-stack environment file, so the snapshot
+ * environment never selects the destructive target.
+ */
+export function loadLocalRestoreConfig({ source, root, vars, ...opts }) {
+  const requirements = LOCAL_RESTORE_REQUIREMENTS[source];
+  if (!requirements) {
+    throw new ConfigError(['source must be one of: r2, repo']);
+  }
+  const sourceCfg = loadOperationConfig({ ...opts, root, vars, requirements });
+  const targetCfg = loadOperationConfig({
+    environment: LOCAL_STACK_ENVIRONMENT,
+    root,
+    vars,
+    requirements: LOCAL_RESET_REQUIREMENTS,
+  });
+  return { ...sourceCfg, projectWorkdir: targetCfg.projectWorkdir };
+}
+
 /** Hosted reset: target URL and ref only, same consumed-scope as local restores. */
 const HOSTED_RESET_REQUIREMENTS = {
   projectRef: true,

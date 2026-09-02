@@ -245,28 +245,79 @@ test('hosted: a Docker launch failure before any SQL is delivered is not reporte
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('hosted: duplicate roles are commented narrowly, others untouched', () => {
+test('hosted: existing roles are fully untouched, new roles keep their attributes', () => {
   const out = prepareRolesFile({ rolesSql: ROLES_SQL, existingRoles: ['anon'] });
   const lines = out.split('\n');
   const anonCreate = lines.findIndex((l) => l.includes('CREATE ROLE "anon"'));
+  assert.equal(
+    lines.filter((l) => l.startsWith('-- already exists on target')).length,
+    1,
+    'the skip marker is emitted ONCE per role, not per line',
+  );
   assert.ok(lines[anonCreate - 1].includes('already exists on target'));
   assert.ok(lines[anonCreate].startsWith('-- '), 'existing role CREATE is commented');
+  const anonAlter = lines.findIndex((l) => l.includes('ALTER ROLE "anon"'));
   assert.ok(
-    lines.some((l) => l.includes('ALTER ROLE "anon"')),
-    'ALTER preserved',
+    lines[anonAlter].startsWith('-- '),
+    'existing role ALTER is commented: modifying it would fail on reserved roles and is meaningless for any existing role',
   );
   assert.ok(
     lines.some((l) => !l.startsWith('--') && l.includes('CREATE ROLE "app_custom"')),
     'new role kept active',
   );
   assert.ok(
-    lines.some((l) => l.includes('ALTER ROLE "app_custom" WITH LOGIN')),
+    lines.some((l) => !l.startsWith('--') && l.includes('ALTER ROLE "app_custom" WITH LOGIN')),
     'its ALTER preserved',
   );
   assert.ok(
-    lines.some((l) => l.includes('GRANT USAGE')),
+    lines.some((l) => !l.startsWith('--') && l.includes('GRANT USAGE')),
     'grants preserved',
   );
+});
+
+test('hosted: unquoted ALTER ROLE identifiers are commented for existing roles and kept for new roles', () => {
+  const out = prepareRolesFile({
+    rolesSql:
+      'CREATE ROLE "anon";\nALTER ROLE anon WITH NOLOGIN;\nALTER ROLE app_custom WITH LOGIN;\n',
+    existingRoles: ['anon'],
+  });
+  const lines = out.split('\n');
+  assert.ok(
+    lines.some((l) => l.startsWith('-- ') && l.includes('ALTER ROLE anon WITH NOLOGIN')),
+    'unquoted existing-role ALTER must be commented (pooler cannot modify it)',
+  );
+  assert.ok(
+    lines.some((l) => !l.startsWith('--') && l.includes('ALTER ROLE app_custom WITH LOGIN')),
+    'unquoted new-role ALTER stays active',
+  );
+});
+
+test('hosted: unexpected ALTER ROLE syntax fails closed like unexpected CREATE ROLE', () => {
+  assert.throws(
+    () =>
+      prepareRolesFile({
+        rolesSql: 'CREATE ROLE "anon";\nALTER ROLE anon;\n',
+        existingRoles: ['anon'],
+      }),
+    (err) => err instanceof HostedRestoreError && /ALTER ROLE/.test(err.message),
+  );
+});
+
+test('hosted: reserved platform roles already on the target are never modified', () => {
+  const rolesSql = [
+    'CREATE ROLE "supabase_admin";',
+    'ALTER ROLE "supabase_admin" WITH NOSUPERUSER INHERIT NOCREATEROLE NOCREATEDB NOLOGIN NOREPLICATION NOBYPASSRLS;',
+    'ALTER ROLE "supabase_admin" SET search_path TO public;',
+  ].join('\n');
+  const out = prepareRolesFile({
+    rolesSql,
+    existingRoles: ['postgres', 'supabase_admin'],
+  });
+  for (const line of out.split('\n')) {
+    if (line.includes('supabase_admin')) {
+      assert.ok(line.startsWith('--'), `reserved role statement must be commented: ${line}`);
+    }
+  }
 });
 
 test('hosted: local managed parameter grant is commented and other grants are preserved', () => {

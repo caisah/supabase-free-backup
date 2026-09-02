@@ -8,12 +8,14 @@ import {
   parseHostedResetArgs,
   parseLocalBackupArgs,
   parseLocalResetArgs,
+  parseLocalRestoreArgs,
   BACKUP_USAGE,
   COMMIT_WEEKLY_USAGE,
   HOSTED_RESTORE_USAGE,
   HOSTED_RESET_USAGE,
   LOCAL_BACKUP_USAGE,
   LOCAL_RESET_USAGE,
+  LOCAL_RESTORE_USAGE,
 } from './args.js';
 
 const CWD = '/repo/root';
@@ -29,6 +31,10 @@ test('args: usage text constants are the single CLI grammar', () => {
   assert.match(HOSTED_RESTORE_USAGE, /usage: vp run restore:development\|restore:production/);
   assert.match(HOSTED_RESET_USAGE, /usage: vp run reset:development\|reset:production/);
   assert.match(LOCAL_RESET_USAGE, /^usage: vp run reset:local$/);
+  assert.match(
+    LOCAL_RESTORE_USAGE,
+    /usage: vp run restore:local --environment <development\|production> --source <r2\|repo>/,
+  );
 });
 
 test('args: backup parses the documented invocation with defaults', () => {
@@ -106,6 +112,76 @@ test('args: commit-weekly rejects empty path option values', () => {
   assert.throws(
     () => parseCommitWeeklyArgs(['--staging-dir', 'c', '--repo-root', '   '], { cwd: CWD }),
     /non-empty/,
+  );
+});
+
+test('args: local restore parses the environment flag and snapshot selector', () => {
+  assert.deepEqual(
+    parseLocalRestoreArgs(['--environment', 'development', '--source', 'r2', '--backup', 'latest']),
+    { environment: 'development', source: 'r2', backup: 'latest' },
+  );
+  assert.deepEqual(
+    parseLocalRestoreArgs(['--environment', 'production', '--source', 'repo', '--backup', ID]),
+    { environment: 'production', source: 'repo', backup: ID },
+  );
+});
+
+test('args: local restore help forms', () => {
+  assert.deepEqual(parseLocalRestoreArgs(['--help']), { help: true });
+  assert.deepEqual(parseLocalRestoreArgs(['-h']), { help: true });
+});
+
+test('args: local restore rejects the local store source and malformed flags', () => {
+  // The plaintext local store feeds hosted restores only; r2|repo are the
+  // only snapshot sources this target can read.
+  assert.throws(
+    () =>
+      parseLocalRestoreArgs([
+        '--environment',
+        'development',
+        '--source',
+        'local',
+        '--backup',
+        'latest',
+      ]),
+    /r2\|repo/,
+  );
+  assert.throws(
+    () => parseLocalRestoreArgs(['--source', 'r2', '--backup', 'latest']),
+    /--environment/,
+  );
+  assert.throws(
+    () =>
+      parseLocalRestoreArgs(['--environment', 'staging', '--source', 'r2', '--backup', 'latest']),
+    /development\|production/,
+  );
+  assert.throws(
+    () => parseLocalRestoreArgs(['--environment', 'development', '--backup', 'latest']),
+    /--source/,
+  );
+  assert.throws(
+    () => parseLocalRestoreArgs(['--environment', 'development', '--source', 'r2']),
+    /--backup/,
+  );
+  assert.throws(
+    () => parseLocalRestoreArgs(['--environment', 'development', '--source', 'r2', '--bogus', 'x']),
+    UNKNOWN_OPTION,
+  );
+  assert.throws(
+    () =>
+      parseLocalRestoreArgs([
+        '--environment',
+        'development',
+        '--source',
+        'r2',
+        '--backup',
+        '--help',
+      ]),
+    MISSING_VALUE,
+  );
+  assert.throws(
+    () => parseLocalRestoreArgs(['development', '--source', 'r2', '--backup', 'latest']),
+    POSITIONAL,
   );
 });
 

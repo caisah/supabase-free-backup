@@ -7,6 +7,7 @@ import {
   loadBackupConfig,
   loadHostedRestoreConfig,
   loadLocalBackupConfig,
+  loadLocalRestoreConfig,
   classifySharedPoolerUrl,
   ConfigError,
   CONFLICT_PREFIX,
@@ -870,6 +871,123 @@ test('config: hosted local source never consumes DECRYPT_KEY (legacy encrypted-l
   });
   assert.equal(cfg2.ageIdentity, undefined);
   assert.equal(cfg2.projectRef, REF_DEV);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: local restore consumes workdir + source credentials, never the hosted URL', () => {
+  const root = makeRoot();
+  devFile(root, {
+    SUPABASE_SHARED_POOLER_URL: 'not-a-valid-pooler-url',
+    SUPABASE_PROJECT_REF: REF_DEV,
+    R2_ACCESS_KEY_ID: 'dev-access-key-12345',
+    R2_SECRET_ACCESS_KEY: 'dev-secret-key-abcdefghijklmnop',
+    CLOUDFLARE_ACCOUNT_ID: '0123456789abcdef0123456789abcdef',
+    R2_BUCKET: 'development',
+  });
+  const r2Cfg = loadLocalRestoreConfig({
+    environment: 'development',
+    source: 'r2',
+    root,
+    vars: {},
+  });
+  assert.equal(r2Cfg.environment, 'development');
+  assert.equal(r2Cfg.bucket, 'development');
+  assert.equal(r2Cfg.accessKeyId, 'dev-access-key-12345');
+  assert.equal(r2Cfg.projectWorkdir, path.resolve(root, '..', 'project'));
+  assert.equal(r2Cfg.ageIdentity, 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ');
+  for (const name of ['projectRef', 'sharedPoolerUrl']) {
+    assert.ok(!Object.hasOwn(r2Cfg, name), `r2 local restore exposed ${name}`);
+  }
+  const repoCfg = loadLocalRestoreConfig({
+    environment: 'development',
+    source: 'repo',
+    root,
+    vars: {},
+  });
+  assert.equal(repoCfg.projectWorkdir, r2Cfg.projectWorkdir);
+  for (const name of ['accountId', 'bucket', 'accessKeyId', 'secretAccessKey', 'projectRef']) {
+    assert.ok(!Object.hasOwn(repoCfg, name), `repo local restore exposed ${name}`);
+  }
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: local restore requires the age identity and workdir; r2 also needs credentials', () => {
+  const root = makeRoot();
+  devFile(root, { DECRYPT_KEY: undefined });
+  assert.throws(
+    () => loadLocalRestoreConfig({ environment: 'development', source: 'repo', root, vars: {} }),
+    (err) => err instanceof ConfigError && err.message.includes('DECRYPT_KEY'),
+  );
+  devFile(root, { PROJECT_WORKDIR: undefined });
+  assert.throws(
+    () => loadLocalRestoreConfig({ environment: 'development', source: 'repo', root, vars: {} }),
+    (err) => err instanceof ConfigError && err.message.includes('PROJECT_WORKDIR'),
+  );
+  devFile(root, {
+    R2_ACCESS_KEY_ID: undefined,
+    R2_SECRET_ACCESS_KEY: undefined,
+    CLOUDFLARE_ACCOUNT_ID: undefined,
+    R2_BUCKET: undefined,
+  });
+  const repoCfg = loadLocalRestoreConfig({
+    environment: 'development',
+    source: 'repo',
+    root,
+    vars: {},
+  });
+  assert.equal(repoCfg.accessKeyId, undefined);
+  assert.throws(
+    () => loadLocalRestoreConfig({ environment: 'development', source: 'r2', root, vars: {} }),
+    (err) => err instanceof ConfigError && err.message.includes('R2_ACCESS_KEY_ID'),
+  );
+  assert.throws(
+    () => loadLocalRestoreConfig({ environment: 'development', source: 'local', root, vars: {} }),
+    (err) => err instanceof ConfigError && /r2, repo/.test(err.message),
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: local restore workdir comes from the fixed local-stack environment, never the snapshot environment', () => {
+  const root = makeRoot();
+  // The local stack lives in the development file; the production file has
+  // its own (different) workdir plus the production source credentials.
+  devFile(root, { PROJECT_WORKDIR: '../dev-project' });
+  writeEnv(root, 'production', {
+    BACKUP_ENVIRONMENT: 'production',
+    CLOUDFLARE_ACCOUNT_ID: '0123456789abcdef0123456789abcdef',
+    R2_BUCKET: 'production',
+    R2_ACCESS_KEY_ID: 'prod-access-key-12345',
+    R2_SECRET_ACCESS_KEY: 'prod-secret-key-abcdefghijklmnop',
+    DECRYPT_KEY: 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ',
+    PROJECT_WORKDIR: '../prod-project',
+  });
+  const cfg = loadLocalRestoreConfig({
+    environment: 'production',
+    source: 'r2',
+    root,
+    vars: {},
+  });
+  // Source side: the production snapshot credentials.
+  assert.equal(cfg.environment, 'production');
+  assert.equal(cfg.bucket, 'production');
+  assert.equal(cfg.accessKeyId, 'prod-access-key-12345');
+  // Target side: the destructive target is ALWAYS the local-stack workdir.
+  assert.equal(cfg.projectWorkdir, path.resolve(root, '..', 'dev-project'));
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: local restore never requires or exposes the encryption recipient', () => {
+  const root = makeRoot();
+  devFile(root, { ENCRYPT_KEY: undefined });
+  const cfg = loadLocalRestoreConfig({
+    environment: 'development',
+    source: 'repo',
+    root,
+    vars: {},
+  });
+  assert.equal(cfg.ageRecipient, undefined, 'restore only decrypts');
+  assert.ok(!Object.hasOwn(cfg, 'ageRecipient'), 'recipient never exposed');
+  assert.equal(cfg.ageIdentity, 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ');
   fs.rmSync(root, { recursive: true, force: true });
 });
 

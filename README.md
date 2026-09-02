@@ -121,9 +121,9 @@ Configuration values (see [.env.example](.env.example)):
 | `CLOUDFLARE_ACCOUNT_ID`                     | Cloudflare account id                       |                                                                                                                              |
 | `R2_BUCKET`                                 | R2 bucket                                   | must equal the environment (production \| development)                                                                       |
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 credentials (scoped to the bucket)       |                                                                                                                              |
-| `ENCRYPT_KEY`                               | public age recipient (`age1…`)              | backup only (hosted); not consumed by `backup:local` or `restore:* --source local`                                           |
+| `ENCRYPT_KEY`                               | public age recipient (`age1…`)              | backup only (hosted); not consumed by any restore or local command                                                        |
 | `DECRYPT_KEY`                               | private age identity (`AGE-SECRET-KEY-…`)   | r2/repo restores only (and legacy encrypted local snapshots); never uploaded                                                 |
-| `PROJECT_WORKDIR`                           | path to sibling project where supabase runs | used for local restore; `backup:local` dump source                                                                           |
+| `PROJECT_WORKDIR`                           | path to sibling project where supabase runs | always read from the local-stack (`development`) environment file; `backup:local` dump source and `restore:local` target     |
 |                                             |                                             |                                                                                                                              |
 
 To generate `ENCRYPT_KEY` and `DECRYPT_KEY` run `npm run generate-age-keys` to populate these fields inside .env files.
@@ -180,9 +180,25 @@ To generate `ENCRYPT_KEY` and `DECRYPT_KEY` run `npm run generate-age-keys` to p
   (`YYYY-MM-DDTHH-mm-ssZ`); unavailable ids print the valid choices.
 - Before any repo restore: `git pull --ff-only origin master`.
 - Confirmation phrases (interactive TTY, no bypass): hosted development
-  `RESTORE development`; hosted production `RESTORE production <project-ref>`.
-- Local restore into the local stack is removed; the local store only feeds
-  hosted restores (`--source local`).
+  `RESTORE development`; hosted production `RESTORE production <project-ref>`;
+  local-stack restore `RESTORE local`.
+- `restore:local` reads a hosted snapshot (`--source r2|repo`, always
+  decrypted with the age identity) into the local `<workdir>` stack. The
+  snapshot environment selects only the SOURCE; the destructive target is
+  always the workdir from the local-stack (`development`) environment
+  file (`PROJECT_WORKDIR`). The stack is stopped with its DB volume
+  deleted, bootstrapped fresh (`db start` only — services stay down), then
+  the verified snapshot applies in **one psql transaction**
+  (`ON_ERROR_STOP=1`, `--single-transaction`) that begins by atomically
+  replacing the `public` schema; on failure the transaction rolls back and
+  the freshly bootstrapped stack is left running with nothing applied —
+  retry from the same verified snapshot. Managed auth/storage drift is
+  checked against that fresh target before any data applies: non-empty
+  snapshot data whose target relations/columns/sequences are missing fails
+  closed, while empty incompatible blocks are skipped. The warning and the
+  completion summary name the snapshot's origin project ref. The plaintext
+  local store is never a source here: it only feeds hosted restores
+  (`--source local`).
 
 ### Staging directory (`--staging-dir`)
 
