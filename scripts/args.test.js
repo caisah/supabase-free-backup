@@ -5,11 +5,15 @@ import {
   parseBackupArgs,
   parseCommitWeeklyArgs,
   parseHostedRestoreArgs,
+  parseHostedResetArgs,
   parseLocalBackupArgs,
+  parseLocalResetArgs,
   BACKUP_USAGE,
   COMMIT_WEEKLY_USAGE,
   HOSTED_RESTORE_USAGE,
+  HOSTED_RESET_USAGE,
   LOCAL_BACKUP_USAGE,
+  LOCAL_RESET_USAGE,
 } from './args.js';
 
 const CWD = '/repo/root';
@@ -23,6 +27,8 @@ test('args: usage text constants are the single CLI grammar', () => {
   assert.match(BACKUP_USAGE, /usage: vp run backup --environment/);
   assert.match(COMMIT_WEEKLY_USAGE, /usage: vp run commit:weekly --staging-dir/);
   assert.match(HOSTED_RESTORE_USAGE, /usage: vp run restore:development\|restore:production/);
+  assert.match(HOSTED_RESET_USAGE, /usage: vp run reset:development\|reset:production/);
+  assert.match(LOCAL_RESET_USAGE, /^usage: vp run reset:local$/);
 });
 
 test('args: backup parses the documented invocation with defaults', () => {
@@ -178,6 +184,50 @@ test('args: hosted restore rejects malformed flags', () => {
     () => parseHostedRestoreArgs(['development', '--source', 'r2', '--backup', '--help']),
     MISSING_VALUE,
   );
+});
+
+test('args: hosted reset parses the fixed target positional only', () => {
+  assert.deepEqual(parseHostedResetArgs(['development']), { target: 'development' });
+  assert.deepEqual(parseHostedResetArgs(['production']), { target: 'production' });
+});
+
+test('args: hosted reset help forms do not require a target', () => {
+  assert.deepEqual(parseHostedResetArgs(['--help']), { help: true });
+  assert.deepEqual(parseHostedResetArgs(['development', '--help']), { help: true });
+  assert.deepEqual(parseHostedResetArgs(['-h']), { help: true });
+});
+
+test('args: hosted reset rejects missing, invalid, or stray tokens before any external work', () => {
+  assert.throws(() => parseHostedResetArgs([]), /development\|production/);
+  assert.throws(() => parseHostedResetArgs(['staging']), /development\|production/);
+  // No option exists on this command; every other token fails closed.
+  assert.throws(() => parseHostedResetArgs(['development', 'production']), POSITIONAL);
+  assert.throws(() => parseHostedResetArgs(['development', 'extra']), POSITIONAL);
+  assert.throws(() => parseHostedResetArgs(['development', '--bogus']), UNKNOWN_OPTION);
+  assert.throws(() => parseHostedResetArgs(['development', '--source', 'r2']), UNKNOWN_OPTION);
+  assert.throws(() => parseHostedResetArgs(['development', '--', 'x']), POSITIONAL);
+});
+
+test('args: local reset parses the bare invocation', () => {
+  // No options exist: the local stack is the single fixed development
+  // identity; the only valid value is `{}` (or the help marker).
+  assert.deepEqual(parseLocalResetArgs([]), {});
+});
+
+test('args: local reset help forms', () => {
+  assert.deepEqual(parseLocalResetArgs(['--help']), { help: true });
+  assert.deepEqual(parseLocalResetArgs(['-h']), { help: true });
+});
+
+test('args: local reset rejects every malformed-token form before any external work', () => {
+  // No environment or target token exists on this command; everything
+  // other than --help/-h is grammar-invalid and fails closed.
+  assert.throws(() => parseLocalResetArgs(['development']), POSITIONAL);
+  assert.throws(() => parseLocalResetArgs(['--environment', 'development']), UNKNOWN_OPTION);
+  assert.throws(() => parseLocalResetArgs(['--bogus']), UNKNOWN_OPTION);
+  assert.throws(() => parseLocalResetArgs(['--bogus', '--help']), UNKNOWN_OPTION);
+  assert.throws(() => parseLocalResetArgs(['extra']), POSITIONAL);
+  assert.throws(() => parseLocalResetArgs(['--', 'x']), POSITIONAL);
 });
 
 test('args: local backup parses the bare invocation', () => {

@@ -153,6 +153,8 @@ To generate `ENCRYPT_KEY` and `DECRYPT_KEY` run `npm run generate-age-keys` to p
 | `npm run backup:local -- --environment development\|production`                                                   | Package the ALREADY-RUNNING local <workdir> DB into `local-backups/<env>/`      |
 | `npm run restore:development -- --source r2\|repo\|local --backup latest\|<snapshot-id>`                          | Restore into hosted development DB                                              |
 | `npm run restore:production -- --source r2\|repo\|local --backup latest\|<snapshot-id>`                           | Restore into hosted production DB (maintenance window required)                 |
+| `npm run reset:development` / `npm run reset:production`                                                                 | Wipe the hosted DB to empty (`supabase db reset --db-url`); typed confirmation required, production phrase names the project ref; nothing is restored afterwards |
+| `npm run reset:local`                                                                                                    | Rebuild the ALREADY-RUNNING local workdir stack DB from its own migrations/seed (`supabase db reset --local`); pinned CLI, sibling-workdir checks, no hosted contact |
 | `npm run restore:local -- --environment development\|production --source r2\|repo --backup latest\|<snapshot-id>` | Restore either hosted snapshot into the local `<workdir>` stack                 |
 | `npm run github:configure [OWNER/REPO]`                                                                           | Validate local env files, sync GitHub Environments                              |
 | `npm run generate-age-keys`                                                                                       | Generate age X25519 key pair and write to existing `.env.*.local` files         |
@@ -167,6 +169,13 @@ To generate `ENCRYPT_KEY` and `DECRYPT_KEY` run `npm run generate-age-keys` to p
   with a writable in-memory `/tmp`, and complete stdin delivery is part of
   command success: a source read failure terminates the client instead of
   letting a partial SQL prefix commit and be reported as restored.
+- `reset:development|production` run the same clean step as restore but apply
+  **nothing** afterwards — the hosted target is left empty. The repository
+  workdir has no migrations/seeds, and the target is fixed by the
+  per-environment `.env.<environment>.local` connection URL (never
+  `supabase link` global state). `reset:local` instead rebuilds the local
+  stack from the sibling `PROJECT_WORKDIR`'s own migrations/seed, with the
+  explicit `--local` flag — never link state.
 - `--backup` accepts `latest` or one exact canonical snapshot id
   (`YYYY-MM-DDTHH-mm-ssZ`); unavailable ids print the valid choices.
 - Before any repo restore: `git pull --ff-only origin master`.
@@ -213,6 +222,10 @@ never starts, stops, resets, or migrates the local stack. It uses only
 read-only connectivity and source-state probes. The selected environment only
 selects **target metadata** (`SUPABASE_PROJECT_REF`); the data source is always
 the local database.
+
+`npm run reset:local` is the deliberate destructive counterpart (pinned CLI,
+sibling-workdir checks, explicit `--local`, warning before the run — no typed
+phrase: the stack is a reproducible developer database).
 
 ```text
 local-backups/local/<YYYY-MM-DDTHH-mm-ssZ>/

@@ -19,7 +19,9 @@ export const COMMIT_WEEKLY_USAGE =
   'usage: vp run commit:weekly --staging-dir <path> [--repo-root <path>]';
 export const HOSTED_RESTORE_USAGE =
   'usage: vp run restore:development|restore:production --source <r2|repo|local> --backup <latest|snapshot-id>';
+export const HOSTED_RESET_USAGE = 'usage: vp run reset:development|reset:production';
 export const LOCAL_BACKUP_USAGE = 'usage: vp run backup:local';
+export const LOCAL_RESET_USAGE = 'usage: vp run reset:local';
 
 // Hosted restores additionally read the private local snapshot store.
 const HOSTED_RESTORE_SOURCES = ['r2', 'repo', 'local'];
@@ -141,6 +143,50 @@ export function parseHostedRestoreArgs(argv) {
     throw new Error('restore requires --backup latest|<snapshot-id>');
   }
   return { target, source, backup: values.backup };
+}
+
+/**
+ * Parse the hosted reset arguments: a fixed target positional
+ * (`development|production`). No other options exist; every token other
+ * than --help/-h is grammar-invalid and fails closed (never a config error).
+ * @returns {{target:string}|{help:true}}
+ */
+export function parseHostedResetArgs(argv) {
+  if (argv.length === 0) {
+    throw new Error('reset:development|production requires a target of development|production');
+  }
+  const [target, ...rest] = argv;
+  if (target === '--help' || target === '-h') return { help: true };
+  if (!ENVIRONMENTS.includes(target)) {
+    throw new Error(`reset:development|production must fix the target environment; got ${target}`);
+  }
+  const parsed = parseArgs({
+    args: rest,
+    options: HELP_OPTIONS,
+    strict: true,
+    allowPositionals: false,
+  });
+  if (parsed.values.help) return { help: true };
+  return { target };
+}
+
+/**
+ * Parse the local-reset arguments: no options exist; only --help is
+ * accepted. The local stack is a single database with the fixed
+ * development identity (see LOCAL_STACK_ENVIRONMENT), so no environment
+ * or target flag exists.
+ * @returns {{}|{help:true}}
+ */
+export function parseLocalResetArgs(argv) {
+  const parsed = parseArgs({
+    args: argv,
+    options: HELP_OPTIONS,
+    strict: true,
+    allowPositionals: false,
+  });
+  const values = parsed.values;
+  if (values.help) return { help: true };
+  return {};
 }
 
 /**

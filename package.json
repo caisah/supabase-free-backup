@@ -16,6 +16,9 @@
     "backup:local": "node scripts/backup-local.js",
     "restore:development": "node scripts/restore-hosted.js development",
     "restore:production": "node scripts/restore-hosted.js production",
+    "reset:development": "node scripts/reset-hosted.js development",
+    "reset:production": "node scripts/reset-hosted.js production",
+    "reset:local": "node scripts/reset-local.js",
     "github:configure": "node scripts/configure-github.js",
     "commit:weekly": "node scripts/commit-weekly.js",
     "generate-age-keys": "node scripts/generate-age-keys.js"

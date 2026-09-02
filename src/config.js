@@ -552,3 +552,26 @@ export function loadHostedRestoreConfig({ source, ...opts }) {
   }
   return loadOperationConfig({ ...opts, requirements });
 }
+
+/** Hosted reset: target URL and ref only, same consumed-scope as local restores. */
+const HOSTED_RESET_REQUIREMENTS = {
+  projectRef: true,
+  sharedPoolerUrl: true,
+  consumedOnly: true,
+};
+
+/** Hosted reset (development/production): the environment-scoped URL fixes the target. */
+export function loadHostedResetConfig(opts) {
+  return loadOperationConfig({ ...opts, requirements: HOSTED_RESET_REQUIREMENTS });
+}
+
+/** Local reset: sibling workdir only; the stack identity is the fixed development dotenv. */
+const LOCAL_RESET_REQUIREMENTS = {
+  projectWorkdir: true,
+  consumedOnly: true,
+};
+
+/** Local reset: workdir-only config from the fixed development identity. */
+export function loadLocalResetConfig(opts) {
+  return loadOperationConfig({ ...opts, requirements: LOCAL_RESET_REQUIREMENTS });
+}

@@ -66,6 +66,31 @@ export function locateSupabaseCli({ root = process.cwd() } = {}) {
 }
 
 /**
+ * Enforce the pinned CLI version before any destructive command runs.
+ * Shared by the reset entry points; the hosted restore entry point keeps
+ * its own copy with its own error vocabulary.
+ */
+export async function assertPinnedSupabaseCliVersion({ supabasePath, run }) {
+  let version;
+  try {
+    const res = await run({
+      command: supabasePath,
+      args: ['--version'],
+      stdout: 'collect',
+      stderr: 'collect',
+    });
+    version = (res.stdout ?? '').trim();
+  } catch (err) {
+    throw new Error('Supabase CLI version check failed', { cause: err });
+  }
+  if (version !== PINNED_SUPABASE_CLI_VERSION) {
+    throw new Error(
+      `Supabase CLI must be exactly ${PINNED_SUPABASE_CLI_VERSION}; found ${version || '(unreadable)'}. Update the pin in package.json and run vp install.`,
+    );
+  }
+}
+
+/**
  * Preflight: Docker present, CLI present, CLI version pinned. Runs nothing
  * network or Docker related; version read is a local command.
  */
