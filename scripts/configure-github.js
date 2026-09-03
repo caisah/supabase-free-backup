@@ -6,27 +6,26 @@
  *   vp run github:configure
  *   vp run github:configure OWNER/REPO
  *
- * Both environments are always validated and synchronized together; values
- * come only from `.env.<environment>.local` (never from the process
- * environment). Only the fixed allowlists below are uploaded, secrets travel
- * exclusively over gh stdin, and the target repository must be private. The
- * repository-level BACKUPS_ENABLED opt-in is set to `true` as the final
- * step: only after every environment upsert and legacy-secret deletion
- * succeeded, so a partial configuration can never auto-enable backups.
+ * Configuration validation is delegated ENTIRELY to the doctor: `runDoctor`
+ * runs first in STATIC-ONLY mode (`live: false` — file contracts, shapes,
+ * and workdir validation, no Docker/network probes) and this command
+ * uploads only the exact in-memory values the doctor returned. Values come
+ * only from `.env.<environment>.local` files (never from the process
+ * environment). Only the fixed allowlists below are uploaded, secrets
+ * travel exclusively over gh stdin, and the target repository must be
+ * private. The repository-level BACKUPS_ENABLED opt-in is set to `true`
+ * as the final step: only after every environment upsert and legacy-secret
+ * deletion succeeded, so a partial configuration can never auto-enable
+ * backups.
  */
 
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertNodeVersion } from '../src/runtime.js';
 import { createLogger } from '../src/logger.js';
 import { runCommand, lookupExecutable, TRUNCATED_MARKER } from '../src/process.js';
-import {
-  ENVIRONMENTS,
-  REPOSITORY_ROOT,
-  LEGACY_DB_URL_VARIABLE,
-  loadBackupConfig,
-} from '../src/config.js';
+import { REPOSITORY_ROOT, LEGACY_DB_URL_VARIABLE } from '../src/config.js';
+import { runDoctor } from './doctor.js';
 
 /** Upper bound for a single `github:configure` run. */
 export const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -127,38 +126,22 @@ function gitHubMapsFromConfig(config) {
   return { secrets, variables };
 }
 
-function envFilePath(root, environment) {
-  return path.join(root, `.env.${environment}.local`);
-}
-
 /**
- * Load and validate both environments before any external command.
- * `vars: {}` is mandatory: ambient process values cannot replace file values.
+ * Pure builder: map the EXACT validated in-memory doctor configs through the
+ * fixed allowlists. Performs no filesystem read, parsing, or validation —
+ * those all happened in the doctor, whose returned values are authoritative
+ * here, so a later file mutation can never change what gets uploaded.
  * Registers every value that will be sent to gh so a later failure cannot
  * expose a credential through the logger/error path.
- * Skips environments whose dotenv file does not exist.
  *
  * @returns {{ configs: Record<string, {secrets: object, variables: object}>, environments: string[] }}
  */
-export function loadGitHubEnvironmentConfigs({ root, loadConfig = loadBackupConfig, logger }) {
+export function buildGitHubEnvironmentConfigs({ validatedConfigs, environments, logger }) {
   const configs = {};
-  const environments = [];
-  for (const environment of ENVIRONMENTS) {
-    const filePath = envFilePath(root, environment);
-    try {
-      fs.accessSync(filePath, fs.constants.R_OK);
-    } catch (err) {
-      // Only a genuinely absent file is skipped; an existing but unreadable
-      // file must fail before any GitHub mutation so one environment cannot
-      // be migrated while the other is silently left behind.
-      if (err.code !== 'ENOENT') throw err;
-      continue;
-    }
-    const config = loadConfig({ environment, root, vars: {} });
-    const maps = gitHubMapsFromConfig(config);
+  for (const environment of environments) {
+    const maps = gitHubMapsFromConfig(validatedConfigs[environment]);
     for (const value of Object.values(maps.secrets)) logger?.addSecret(value);
     configs[environment] = maps;
-    environments.push(environment);
   }
   return { configs, environments };
 }
@@ -328,8 +311,8 @@ export async function runConfigureGitHub({
   timeoutMs = DEFAULT_TIMEOUT_MS,
 } = {}) {
   const {
-    loadConfig = loadBackupConfig,
-    loadEnvConfigs = loadGitHubEnvironmentConfigs,
+    doctor = runDoctor,
+    buildConfigs = buildGitHubEnvironmentConfigs,
     lookup = lookupExecutable,
     run = runCommand,
   } = deps;
@@ -337,7 +320,25 @@ export async function runConfigureGitHub({
   const parsed = parseConfigureGitHubArgs(argv);
   if (parsed.help) return { help: true };
 
-  const { configs, environments } = loadEnvConfigs({ root, loadConfig, logger });
+  // One overall deadline for the whole run, computed BEFORE the doctor: the
+  // doctor receives the remaining budget (it still owns its own abort
+  // controller) and the GitHub phase gets whatever is left, so a short
+  // caller-supplied timeout bounds every phase. The doctor itself runs in
+  // static-only mode: configure must work offline, in CI-like environments,
+  // and without a running local stack or live hosted endpoints.
+  const deadline = Date.now() + timeoutMs;
+  const doctorResult = await doctor({
+    argv: [],
+    root,
+    logger,
+    timeoutMs: deadline - Date.now(),
+    live: false,
+  });
+  const { configs, environments } = buildConfigs({
+    validatedConfigs: doctorResult.configs,
+    environments: doctorResult.environments,
+    logger,
+  });
 
   if (environments.length === 0) {
     throw new Error('no .env.*.local files found; nothing to configure');
@@ -350,10 +351,12 @@ export async function runConfigureGitHub({
 
   // Overall deadline so a stalled `gh` network call cannot hang the run
   // indefinitely; every call shares the same abort signal.
+  const remaining = deadline - Date.now();
   const controller = new AbortController();
+  if (remaining <= 0) controller.abort();
   const timer =
-    Number.isFinite(timeoutMs) && timeoutMs > 0
-      ? setTimeout(() => controller.abort(), timeoutMs)
+    Number.isFinite(remaining) && remaining > 0
+      ? setTimeout(() => controller.abort(), remaining)
       : null;
   const signal = controller.signal;
 

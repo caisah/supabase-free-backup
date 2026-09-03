@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { runGenerateAgeKeys } from './generate-age-keys.js';
+import { runGenerateAgeKeys, resolveAgeKeygen } from './generate-age-keys.js';
 import { tmpdir, writePrivateFile } from '../src/test-fixtures.js';
 
 const AGE_RECIPIENT = 'age1rz8dtx9s7r2fyjejpq9wmewumm23ukwfdfqy0zjq0063ua6twfuqh0vyk9';
@@ -207,4 +207,19 @@ test('generate-age-keys: works when no env files exist', async () => {
   assert.equal(result.skippedFiles.length, 2);
 
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('generate-age-keys: exported resolver searches Windows wrappers before the plain name', () => {
+  const seen = [];
+  const lookup = (name) => {
+    seen.push(name);
+    return name === 'age-keygen' ? '/usr/local/bin/age-keygen' : null;
+  };
+  assert.equal(resolveAgeKeygen({ lookup, platform: 'win32' }), '/usr/local/bin/age-keygen');
+  assert.deepEqual(seen, ['age-keygen.exe', 'age-keygen.cmd', 'age-keygen']);
+  assert.equal(resolveAgeKeygen({ lookup: () => null, platform: 'linux' }), null);
+  const direct = (name) => (name === 'age-keygen' ? '/c/age-keygen' : null);
+  assert.equal(resolveAgeKeygen({ lookup: direct, platform: 'darwin' }), '/c/age-keygen');
+  const cmd = (name) => (name === 'age-keygen.cmd' ? '/c/age-keygen.cmd' : null);
+  assert.equal(resolveAgeKeygen({ lookup: cmd, platform: 'win32' }), '/c/age-keygen.cmd');
 });

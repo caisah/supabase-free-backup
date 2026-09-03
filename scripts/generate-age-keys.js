@@ -31,7 +31,7 @@ const DECRYPT_KEY_NAME = 'DECRYPT_KEY';
  * @param {string} [opts.platform=process.platform] - Current platform identifier
  * @returns {string|null} Absolute path to the executable, or null if not found
  */
-function resolveAgeKeygen({ lookup, platform = process.platform }) {
+export function resolveAgeKeygen({ lookup, platform = process.platform }) {
   const names =
     platform === 'win32' ? ['age-keygen.exe', 'age-keygen.cmd', 'age-keygen'] : ['age-keygen'];
   for (const name of names) {

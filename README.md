@@ -28,7 +28,8 @@ by storing daily (for the last week) db snapshots in Cloudflare R2 and a weekly 
 
 1. Create a separate private GitHub repository from this source. (A public fork remains public and cannot run backups.)
 2. Create `.env.production.local` and, if needed, `.env.development.local`; only production is mandatory. See [Configuration](#configuration).
-3. Set the required GitHub Actions variables and secrets (or use `github:configure` script). `github:configure` validates every local file first, inventories existing GitHub Environment secret names without reading values, upserts the approved variables/secrets, and finally deletes the legacy `SUPABASE_DB_URL` secret from each environment only after every environment completed all upserts (see [Supabase connection migration](#supabase-connection-migration)). As its final step it sets the repository-level `BACKUPS_ENABLED=true` opt-in, so a failed or partial run never enables backup jobs.
+3. Run `npm run doctor` and fix every reported problem until it exits `0`. The doctor validates every checked file's complete static contract (all supported variables above — `DECRYPT_KEY` is restore-only and only ever warned when absent — canonical shapes, relationships, private 0600 file permissions, no symlinks) and then runs read-only connectivity probes: Dockerized `psql` `SELECT 1` against each hosted database, R2 `HeadBucket`, an `age-keygen -y` key-pair derivation, and the selected local stack. Docker, a running local stack, `age-keygen`, and network access are mandatory. Missing `.env.production.local` fails; a missing development file is skipped and production then supplies the local-stack path. All static checks finish before any live call, failures from every category are aggregated into one names-only report, and legacy/duplicate/unknown assignments only warn. Never run the live doctor in CI: the ignored dotenv files and external credentials are intentionally absent there.
+4. Set the required GitHub Actions variables and secrets (or use `github:configure` script). `github:configure` always runs the same doctor first in STATIC-ONLY mode (`--help` bypasses it) — file contracts and shapes, no Docker/network probes, so it works offline and in CI-like environments — and uploads only the exact in-memory values the doctor validated; it then inventories existing GitHub Environment secret names without reading values, upserts the approved variables/secrets, and finally deletes the legacy `SUPABASE_DB_URL` secret from each environment only after every environment completed all upserts (see [Supabase connection migration](#supabase-connection-migration)). As its final step it sets the repository-level `BACKUPS_ENABLED=true` opt-in, so a failed or partial run never enables backup jobs.
 
 ## Architecture
 
@@ -145,7 +146,54 @@ SUPABASE_CONFIG_PATH=../main-project/supabase/config.toml
 relative values resolve from this backup repository. A leftover
 `PROJECT_WORKDIR` is rejected by those commands with
 `UNSUPPORTED PROJECT_WORKDIR (rename to SUPABASE_CONFIG_PATH)` — there is no
-grace period, fallback, or alias.
+grace period, fallback, or alias. The doctor accepts legacy, duplicate, and
+unknown assignments as warnings only; a warning never satisfies a missing
+current variable.
+
+## Doctor
+
+`npm run doctor` is a standalone local-configuration gate:
+
+- static phase (no external call): reads `.env.production.local` (required)
+  and `.env.development.local` (optional, skipped with a status line when
+  absent) as 0600 regular files — symlinks and group/world-readable files are
+  rejected — requires all supported variables in every checked file except
+  the restore-only `DECRYPT_KEY` (missing it warns; present, it must match
+  the recipient), enforces the canonical shapes (project ref, account ID,
+  32/64 lowercase hex R2 credentials, matching X25519 age pair,
+  `SUPABASE_CONFIG_PATH`), the environment/bucket/pooler relationships, and
+  validates every `SUPABASE_CONFIG_PATH` with the real workdir validator.
+  Values come only from the files: ambient process exports are ignored. Any
+  static error in any file aborts before a single lookup, subprocess, Docker,
+  database, or R2 call, and every static problem is reported together.
+- live phase (strictly read-only, sequential): Dockerized `psql` 17
+  `SELECT 1` per hosted environment (development first, then production),
+  R2 `HeadBucket` via the exact validated credentials, an age key-pair
+  derivation (`age-keygen -y`, identity over stdin, recipient never on
+  argv), and one `SELECT 1`/`SHOW server_version_num` probe against the
+  selected local stack. Hosted connection passwords travel in the docker
+  client's environment (`-e PGPASSWORD`), never in the `docker run` argv.
+  Development supplies the local-stack path when both files exist;
+  otherwise production does. Missing Docker or `age-keygen` fail those
+  probes while independent checks still run; deadline expiry stops all
+  further probes with a stable timeout problem.
+- output contract: every failure is stored as one allowlisted static problem
+  (`<environment>: SUPABASE connection failed`, `R2 bucket access failed`,
+  `age key-pair validation failed`, `local database connection failed`, …)
+  and the raw error, stderr, and cause are discarded. Status and warnings use
+  the same fixed labels; no value, URL, password, credential, age key, or
+  configured path is ever printed, serialized, or kept as an error cause.
+- `github:configure` runs the same doctor automatically before resolving `gh`
+  in static-only mode (`live: false` — no Docker/network probes, so the
+  setup command works offline and in CI-like environments; `--help` bypasses
+  it) and uploads only the exact validated in-memory values. One overall
+  deadline bounds the doctor and every GitHub call together.
+
+`npm run doctor` exits `0` only when every checked file's static contract
+and every live probe passed. A real run needs Docker, a running local stack,
+`age-keygen`, and network access to both hosted databases and both R2
+buckets; it belongs on the operator machine, not in CI, because the ignored
+dotenv files and external credentials are intentionally absent there.
 
 ## Scripts
 
@@ -175,7 +223,8 @@ grace period, fallback, or alias.
 | `npm run reset:development` / `npm run reset:production`                                                                 | Wipe the hosted DB to empty (`supabase db reset --db-url`); typed confirmation required, production phrase names the project ref; nothing is restored afterwards |
 | `npm run reset:local`                                                                                                    | Rebuild the ALREADY-RUNNING local workdir stack DB from its own migrations/seed (`supabase db reset --local`); pinned CLI, sibling-workdir checks, no hosted contact |
 | `npm run restore:local -- --environment development\|production --source r2\|repo --backup latest\|<snapshot-id>` | Restore either hosted snapshot into the local `<workdir>` stack                 |
-| `npm run github:configure [OWNER/REPO]`                                                                           | Validate local env files, sync GitHub Environments                              |
+| `npm run doctor`                                                                                                | Validate every existing dotenv file (private perms, static contract + read-only hosted DB/R2/age/local-stack probes); aggregated names-only errors; exits 0 only when everything passes       |
+| `npm run github:configure [OWNER/REPO]`                                                                           | Run the doctor in static-only mode, then sync GitHub Environments from the exact validated values                              |
 | `npm run generate-age-keys`                                                                                       | Generate age X25519 key pair and write to existing `.env.*.local` files         |
 | `npm run commit:weekly -- --staging-dir <path> --repo-root .`                                                     | Weekly Git snapshot commit (used by the workflow; runnable locally on `master`) |
 

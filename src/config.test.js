@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   loadBackupConfig,
+  loadDoctorConfig,
   loadHostedRestoreConfig,
   loadLocalBackupConfig,
   loadLocalResetConfig,
@@ -14,12 +15,37 @@ import {
   CONFLICT_PREFIX,
   urlPassword,
   REPOSITORY_ROOT,
+  DOCTOR_VARIABLE_NAMES,
 } from './config.js';
 
 const REF_DEV = 'a1b2c3d4e5f6a7b8c9d0';
 const REF_PROD = 'f0e9d8c7b6a5f4e3d2c1';
 const PASSWORD = 'the-ultimate-secret-password';
 const POOLER_HOST = 'aws-0-us-east-1.pooler.supabase.com';
+
+/** Canonical Cloudflare-shaped R2 credentials shared by every fixture. */
+const R2_ACCESS_KEY = 'abcd1234abcd1234abcd1234abcd1234';
+const R2_SECRET_KEY = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+/** Canonical-length stand-in age recipient (age1 + 58 bech32 chars). */
+const AGE_RECIPIENT_ALT = `age1${'x'.repeat(58)}`;
+/** Canonical-length stand-in age identity (AGE-SECRET-KEY-1 + 58 bech32 chars). */
+const AGE_IDENTITY_ALT = `AGE-SECRET-KEY-1${'Q'.repeat(58)}`;
+const AGE_IDENTITY_ALT2 = `AGE-SECRET-KEY-1${'Z'.repeat(58)}`;
+
+/** The eleven variables every checked doctor file must contain. */
+const ALL_DOCTOR_VARS = [
+  'BACKUPS_ENABLED',
+  'BACKUP_ENVIRONMENT',
+  'SUPABASE_PROJECT_REF',
+  'SUPABASE_SHARED_POOLER_URL',
+  'CLOUDFLARE_ACCOUNT_ID',
+  'R2_BUCKET',
+  'R2_ACCESS_KEY_ID',
+  'R2_SECRET_ACCESS_KEY',
+  'ENCRYPT_KEY',
+  'DECRYPT_KEY',
+  'SUPABASE_CONFIG_PATH',
+];
 
 function sharedPoolerUrl(projectRef, overrides = {}) {
   const {
@@ -45,15 +71,16 @@ function writeEnv(root, name, entries) {
 
 function devFile(root, overrides = {}) {
   writeEnv(root, 'development', {
+    BACKUPS_ENABLED: 'true',
     BACKUP_ENVIRONMENT: 'development',
     SUPABASE_PROJECT_REF: REF_DEV,
     SUPABASE_SHARED_POOLER_URL: sharedPoolerUrl(REF_DEV),
     CLOUDFLARE_ACCOUNT_ID: '0123456789abcdef0123456789abcdef',
     R2_BUCKET: 'development',
-    R2_ACCESS_KEY_ID: 'dev-access-key-12345',
-    R2_SECRET_ACCESS_KEY: 'dev-secret-key-abcdefghijklmnop',
-    ENCRYPT_KEY: 'age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-    DECRYPT_KEY: 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ',
+    R2_ACCESS_KEY_ID: R2_ACCESS_KEY,
+    R2_SECRET_ACCESS_KEY: R2_SECRET_KEY,
+    ENCRYPT_KEY: AGE_RECIPIENT_ALT,
+    DECRYPT_KEY: AGE_IDENTITY_ALT,
     SUPABASE_CONFIG_PATH: '../project/supabase/config.toml',
     ...overrides,
   });
@@ -128,7 +155,7 @@ test('config: differing process and dotenv values are rejected as CONFLICT (name
 test('config: process values fill variables absent from the dotenv file', () => {
   const root = makeRoot();
   devFile(root, { ENCRYPT_KEY: undefined });
-  const recipient = `age1${'y'.repeat(38)}`;
+  const recipient = `age1${'y'.repeat(58)}`;
   const cfg = loadBackupConfig({
     environment: 'development',
     root,
@@ -194,7 +221,7 @@ test('config: variables the operation does not consume never conflict', () => {
   // Backup does not consume the private age identity: a differing DECRYPT_KEY
   // shell export must not block the run, and must not be resolved into the
   // backup config object either.
-  const identity = 'AGE-SECRET-KEY-1ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ';
+  const identity = AGE_IDENTITY_ALT2;
   const backupCfg = loadBackupConfig({
     environment: 'development',
     root,
@@ -209,8 +236,8 @@ test('config: variables the operation does not consume never conflict', () => {
     source: 'repo',
     root,
     vars: {
-      R2_ACCESS_KEY_ID: 'different-access-key-98765',
-      R2_SECRET_ACCESS_KEY: 'different-secret-key-9876543210',
+      R2_ACCESS_KEY_ID: 'ffffffffffffffffffffffffffffffff',
+      R2_SECRET_ACCESS_KEY: 'f'.repeat(64),
       R2_BUCKET: 'production',
     },
   });
@@ -260,9 +287,9 @@ test('config: a present dotenv file that omits CLOUDFLARE_ACCOUNT_ID fails close
       SUPABASE_SHARED_POOLER_URL: sharedPoolerUrl(REF_DEV),
       CLOUDFLARE_ACCOUNT_ID: accountId,
       R2_BUCKET: 'development',
-      R2_ACCESS_KEY_ID: 'dev-access-key-12345',
-      R2_SECRET_ACCESS_KEY: 'dev-secret-key-abcdefghijklmnop',
-      ENCRYPT_KEY: 'age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+      R2_ACCESS_KEY_ID: R2_ACCESS_KEY,
+      R2_SECRET_ACCESS_KEY: R2_SECRET_KEY,
+      ENCRYPT_KEY: AGE_RECIPIENT_ALT,
     },
   });
   assert.equal(cfg.accountId, accountId);
@@ -357,9 +384,9 @@ test('config: mismatched bucket/environment fails', () => {
     SUPABASE_SHARED_POOLER_URL: sharedPoolerUrl(REF_PROD),
     CLOUDFLARE_ACCOUNT_ID: '0123456789abcdef0123456789abcdef',
     R2_BUCKET: 'development',
-    R2_ACCESS_KEY_ID: 'prod-access-key-12345',
-    R2_SECRET_ACCESS_KEY: 'prod-secret-key-abcdefghijklmnop',
-    ENCRYPT_KEY: 'age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+    R2_ACCESS_KEY_ID: R2_ACCESS_KEY,
+    R2_SECRET_ACCESS_KEY: R2_SECRET_KEY,
+    ENCRYPT_KEY: AGE_RECIPIENT_ALT,
   });
   assert.throws(
     () => loadBackupConfig({ environment: 'production', root: prod, vars: {} }),
@@ -663,7 +690,7 @@ test('config: hosted backup never returns the private identity or the config pat
   const cfg2 = loadBackupConfig({
     environment: 'development',
     root,
-    vars: { DECRYPT_KEY: 'AGE-SECRET-KEY-1ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ' },
+    vars: { DECRYPT_KEY: AGE_IDENTITY_ALT2 },
   });
   assert.ok(!Object.hasOwn(cfg2, 'ageIdentity'));
   assert.ok(!Object.hasOwn(cfg2, 'supabaseConfigPath'));
@@ -716,7 +743,7 @@ test('config: age recipient and identity shape are validated without echoing val
     },
   );
   devFile(root, {
-    ENCRYPT_KEY: 'age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+    ENCRYPT_KEY: AGE_RECIPIENT_ALT,
     DECRYPT_KEY: 'garbage-identity',
   });
   assert.throws(
@@ -867,9 +894,23 @@ test('config: local backup consumed disagreements conflict; unused ones never do
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('config: differing process and dotenv SUPABASE_CONFIG_PATH values conflict without echoing paths', () => {
+test('config: SUPABASE_CONFIG_PATH is file-authoritative like CLOUDFLARE_ACCOUNT_ID', () => {
   const root = makeRoot();
   devFile(root);
+  // A differing process export is ignored: the dotenv value always wins, so
+  // a stale shell export can never redirect the destructive local target.
+  const cfg = loadLocalBackupConfig({
+    environment: 'development',
+    root,
+    vars: { SUPABASE_CONFIG_PATH: '../other/supabase/config.toml' },
+  });
+  assert.equal(
+    cfg.supabaseConfigPath,
+    path.resolve(root, '../project/supabase/config.toml'),
+    'the dotenv file wins over the process export',
+  );
+  // A present file that omits it fails closed: the export must not take over.
+  devFile(root, { SUPABASE_CONFIG_PATH: undefined });
   assert.throws(
     () =>
       loadLocalBackupConfig({
@@ -877,13 +918,7 @@ test('config: differing process and dotenv SUPABASE_CONFIG_PATH values conflict 
         root,
         vars: { SUPABASE_CONFIG_PATH: '../other/supabase/config.toml' },
       }),
-    (err) => {
-      assert.ok(err instanceof ConfigError);
-      assert.ok(err.message.includes(`${CONFLICT_PREFIX} SUPABASE_CONFIG_PATH`), err.message);
-      assert.ok(!err.message.includes('project'), 'neither path value may be reported');
-      assert.ok(!err.message.includes('config.toml'), 'neither path value may be reported');
-      return true;
-    },
+    (err) => err instanceof ConfigError && err.message.includes('SUPABASE_CONFIG_PATH'),
   );
   fs.rmSync(root, { recursive: true, force: true });
 });
@@ -1019,7 +1054,7 @@ test('config: hosted local source never consumes DECRYPT_KEY (legacy encrypted-l
     environment: 'development',
     source: 'local',
     root,
-    vars: { DECRYPT_KEY: 'AGE-SECRET-KEY-1ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ' },
+    vars: { DECRYPT_KEY: AGE_IDENTITY_ALT2 },
   });
   assert.equal(cfg2.ageIdentity, undefined);
   assert.equal(cfg2.projectRef, REF_DEV);
@@ -1031,8 +1066,8 @@ test('config: local restore consumes config path + source credentials, never the
   devFile(root, {
     SUPABASE_SHARED_POOLER_URL: 'not-a-valid-pooler-url',
     SUPABASE_PROJECT_REF: REF_DEV,
-    R2_ACCESS_KEY_ID: 'dev-access-key-12345',
-    R2_SECRET_ACCESS_KEY: 'dev-secret-key-abcdefghijklmnop',
+    R2_ACCESS_KEY_ID: R2_ACCESS_KEY,
+    R2_SECRET_ACCESS_KEY: R2_SECRET_KEY,
     CLOUDFLARE_ACCOUNT_ID: '0123456789abcdef0123456789abcdef',
     R2_BUCKET: 'development',
   });
@@ -1044,12 +1079,12 @@ test('config: local restore consumes config path + source credentials, never the
   });
   assert.equal(r2Cfg.environment, 'development');
   assert.equal(r2Cfg.bucket, 'development');
-  assert.equal(r2Cfg.accessKeyId, 'dev-access-key-12345');
+  assert.equal(r2Cfg.accessKeyId, R2_ACCESS_KEY);
   assert.equal(
     r2Cfg.supabaseConfigPath,
     path.resolve(root, '..', 'project', 'supabase', 'config.toml'),
   );
-  assert.equal(r2Cfg.ageIdentity, 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ');
+  assert.equal(r2Cfg.ageIdentity, AGE_IDENTITY_ALT);
   for (const name of ['projectRef', 'sharedPoolerUrl']) {
     assert.ok(!Object.hasOwn(r2Cfg, name), `r2 local restore exposed ${name}`);
   }
@@ -1066,19 +1101,20 @@ test('config: local restore consumes config path + source credentials, never the
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('config: loadLocalRestoreConfig resolves the target config path from the same explicit dotenv file', () => {
+test('config: loadLocalRestoreConfig target never follows the source dotenvPath', () => {
   const root = makeRoot();
-  // No per-environment files at all: the caller points both loads at one
-  // explicit dotenv file via dotenvPath.
+  // The destructive target path must come from the FIXED local-stack
+  // identity file only, never from where the source credentials were read.
+  devFile(root); // fixed .env.development.local with the default ../project path
   const customPath = path.join(root, '.env.custom.local');
   writeEnv(root, 'custom', {
     BACKUP_ENVIRONMENT: 'development',
-    SUPABASE_CONFIG_PATH: '../project/supabase/config.toml',
+    SUPABASE_CONFIG_PATH: '../custom-project/supabase/config.toml',
     CLOUDFLARE_ACCOUNT_ID: '0123456789abcdef0123456789abcdef',
     R2_BUCKET: 'development',
-    R2_ACCESS_KEY_ID: 'dev-access-key-12345',
-    R2_SECRET_ACCESS_KEY: 'dev-secret-key-abcdefghijklmnop',
-    DECRYPT_KEY: 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ',
+    R2_ACCESS_KEY_ID: R2_ACCESS_KEY,
+    R2_SECRET_ACCESS_KEY: R2_SECRET_KEY,
+    DECRYPT_KEY: AGE_IDENTITY_ALT,
   });
   const cfg = loadLocalRestoreConfig({
     environment: 'development',
@@ -1087,11 +1123,26 @@ test('config: loadLocalRestoreConfig resolves the target config path from the sa
     vars: {},
     dotenvPath: customPath,
   });
+  assert.equal(cfg.ageIdentity, AGE_IDENTITY_ALT, 'source credentials come from the custom file');
   assert.equal(
     cfg.supabaseConfigPath,
     path.resolve(root, '..', 'project', 'supabase', 'config.toml'),
+    'the target reads the fixed development file, never the source dotenvPath',
   );
-  assert.equal(cfg.ageIdentity, 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ');
+  // Without the fixed development file the target fails closed even though
+  // the source file carries a valid path.
+  fs.rmSync(path.join(root, '.env.development.local'), { force: true });
+  assert.throws(
+    () =>
+      loadLocalRestoreConfig({
+        environment: 'development',
+        source: 'r2',
+        root,
+        vars: {},
+        dotenvPath: customPath,
+      }),
+    (err) => err instanceof ConfigError && err.message.includes('SUPABASE_CONFIG_PATH'),
+  );
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -1140,9 +1191,9 @@ test('config: local restore config path comes from the fixed local-stack environ
     BACKUP_ENVIRONMENT: 'production',
     CLOUDFLARE_ACCOUNT_ID: '0123456789abcdef0123456789abcdef',
     R2_BUCKET: 'production',
-    R2_ACCESS_KEY_ID: 'prod-access-key-12345',
-    R2_SECRET_ACCESS_KEY: 'prod-secret-key-abcdefghijklmnop',
-    DECRYPT_KEY: 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ',
+    R2_ACCESS_KEY_ID: R2_ACCESS_KEY,
+    R2_SECRET_ACCESS_KEY: R2_SECRET_KEY,
+    DECRYPT_KEY: AGE_IDENTITY_ALT,
     SUPABASE_CONFIG_PATH: '../prod-project/supabase/config.toml',
   });
   const cfg = loadLocalRestoreConfig({
@@ -1154,7 +1205,7 @@ test('config: local restore config path comes from the fixed local-stack environ
   // Source side: the production snapshot credentials.
   assert.equal(cfg.environment, 'production');
   assert.equal(cfg.bucket, 'production');
-  assert.equal(cfg.accessKeyId, 'prod-access-key-12345');
+  assert.equal(cfg.accessKeyId, R2_ACCESS_KEY);
   // Target side: the destructive target is ALWAYS the local-stack config path.
   assert.equal(
     cfg.supabaseConfigPath,
@@ -1174,7 +1225,7 @@ test('config: local restore never requires or exposes the encryption recipient',
   });
   assert.equal(cfg.ageRecipient, undefined, 'restore only decrypts');
   assert.ok(!Object.hasOwn(cfg, 'ageRecipient'), 'recipient never exposed');
-  assert.equal(cfg.ageIdentity, 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ');
+  assert.equal(cfg.ageIdentity, AGE_IDENTITY_ALT);
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -1224,8 +1275,8 @@ test('config: hosted local source requires shared pooler URL and ref, and ignore
     source: 'local',
     root,
     vars: {
-      R2_ACCESS_KEY_ID: 'different-access-key-98765',
-      R2_SECRET_ACCESS_KEY: 'different-secret-key-9876543210',
+      R2_ACCESS_KEY_ID: 'ffffffffffffffffffffffffffffffff',
+      R2_SECRET_ACCESS_KEY: 'f'.repeat(64),
       R2_BUCKET: 'production',
     },
   });
@@ -1255,9 +1306,9 @@ test('config: process-only hosted configuration works without any dotenv file', 
       SUPABASE_SHARED_POOLER_URL: sharedPoolerUrl(REF_DEV),
       CLOUDFLARE_ACCOUNT_ID: '0123456789abcdef0123456789abcdef',
       R2_BUCKET: 'development',
-      R2_ACCESS_KEY_ID: 'dev-access-key-12345',
-      R2_SECRET_ACCESS_KEY: 'dev-secret-key-abcdefghijklmnop',
-      ENCRYPT_KEY: 'age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+      R2_ACCESS_KEY_ID: R2_ACCESS_KEY,
+      R2_SECRET_ACCESS_KEY: R2_SECRET_KEY,
+      ENCRYPT_KEY: AGE_RECIPIENT_ALT,
     },
   });
   assert.equal(cfg.sharedPoolerUrl, sharedPoolerUrl(REF_DEV));
@@ -1267,4 +1318,265 @@ test('config: process-only hosted configuration works without any dotenv file', 
 
 test('config: REPOSITORY_ROOT resolves to the repository (contains package.json)', () => {
   assert.ok(fs.existsSync(path.join(REPOSITORY_ROOT, 'package.json')));
+});
+
+test('config: DOCTOR_VARIABLE_NAMES is a frozen ordered list of the eleven supported variables', () => {
+  assert.ok(Object.isFrozen(DOCTOR_VARIABLE_NAMES));
+  assert.deepEqual([...DOCTOR_VARIABLE_NAMES], ALL_DOCTOR_VARS);
+});
+
+test('config: the complete valid doctor config returns all eleven source values', () => {
+  const root = makeRoot();
+  devFile(root);
+  const cfg = loadDoctorConfig({ environment: 'development', root, vars: {} });
+  assert.equal(cfg.environment, 'development');
+  assert.equal(cfg.projectRef, REF_DEV);
+  assert.equal(cfg.sharedPoolerUrl, sharedPoolerUrl(REF_DEV));
+  assert.equal(cfg.accountId, '0123456789abcdef0123456789abcdef');
+  assert.equal(cfg.bucket, 'development');
+  assert.equal(cfg.accessKeyId, R2_ACCESS_KEY);
+  assert.equal(cfg.secretAccessKey, R2_SECRET_KEY);
+  assert.equal(cfg.ageRecipient, AGE_RECIPIENT_ALT);
+  assert.equal(cfg.ageIdentity, AGE_IDENTITY_ALT);
+  assert.equal(cfg.supabaseConfigPath, path.resolve(root, '../project/supabase/config.toml'));
+  assert.equal(cfg.backupsEnabled, 'true');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: doctor requires every supported variable except restore-only DECRYPT_KEY', () => {
+  const root = makeRoot();
+  for (const name of ALL_DOCTOR_VARS) {
+    if (name === 'DECRYPT_KEY') continue; // restore-only: never hard-required
+    devFile(root, { [name]: undefined });
+    assert.throws(
+      () => loadDoctorConfig({ environment: 'development', root, vars: {} }),
+      (err) => err instanceof ConfigError && err.message.includes(`MISSING ${name}`),
+      name,
+    );
+  }
+  // A missing DECRYPT_KEY is not a doctor failure (backup-only setups), but
+  // the shape is still validated whenever the identity IS present.
+  devFile(root, { DECRYPT_KEY: undefined });
+  const cfg = loadDoctorConfig({ environment: 'development', root, vars: {} });
+  assert.equal(cfg.ageIdentity, undefined);
+  devFile(root, { DECRYPT_KEY: `AGE-SECRET-KEY-1${'Q'.repeat(57)}` });
+  assert.throws(
+    () => loadDoctorConfig({ environment: 'development', root, vars: {} }),
+    (err) => err instanceof ConfigError && err.message.includes('INVALID DECRYPT_KEY'),
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: doctor BACKUPS_ENABLED accepts only the exact lowercase true', () => {
+  const root = makeRoot();
+  const cases = [
+    ['', 'MISSING BACKUPS_ENABLED'],
+    ['   ', 'MISSING BACKUPS_ENABLED'],
+    ['false', 'INVALID BACKUPS_ENABLED'],
+    ['TRUE', 'INVALID BACKUPS_ENABLED'],
+    ['true', null],
+  ];
+  for (const [value, expectedProblem] of cases) {
+    devFile(root, { BACKUPS_ENABLED: value });
+    if (expectedProblem === null) {
+      const cfg = loadDoctorConfig({ environment: 'development', root, vars: {} });
+      assert.equal(cfg.backupsEnabled, 'true', JSON.stringify(value));
+    } else {
+      assert.throws(
+        () => loadDoctorConfig({ environment: 'development', root, vars: {} }),
+        (err) => err instanceof ConfigError && err.message.includes(expectedProblem),
+        JSON.stringify(value),
+      );
+    }
+  }
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: doctor rejects exact boundary and character-set failures for every shaped variable', () => {
+  const root = makeRoot();
+  const cases = [
+    ['SUPABASE_PROJECT_REF', 'a'.repeat(19)],
+    ['SUPABASE_PROJECT_REF', 'a'.repeat(21)],
+    ['SUPABASE_PROJECT_REF', 'A'.repeat(20)],
+    ['CLOUDFLARE_ACCOUNT_ID', 'a'.repeat(31)],
+    ['CLOUDFLARE_ACCOUNT_ID', 'a'.repeat(33)],
+    ['CLOUDFLARE_ACCOUNT_ID', 'A'.repeat(32), 'uppercase account id'],
+    ['CLOUDFLARE_ACCOUNT_ID', 'g'.repeat(32), 'non-hex account id'],
+    ['R2_ACCESS_KEY_ID', 'a'.repeat(31)],
+    ['R2_ACCESS_KEY_ID', 'a'.repeat(33)],
+    ['R2_ACCESS_KEY_ID', 'A'.repeat(32), 'uppercase access key'],
+    ['R2_SECRET_ACCESS_KEY', 'a'.repeat(63)],
+    ['R2_SECRET_ACCESS_KEY', 'a'.repeat(65)],
+    ['R2_SECRET_ACCESS_KEY', 'g'.repeat(64), 'non-hex secret key'],
+    ['ENCRYPT_KEY', `age1${'x'.repeat(57)}`, 'recipient one short'],
+    ['ENCRYPT_KEY', `age1${'x'.repeat(59)}`, 'recipient one long'],
+    ['ENCRYPT_KEY', `age1${'X'.repeat(58)}`, 'uppercase recipient'],
+    ['ENCRYPT_KEY', `age1${'b'.repeat(58)}`, 'bech32 excludes b'],
+    ['ENCRYPT_KEY', `age1${'i'.repeat(58)}`, 'bech32 excludes i'],
+    ['ENCRYPT_KEY', `age1${'o'.repeat(58)}`, 'bech32 excludes o'],
+    ['ENCRYPT_KEY', `age1${'1'.repeat(58)}`, 'bech32 separator char'],
+    ['DECRYPT_KEY', `AGE-SECRET-KEY-1${'Q'.repeat(57)}`, 'identity one short'],
+    ['DECRYPT_KEY', `AGE-SECRET-KEY-1${'Q'.repeat(59)}`, 'identity one long'],
+    ['DECRYPT_KEY', `AGE-SECRET-KEY-1${'q'.repeat(58)}`, 'lowercase identity'],
+    ['DECRYPT_KEY', `AGE-SECRET-KEY-1${'B'.repeat(58)}`, 'bech32 excludes B'],
+  ];
+  for (const [name, value, label] of cases) {
+    devFile(root, { [name]: value });
+    assert.throws(
+      () => loadDoctorConfig({ environment: 'development', root, vars: {} }),
+      (err) => {
+        assert.ok(err instanceof ConfigError, `${label ?? ''}: ${name}`);
+        assert.ok(err.message.includes(`INVALID ${name}`), `${label ?? name}: ${err.message}`);
+        assert.ok(!err.message.includes(value), `${label ?? name}: value leaked`);
+        return true;
+      },
+      `${name}=${value.length} chars ${label ?? ''}`,
+    );
+  }
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: doctor accepts real age key pairs and rejects SSH or plugin identities', () => {
+  const root = makeRoot();
+  devFile(root);
+  const cfg = loadDoctorConfig({ environment: 'development', root, vars: {} });
+  assert.equal(cfg.ageRecipient, AGE_RECIPIENT_ALT);
+  assert.equal(cfg.ageIdentity, AGE_IDENTITY_ALT);
+  // SSH recipients and post-quantum identities are not X25519: rejected.
+  devFile(root, { ENCRYPT_KEY: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI' });
+  assert.throws(
+    () => loadDoctorConfig({ environment: 'development', root, vars: {} }),
+    (err) => err instanceof ConfigError && err.message.includes('INVALID ENCRYPT_KEY'),
+  );
+  devFile(root, {
+    DECRYPT_KEY: 'AGE-PLUGIN-1MLK3G2DXVHMIZMK5KFQSJEARAXBHXQ6BKAHIRXJYMH4B2Y5K3HQS5V6OMF6JJV',
+  });
+  assert.throws(
+    () => loadDoctorConfig({ environment: 'development', root, vars: {} }),
+    (err) => err instanceof ConfigError && err.message.includes('INVALID DECRYPT_KEY'),
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: doctor still enforces environment, bucket, and pooler/ref relationships', () => {
+  const root = makeRoot();
+  devFile(root, { BACKUP_ENVIRONMENT: 'production' });
+  assert.throws(
+    () => loadDoctorConfig({ environment: 'development', root, vars: {} }),
+    (err) => err instanceof ConfigError && err.message.includes('BACKUP_ENVIRONMENT'),
+  );
+  devFile(root, { R2_BUCKET: 'production' });
+  assert.throws(
+    () => loadDoctorConfig({ environment: 'development', root, vars: {} }),
+    (err) => err instanceof ConfigError && err.message.includes('R2_BUCKET'),
+  );
+  devFile(root, { SUPABASE_SHARED_POOLER_URL: sharedPoolerUrl(REF_PROD) });
+  assert.throws(
+    () => loadDoctorConfig({ environment: 'development', root, vars: {} }),
+    (err) => err instanceof ConfigError && err.message.includes('SUPABASE_SHARED_POOLER_URL'),
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: doctor tolerates both legacy names while normal loaders still hard-fail', () => {
+  const root = makeRoot();
+  devFile(root, {
+    SUPABASE_DB_URL: sharedPoolerUrl(REF_DEV, { port: '6543' }),
+    PROJECT_WORKDIR: '../project',
+  });
+  const cfg = loadDoctorConfig({ environment: 'development', root, vars: {} });
+  assert.equal(cfg.projectRef, REF_DEV);
+  assert.equal(cfg.supabaseConfigPath, path.resolve(root, '../project/supabase/config.toml'));
+  assert.throws(
+    () => loadBackupConfig({ environment: 'development', root, vars: {} }),
+    (err) => err instanceof ConfigError && err.message.includes('UNSUPPORTED SUPABASE_DB_URL'),
+  );
+  assert.throws(
+    () => loadLocalResetConfig({ environment: 'development', root, vars: {} }),
+    (err) => err instanceof ConfigError && err.message.includes('UNSUPPORTED PROJECT_WORKDIR'),
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: doctor with vars: {} isolates from ambient process values', () => {
+  const root = makeRoot();
+  // DECRYPT_KEY is missing from the file: a process export must never fill it.
+  devFile(root, { DECRYPT_KEY: undefined });
+  const previous = {};
+  for (const name of ['SUPABASE_PROJECT_REF', 'DECRYPT_KEY', 'R2_BUCKET']) {
+    previous[name] = process.env[name];
+  }
+  process.env.SUPABASE_PROJECT_REF = 'fedcba9876543210fedc';
+  process.env.DECRYPT_KEY = `AGE-SECRET-KEY-1${'Y'.repeat(58)}`;
+  process.env.R2_BUCKET = 'production';
+  try {
+    // A differing ambient export neither conflicts nor overrides; a missing
+    // file field stays missing regardless of the ambient export, and a
+    // restore-only field may be absent without failing the doctor.
+    const cfgMissing = loadDoctorConfig({ environment: 'development', root, vars: {} });
+    assert.equal(cfgMissing.ageIdentity, undefined);
+    devFile(root);
+    const cfg = loadDoctorConfig({ environment: 'development', root, vars: {} });
+    assert.equal(cfg.projectRef, REF_DEV, 'file value wins over a differing ambient export');
+    assert.equal(cfg.bucket, 'development');
+    assert.equal(cfg.backupsEnabled, 'true');
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('config: supplied dotenvContent stays authoritative after the path changes or disappears', () => {
+  const root = makeRoot();
+  const filePath = path.join(root, '.env.development.local');
+  devFile(root);
+  const raw = fs.readFileSync(filePath, 'utf8');
+  fs.rmSync(filePath, { force: true });
+  // Path removed: content still validates.
+  const cfg = loadDoctorConfig({
+    environment: 'development',
+    root,
+    vars: {},
+    dotenvPath: filePath,
+    dotenvContent: raw,
+  });
+  assert.equal(cfg.projectRef, REF_DEV);
+  assert.equal(cfg.backupsEnabled, 'true');
+  // A path that never existed works identically when content is supplied.
+  const cfg2 = loadDoctorConfig({
+    environment: 'development',
+    root,
+    vars: {},
+    dotenvPath: path.join(root, 'never-read.env'),
+    dotenvContent: raw,
+  });
+  assert.equal(cfg2.projectRef, REF_DEV);
+  assert.equal(cfg2.ageIdentity, AGE_IDENTITY_ALT);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: doctor errors remain names-only and exclude every fixture value', () => {
+  const root = makeRoot();
+  devFile(root, {
+    SUPABASE_PROJECT_REF: 'not-a-ref',
+    R2_BUCKET: 'production',
+    BACKUPS_ENABLED: 'false',
+  });
+  assert.throws(
+    () => loadDoctorConfig({ environment: 'development', root, vars: {} }),
+    (err) => {
+      assert.ok(err instanceof ConfigError);
+      assertNoLeak(err, PASSWORD, REF_DEV);
+      assert.ok(!err.message.includes(R2_ACCESS_KEY), 'access key leaked');
+      assert.ok(!err.message.includes(R2_SECRET_KEY), 'secret key leaked');
+      assert.ok(!err.message.includes(AGE_RECIPIENT_ALT), 'recipient leaked');
+      assert.ok(!err.message.includes(AGE_IDENTITY_ALT), 'identity leaked');
+      assert.ok(!err.message.includes('...project/supabase/config.toml'), 'path leaked');
+      return true;
+    },
+  );
+  fs.rmSync(root, { recursive: true, force: true });
 });

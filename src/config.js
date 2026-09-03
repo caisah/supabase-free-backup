@@ -42,11 +42,16 @@ export const BUCKET_BY_ENVIRONMENT = Object.freeze({
 export const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const PROJECT_REF_SHAPE = /^[a-z0-9]{20}$/;
-const ACCOUNT_ID_SHAPE = /^[0-9a-f]{32}$/i;
-const R2_ACCESS_KEY_MIN = 8;
-const R2_SECRET_MIN = 16;
-const AGE_RECIPIENT_SHAPE = /^age1[a-z0-9]{38,65}$/;
-const AGE_IDENTITY_SHAPE = /^AGE-SECRET-KEY-[A-Z0-9]{30,100}$/;
+const ACCOUNT_ID_SHAPE = /^[0-9a-f]{32}$/;
+const R2_ACCESS_KEY_SHAPE = /^[0-9a-f]{32}$/;
+const R2_SECRET_KEY_SHAPE = /^[0-9a-f]{64}$/;
+/** Bech32 data alphabet as age emits it: digits 0/2-9, letters excluding b/i/o. */
+const BECH32_LOWER = '[ac-hj-np-z02-9]';
+const BECH32_UPPER = '[AC-HJ-NP-Z02-9]';
+/** Canonical age X25519 recipient: `age1` + 58 lowercase Bech32 chars. */
+const AGE_RECIPIENT_SHAPE = new RegExp(`^age1${BECH32_LOWER}{58}$`);
+/** Canonical age X25519 identity: `AGE-SECRET-KEY-1` + 58 uppercase Bech32 chars. */
+const AGE_IDENTITY_SHAPE = new RegExp(`^AGE-SECRET-KEY-1${BECH32_UPPER}{58}$`);
 
 /** The only SSL modes accepted for hosted connections. */
 const SECURE_SSL_MODES = new Set(['require', 'verify-ca', 'verify-full']);
@@ -60,11 +65,17 @@ const SHARED_POOLER_PORT = '5432';
 /** The only database path the dashboard pooler contract exposes. */
 const POOLER_DATABASE_PATH = '/postgres';
 
-/** Literal legacy hosted-connection variable name (hard-cutover gate only). */
+/** Legacy hosted-connection variable name and its replacement (hard-cutover gate only). */
 export const LEGACY_DB_URL_VARIABLE = 'SUPABASE_DB_URL';
 
-/** Literal legacy local-workdir variable name (hard-cutover gate only). */
+/** Legacy local-workdir variable name and its replacement (hard-cutover gate only). */
 export const LEGACY_PROJECT_WORKDIR_VARIABLE = 'PROJECT_WORKDIR';
+
+/** Single source of truth for legacy-name -> replacement-name mapping; shared by the doctor warning scan and the hard-cutover gate. */
+export const LEGACY_VARIABLE_RENAMES = Object.freeze({
+  [LEGACY_DB_URL_VARIABLE]: 'SUPABASE_SHARED_POOLER_URL',
+  [LEGACY_PROJECT_WORKDIR_VARIABLE]: 'SUPABASE_CONFIG_PATH',
+});
 
 /** Stable diagnostic keyword for source disagreements; shared with tests. */
 export const CONFLICT_PREFIX = 'CONFLICT';
@@ -172,6 +183,7 @@ function fieldSchema(name, options = {}) {
 }
 
 const VARIABLE_SCHEMAS = {
+  BACKUPS_ENABLED: fieldSchema('BACKUPS_ENABLED'),
   BACKUP_ENVIRONMENT: fieldSchema('BACKUP_ENVIRONMENT'),
   SUPABASE_PROJECT_REF: fieldSchema('SUPABASE_PROJECT_REF', {
     shape: PROJECT_REF_SHAPE,
@@ -180,17 +192,17 @@ const VARIABLE_SCHEMAS = {
   SUPABASE_SHARED_POOLER_URL: fieldSchema('SUPABASE_SHARED_POOLER_URL'),
   [CLOUDFLARE_ACCOUNT_ID]: fieldSchema(CLOUDFLARE_ACCOUNT_ID, {
     shape: ACCOUNT_ID_SHAPE,
-    hint: 'expected 32 hexadecimal characters',
+    hint: 'expected 32 lowercase hexadecimal characters',
   }),
-  R2_ACCESS_KEY_ID: fieldSchema('R2_ACCESS_KEY_ID').refine(
-    (v) => v === undefined || v.length >= R2_ACCESS_KEY_MIN,
-    { message: 'INVALID R2_ACCESS_KEY_ID' },
-  ),
-  R2_SECRET_ACCESS_KEY: fieldSchema('R2_SECRET_ACCESS_KEY').refine(
-    (v) => v === undefined || v.length >= R2_SECRET_MIN,
-    { message: 'INVALID R2_SECRET_ACCESS_KEY' },
-  ),
   R2_BUCKET: fieldSchema('R2_BUCKET'),
+  R2_ACCESS_KEY_ID: fieldSchema('R2_ACCESS_KEY_ID', {
+    shape: R2_ACCESS_KEY_SHAPE,
+    hint: 'expected 32 lowercase hexadecimal characters',
+  }),
+  R2_SECRET_ACCESS_KEY: fieldSchema('R2_SECRET_ACCESS_KEY', {
+    shape: R2_SECRET_KEY_SHAPE,
+    hint: 'expected 64 lowercase hexadecimal characters',
+  }),
   ENCRYPT_KEY: fieldSchema('ENCRYPT_KEY', {
     shape: AGE_RECIPIENT_SHAPE,
     hint: 'expected an age1... X25519 recipient',
@@ -253,12 +265,13 @@ function collectConflictProblems({ requirements, filePath, vars, fileValues }) {
 /** Variable names consumed by an operation: universal fields + requirements. */
 function conflictScopedNames(requirements) {
   const names = ['BACKUP_ENVIRONMENT'];
+  if (requirements.backupsEnabled) names.push('BACKUPS_ENABLED');
   if (requirements.projectRef) names.push('SUPABASE_PROJECT_REF');
   if (requirements.sharedPoolerUrl) names.push('SUPABASE_SHARED_POOLER_URL');
   if (requirements.accountId) names.push(CLOUDFLARE_ACCOUNT_ID);
   if (requirements.r2) names.push('R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET');
   if (requirements.ageRecipient) names.push('ENCRYPT_KEY');
-  if (requirements.ageIdentity) names.push('DECRYPT_KEY');
+  if (requirements.ageIdentity || requirements.ageIdentityOptional) names.push('DECRYPT_KEY');
   if (requirements.supabaseConfigPath) names.push('SUPABASE_CONFIG_PATH');
   return new Set(names);
 }
@@ -300,6 +313,9 @@ function selectedEnvironmentProblems({ environment, resolved }) {
 /** Operation-specific missing-requirement checks (names only). */
 function collectRequirementProblems({ requirements, resolved }) {
   const problems = [];
+  if (requirements.backupsEnabled && !resolved.BACKUPS_ENABLED) {
+    problems.push('MISSING BACKUPS_ENABLED');
+  }
   if (requirements.projectRef && !resolved.SUPABASE_PROJECT_REF) {
     problems.push('MISSING SUPABASE_PROJECT_REF');
   }
@@ -331,29 +347,42 @@ function collectRequirementProblems({ requirements, resolved }) {
  * the selected operation consumes the replacement field; inspects BOTH
  * process and dotenv sources; never resolves or returns the old value;
  * fails even when the new field is also present so stale configuration
- * cannot silently linger. Reports variable names only.
+ * cannot silently linger. Reports variable names only. The doctor flags
+ * `warnOnlyLegacy` to suppress these hard errors: warning emission for the
+ * same names belongs to the doctor script so a complete current
+ * configuration can proceed with warning-only legacy entries.
  */
 function collectLegacyVariableProblems({ requirements, vars, fileValues }) {
+  if (requirements.warnOnlyLegacy) return [];
   const problems = [];
   const isConfigured = (name) =>
     [vars[name], fileValues[name]].some((value) => typeof value === 'string' && value.length > 0);
 
   if (requirements.sharedPoolerUrl && isConfigured(LEGACY_DB_URL_VARIABLE)) {
-    problems.push('UNSUPPORTED SUPABASE_DB_URL (rename to SUPABASE_SHARED_POOLER_URL)');
+    problems.push(
+      `UNSUPPORTED ${LEGACY_DB_URL_VARIABLE} (rename to ${LEGACY_VARIABLE_RENAMES[LEGACY_DB_URL_VARIABLE]})`,
+    );
   }
 
   if (requirements.supabaseConfigPath && isConfigured(LEGACY_PROJECT_WORKDIR_VARIABLE)) {
     problems.push(
-      `UNSUPPORTED ${LEGACY_PROJECT_WORKDIR_VARIABLE} (rename to SUPABASE_CONFIG_PATH)`,
+      `UNSUPPORTED ${LEGACY_PROJECT_WORKDIR_VARIABLE} (rename to ${LEGACY_VARIABLE_RENAMES[LEGACY_PROJECT_WORKDIR_VARIABLE]})`,
     );
   }
 
   return problems;
 }
 
-/** Cross-field checks: bucket/environment mapping and Shared Pooler URL classification. */
+/** Cross-field checks: bucket/environment mapping, Shared Pooler URL classification, and the doctor-only exact `true` opt-in. */
 function collectCrossFieldProblems({ environment, requirements, resolved }) {
   const problems = [];
+  if (
+    requirements.backupsEnabled &&
+    resolved.BACKUPS_ENABLED !== undefined &&
+    resolved.BACKUPS_ENABLED !== 'true'
+  ) {
+    problems.push('INVALID BACKUPS_ENABLED (must be exactly true)');
+  }
   if (
     resolved.R2_BUCKET &&
     requirements.r2 &&
@@ -408,6 +437,7 @@ function buildOperationConfig({ environment, requirements, resolved, supabaseCon
     secretAccessKey: resolved.R2_SECRET_ACCESS_KEY,
     ageRecipient: resolved.ENCRYPT_KEY,
     ageIdentity: resolved.DECRYPT_KEY,
+    backupsEnabled: resolved.BACKUPS_ENABLED,
     supabaseConfigPath,
     r2Endpoint: resolved.CLOUDFLARE_ACCOUNT_ID
       ? `https://${resolved.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`
@@ -416,6 +446,7 @@ function buildOperationConfig({ environment, requirements, resolved, supabaseCon
   if (!requirements.consumedOnly) return config;
 
   const scoped = { environment };
+  if (requirements.backupsEnabled) scoped.backupsEnabled = config.backupsEnabled;
   if (requirements.projectRef) scoped.projectRef = config.projectRef;
   if (requirements.sharedPoolerUrl) scoped.sharedPoolerUrl = config.sharedPoolerUrl;
   if (requirements.accountId) {
@@ -428,7 +459,9 @@ function buildOperationConfig({ environment, requirements, resolved, supabaseCon
     scoped.secretAccessKey = config.secretAccessKey;
   }
   if (requirements.ageRecipient) scoped.ageRecipient = config.ageRecipient;
-  if (requirements.ageIdentity) scoped.ageIdentity = config.ageIdentity;
+  if (requirements.ageIdentity || requirements.ageIdentityOptional) {
+    scoped.ageIdentity = config.ageIdentity;
+  }
   if (requirements.supabaseConfigPath) scoped.supabaseConfigPath = supabaseConfigPath;
   return scoped;
 }
@@ -441,6 +474,32 @@ const BACKUP_REQUIREMENTS = {
   ageRecipient: true,
   consumedOnly: true,
 };
+
+/**
+ * The doctor requires every supported variable except DECRYPT_KEY, which is
+ * restore-only: shape-validated whenever present, never hard-required (the
+ * documented backup-only setup has no private identity at all).
+ * BACKUPS_ENABLED is a doctor/configuration opt-in, deliberately NOT part of
+ * backup/restore/reset requirements: runtime commands neither resolve nor
+ * validate it.
+ */
+const DOCTOR_REQUIREMENTS = {
+  backupsEnabled: true,
+  projectRef: true,
+  sharedPoolerUrl: true,
+  accountId: true,
+  r2: true,
+  ageRecipient: true,
+  ageIdentityOptional: true,
+  supabaseConfigPath: true,
+  consumedOnly: true,
+  warnOnlyLegacy: true,
+};
+
+/** Immutable list of every supported variable, in schema order. The doctor's
+ * warning scan and the required-variable contract derive from this single
+ * list, so adding a field touches exactly one place. */
+export const DOCTOR_VARIABLE_NAMES = Object.freeze(Object.keys(VARIABLE_SCHEMAS));
 
 /** Local backup: target metadata + config path only, never age or the hosted path. */
 const LOCAL_BACKUP_REQUIREMENTS = {
@@ -458,13 +517,15 @@ const HOSTED_RESTORE_REQUIREMENTS = {
   local: { projectRef: true, sharedPoolerUrl: true, consumedOnly: true },
 };
 
-function loadDotenvValues(filePath) {
-  let raw;
-  try {
-    raw = fs.readFileSync(filePath, 'utf8');
-  } catch (err) {
-    if (err.code === 'ENOENT') return { fileValues: {}, filePresent: false };
-    throw err;
+function loadDotenvValues(filePath, dotenvContent) {
+  let raw = dotenvContent;
+  if (raw === undefined) {
+    try {
+      raw = fs.readFileSync(filePath, 'utf8');
+    } catch (err) {
+      if (err.code === 'ENOENT') return { fileValues: {}, filePresent: false };
+      throw err;
+    }
   }
   const parsed = dotenv.parse(raw);
   // dotenv keeps surrounding whitespace inside quoted values; normalize so
@@ -480,13 +541,16 @@ function loadDotenvValues(filePath) {
  * Variables whose per-environment dotenv file value wins over the process
  * environment. CLOUDFLARE_ACCOUNT_ID is exported globally in developer shells
  * (shared with other Cloudflare tooling) while the backup account is
- * environment-scoped, so the dotenv file is the more specific source. Such
- * variables are also exempt from conflict detection: a differing shell export
- * is ignored by design, never an error. Adding a file-priority variable
- * requires: (1) this Set, (2) a VARIABLE_SCHEMAS entry, (3) the .env.example
- * and README precedence notes.
+ * environment-scoped, so the dotenv file is the more specific source.
+ * SUPABASE_CONFIG_PATH selects the DESTRUCTIVE local-stack target
+ * (backup:local/reset:local/restore:local); a stale shell export must never
+ * redirect it, so the file is authoritative there too. Such variables are
+ * also exempt from conflict detection: a differing shell export is ignored by
+ * design, never an error, and a present file that omits one fails closed.
+ * Adding a file-priority variable requires: (1) this Set, (2) a
+ * VARIABLE_SCHEMAS entry, (3) the .env.example and README precedence notes.
  */
-const FILE_PRIORITY_VARIABLES = new Set([CLOUDFLARE_ACCOUNT_ID]);
+const FILE_PRIORITY_VARIABLES = new Set([CLOUDFLARE_ACCOUNT_ID, 'SUPABASE_CONFIG_PATH']);
 
 function resolveValue(name, vars, fileValues) {
   const fromFile = fileValues[name];
@@ -508,6 +572,9 @@ function resolveValue(name, vars, fileValues) {
  * @param {object} [opts.vars] process-environment override source
  * @param {string} [opts.root] repository root (tests use fixtures)
  * @param {string} [opts.dotenvPath] explicit dotenv file (tests)
+ * @param {string} [opts.dotenvContent] exact file bytes; when supplied the
+ *   file is treated as present and validated from these bytes only, and
+ *   dotenvPath is retained for fixed-basename diagnostics alone
  */
 export function loadOperationConfig({
   environment,
@@ -515,13 +582,14 @@ export function loadOperationConfig({
   vars = process.env,
   root = REPOSITORY_ROOT,
   dotenvPath,
+  dotenvContent,
 }) {
   if (!ENVIRONMENTS.includes(environment)) {
     throw new ConfigError([`environment must be one of: ${ENVIRONMENTS.join(', ')}`]);
   }
 
   const filePath = dotenvPath ?? path.join(root, `.env.${environment}.local`);
-  const { fileValues, filePresent } = loadDotenvValues(filePath);
+  const { fileValues, filePresent } = loadDotenvValues(filePath, dotenvContent);
   const fieldNames = operationFieldNames(requirements);
   const resolved = resolveConfigFields({ vars, fileValues, fieldNames });
 
@@ -553,6 +621,15 @@ export function loadOperationConfig({
 /** Backup: needs everything except the private age identity. */
 export function loadBackupConfig(opts) {
   return loadOperationConfig({ ...opts, requirements: BACKUP_REQUIREMENTS });
+}
+
+/**
+ * Doctor: every supported field is required and file-only. Static,
+ * names-only `ConfigError.problems` behavior is retained; the caller owns
+ * live validation and warning emission.
+ */
+export function loadDoctorConfig(opts) {
+  return loadOperationConfig({ ...opts, requirements: DOCTOR_REQUIREMENTS });
 }
 
 /** Local backup: consumes only matching env, target ref, and workdir. */
@@ -606,12 +683,14 @@ export function loadLocalRestoreConfig({ source, root, vars, dotenvPath, ...opts
     throw new ConfigError(['source must be one of: r2, repo']);
   }
   const sourceCfg = loadOperationConfig({ ...opts, dotenvPath, root, vars, requirements });
+  // The target load NEVER receives the source dotenvPath: the destructive
+  // target path resolves only from the fixed LOCAL_STACK_ENVIRONMENT file,
+  // so the snapshot environment can never steer where the reset/restore lands.
   const targetCfg = loadOperationConfig({
     environment: LOCAL_STACK_ENVIRONMENT,
     root,
     vars,
     requirements: LOCAL_RESET_REQUIREMENTS,
-    dotenvPath,
   });
   return { ...sourceCfg, supabaseConfigPath: targetCfg.supabaseConfigPath };
 }

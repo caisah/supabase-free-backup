@@ -7,12 +7,12 @@ import { fileURLToPath } from 'node:url';
 import {
   runConfigureGitHub,
   parseConfigureGitHubArgs,
-  loadGitHubEnvironmentConfigs,
+  buildGitHubEnvironmentConfigs,
   resolveGhBin,
   GITHUB_SECRETS,
   GITHUB_VARIABLES,
 } from './configure-github.js';
-import { loadBackupConfig, LEGACY_DB_URL_VARIABLE, REPOSITORY_ROOT } from '../src/config.js';
+import { LEGACY_DB_URL_VARIABLE, REPOSITORY_ROOT } from '../src/config.js';
 import { createLogger } from '../src/logger.js';
 import { ProcessError } from '../src/process.js';
 import { tmpdir, writePrivateFile, AGE_RECIPIENT_1, AGE_IDENTITY_1 } from '../src/test-fixtures.js';
@@ -20,8 +20,8 @@ import { tmpdir, writePrivateFile, AGE_RECIPIENT_1, AGE_IDENTITY_1 } from '../sr
 const REF_DEV = 'a1b2c3d4e5f6a7b8c9d0';
 const REF_PROD = 'f0e9d8c7b6a5f4e3d2c1';
 const ACCOUNT_ID = '0123456789abcdef0123456789abcdef';
-const ACCESS_KEY = 'r2-access-key-1234567890';
-const SECRET_KEY = 'r2-secret-key-abcdefghijklmnopqrstuv';
+const ACCESS_KEY = 'abcd1234abcd1234abcd1234abcd1234';
+const SECRET_KEY = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 const AGE_RECIPIENT = AGE_RECIPIENT_1;
 const AGE_IDENTITY = AGE_IDENTITY_1;
 const CONFIG_PATH = '/tmp/main-project/supabase/config.toml';
@@ -49,9 +49,55 @@ function sentinelValues(environment) {
   ];
 }
 
-function envFileValues(environment, overrides = {}) {
+/** Full validated doctor config shape for one environment. */
+function stubConfig(environment) {
   const ref = environment === 'development' ? REF_DEV : REF_PROD;
-  const merged = {
+  return {
+    environment,
+    projectRef: ref,
+    sharedPoolerUrl: dbUrl(environment),
+    accountId: ACCOUNT_ID,
+    bucket: environment,
+    accessKeyId: ACCESS_KEY,
+    secretAccessKey: SECRET_KEY,
+    ageRecipient: AGE_RECIPIENT,
+    ageIdentity: AGE_IDENTITY,
+    backupsEnabled: 'true',
+    supabaseConfigPath: CONFIG_PATH,
+  };
+}
+
+function defaultDoctorConfigs() {
+  return {
+    development: stubConfig('development'),
+    production: stubConfig('production'),
+  };
+}
+
+/** Successful doctor result matching what the real runDoctor returns. */
+function stubDoctorResult({
+  configs = defaultDoctorConfigs(),
+  environments = ['development', 'production'],
+} = {}) {
+  return { environments, configs, localEnvironment: 'development' };
+}
+
+/** Stub doctor recording every invocation; `overrides.fail` rejects. */
+function stubDoctor(overrides = {}) {
+  const calls = [];
+  const doctor = async (opts) => {
+    calls.push(opts);
+    if (overrides.fail) throw new Error(overrides.failMessage ?? 'doctor failed (stub)');
+    return stubDoctorResult(overrides);
+  };
+  return { doctor, calls };
+}
+
+/** Write dotenv fixtures ONLY when a test simulates the doctor reading them. */
+function writeEnvFile(root, environment, overrides = {}) {
+  const ref = environment === 'development' ? REF_DEV : REF_PROD;
+  const values = {
+    BACKUPS_ENABLED: 'true',
     BACKUP_ENVIRONMENT: environment,
     SUPABASE_PROJECT_REF: ref,
     SUPABASE_SHARED_POOLER_URL: dbUrl(environment),
@@ -65,15 +111,9 @@ function envFileValues(environment, overrides = {}) {
     SOME_UNKNOWN_KEY: UNKNOWN_SENTINEL,
     ...overrides,
   };
-  // An explicit undefined override removes the key (simulates an absent field).
-  for (const [name, value] of Object.entries(merged)) {
-    if (value === undefined) delete merged[name];
+  for (const [name, value] of Object.entries(values)) {
+    if (value === undefined) delete values[name];
   }
-  return merged;
-}
-
-function writeEnvFile(root, environment, overrides = {}) {
-  const values = envFileValues(environment, overrides);
   writePrivateFile(
     path.join(root, `.env.${environment}.local`),
     `${Object.entries(values)
@@ -85,52 +125,6 @@ function writeEnvFile(root, environment, overrides = {}) {
 function writeEnvFiles(root, { development, production } = {}) {
   writeEnvFile(root, 'development', development ?? {});
   writeEnvFile(root, 'production', production ?? {});
-}
-
-/** Stub config used when the repository root must not be read from disk. */
-function stubConfig(environment) {
-  const ref = environment === 'development' ? REF_DEV : REF_PROD;
-  return {
-    environment,
-    projectRef: ref,
-    sharedPoolerUrl: dbUrl(environment),
-    accountId: ACCOUNT_ID,
-    bucket: environment,
-    accessKeyId: ACCESS_KEY,
-    secretAccessKey: SECRET_KEY,
-    ageRecipient: AGE_RECIPIENT,
-    ageIdentity: AGE_IDENTITY,
-    supabaseConfigPath: CONFIG_PATH,
-  };
-}
-
-function stubLoadConfig({ environment }) {
-  return stubConfig(environment);
-}
-
-/**
- * Stub for the dotenv file scan: both environments are always configured,
- * with values coming from the injected loadConfig (never from repository
- * .env files). Mirrors the real mapping and secret registration.
- */
-function stubEnvConfigs({ root, loadConfig, logger }) {
-  const configs = {};
-  const environments = [];
-  for (const environment of ['development', 'production']) {
-    const config = loadConfig({ environment, root });
-    const secrets = {};
-    const variables = {};
-    for (const [name, property] of Object.entries(GITHUB_SECRETS)) {
-      secrets[name] = config[property];
-    }
-    for (const [name, property] of Object.entries(GITHUB_VARIABLES)) {
-      variables[name] = config[property];
-    }
-    for (const value of Object.values(secrets)) logger?.addSecret(value);
-    configs[environment] = { secrets, variables };
-    environments.push(environment);
-  }
-  return { configs, environments };
 }
 
 /**
@@ -178,12 +172,13 @@ function silentLogger() {
   };
 }
 
+/** Dependency builder: successful doctor by default, no filesystem reads. */
 function makeDeps(overrides = {}) {
   const gh = makeGh(overrides);
   return {
     deps: {
-      loadConfig: overrides.loadConfig ?? loadBackupConfig,
-      loadEnvConfigs: overrides.loadEnvConfigs ?? stubEnvConfigs,
+      doctor: overrides.doctor ?? stubDoctor().doctor,
+      buildConfigs: overrides.buildConfigs ?? buildGitHubEnvironmentConfigs,
       lookup: () => '/usr/local/bin/gh',
       run: gh.run,
     },
@@ -265,146 +260,183 @@ test('github:configure: rejects malformed positional arguments', () => {
   }
 });
 
-test('github:configure: help returns without loading config or invoking gh', async () => {
+test('github:configure: help bypasses doctor and gh', async () => {
   const { deps, calls } = makeDeps({
-    loadConfig: () => {
-      throw new Error('must not load config for help');
+    doctor: async () => {
+      throw new Error('doctor must not run for help');
     },
   });
-  const { logger } = capturingLogger();
-  const result = await runConfigureGitHub({ argv: ['--help'], logger, deps });
+  const result = await runConfigureGitHub({ argv: ['--help'], logger: silentLogger(), deps });
   assert.deepEqual(result, { help: true });
   assert.equal(calls.length, 0);
-  const resultShort = await runConfigureGitHub({ argv: ['-h'], logger, deps });
+  const resultShort = await runConfigureGitHub({ argv: ['-h'], logger: silentLogger(), deps });
   assert.deepEqual(resultShort, { help: true });
   assert.equal(calls.length, 0);
 });
 
-test('github:configure: maps both environments to exactly the approved allowlists', () => {
-  const root = tmpdir('cfg-gh-map-');
-  writeEnvFiles(root);
-  try {
-    const { configs } = loadGitHubEnvironmentConfigs({ root, loadConfig: loadBackupConfig });
-    for (const environment of ['development', 'production']) {
-      assert.deepEqual(Object.keys(configs[environment].secrets).sort(), [
-        'R2_ACCESS_KEY_ID',
-        'R2_SECRET_ACCESS_KEY',
-        'SUPABASE_SHARED_POOLER_URL',
-      ]);
-      assert.deepEqual(Object.keys(configs[environment].variables).sort(), [
-        'CLOUDFLARE_ACCOUNT_ID',
-        'ENCRYPT_KEY',
-        'R2_BUCKET',
-        'SUPABASE_PROJECT_REF',
-      ]);
-      const flat = {
-        ...configs[environment].secrets,
-        ...configs[environment].variables,
-      };
-      assert.ok(!('DECRYPT_KEY' in flat), 'DECRYPT_KEY must not sync');
-      assert.ok(!('BACKUP_ENVIRONMENT' in flat), 'BACKUP_ENVIRONMENT must not sync');
-      assert.ok(!('SUPABASE_CONFIG_PATH' in flat), 'SUPABASE_CONFIG_PATH must not sync');
-      assert.ok(!('SOME_UNKNOWN_KEY' in flat), 'unknown dotenv keys must not sync');
-      assert.ok(
-        !('SUPABASE_DB_URL' in flat),
-        'the legacy secret must never be upserted from the allowlist',
-      );
-      assert.equal(configs[environment].secrets.SUPABASE_SHARED_POOLER_URL, dbUrl(environment));
-      assert.equal(configs[environment].secrets.R2_ACCESS_KEY_ID, ACCESS_KEY);
-      assert.equal(configs[environment].secrets.R2_SECRET_ACCESS_KEY, SECRET_KEY);
-      assert.equal(
-        configs[environment].variables.SUPABASE_PROJECT_REF,
-        environment === 'development' ? REF_DEV : REF_PROD,
-      );
-      assert.equal(configs[environment].variables.CLOUDFLARE_ACCOUNT_ID, ACCOUNT_ID);
-      assert.equal(configs[environment].variables.R2_BUCKET, environment);
-      assert.equal(configs[environment].variables.ENCRYPT_KEY, AGE_RECIPIENT);
-    }
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
+test('github:configure: buildGitHubEnvironmentConfigs maps exactly the approved allowlists', () => {
+  const registered = [];
+  const logger = {
+    ...silentLogger(),
+    addSecret(value) {
+      registered.push(value);
+    },
+  };
+  const { configs } = buildGitHubEnvironmentConfigs({
+    validatedConfigs: defaultDoctorConfigs(),
+    environments: ['development', 'production'],
+    logger,
+  });
+  for (const environment of ['development', 'production']) {
+    assert.deepEqual(Object.keys(configs[environment].secrets).sort(), [
+      ...Object.keys(GITHUB_SECRETS).sort(),
+    ]);
+    assert.deepEqual(Object.keys(configs[environment].variables).sort(), [
+      ...Object.keys(GITHUB_VARIABLES).sort(),
+    ]);
+    const flat = {
+      ...configs[environment].secrets,
+      ...configs[environment].variables,
+    };
+    assert.ok(!('DECRYPT_KEY' in flat), 'DECRYPT_KEY must not sync');
+    assert.ok(!('BACKUP_ENVIRONMENT' in flat), 'BACKUP_ENVIRONMENT must not sync');
+    assert.ok(!('BACKUPS_ENABLED' in flat), 'the environment opt-in must not sync');
+    assert.ok(!('SUPABASE_CONFIG_PATH' in flat), 'SUPABASE_CONFIG_PATH must not sync');
+    assert.ok(!('SOME_UNKNOWN_KEY' in flat), 'unknown dotenv keys must not sync');
+    assert.ok(
+      !('SUPABASE_DB_URL' in flat),
+      'the legacy secret must never be upserted from the allowlist',
+    );
+    assert.equal(configs[environment].secrets.SUPABASE_SHARED_POOLER_URL, dbUrl(environment));
+    assert.equal(configs[environment].secrets.R2_ACCESS_KEY_ID, ACCESS_KEY);
+    assert.equal(configs[environment].secrets.R2_SECRET_ACCESS_KEY, SECRET_KEY);
+    assert.equal(
+      configs[environment].variables.SUPABASE_PROJECT_REF,
+      environment === 'development' ? REF_DEV : REF_PROD,
+    );
+    assert.equal(configs[environment].variables.CLOUDFLARE_ACCOUNT_ID, ACCOUNT_ID);
+    assert.equal(configs[environment].variables.R2_BUCKET, environment);
+    assert.equal(configs[environment].variables.ENCRYPT_KEY, AGE_RECIPIENT);
   }
+  // Uploaded secrets are registered BEFORE any gh call can fail.
+  assert.ok(registered.includes(dbUrl('development')));
+  assert.ok(registered.includes(dbUrl('production')));
+  assert.ok(registered.includes(ACCESS_KEY));
+  assert.ok(registered.includes(SECRET_KEY));
 });
 
-test('github:configure: file values win over ambient process values', async () => {
-  const root = tmpdir('cfg-gh-ambient-');
-  writeEnvFiles(root);
-  const ambientUrl = `postgresql://postgres.${REF_DEV}:ambient-password@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require`;
-  const previousUrl = process.env.SUPABASE_SHARED_POOLER_URL;
-  const previousKey = process.env.R2_SECRET_ACCESS_KEY;
-  process.env.SUPABASE_SHARED_POOLER_URL = ambientUrl;
-  process.env.R2_SECRET_ACCESS_KEY = 'ambient-key-override-1234567890';
-  try {
-    const { configs } = loadGitHubEnvironmentConfigs({ root, loadConfig: loadBackupConfig });
-    assert.equal(configs.development.secrets.SUPABASE_SHARED_POOLER_URL, dbUrl('development'));
-    assert.equal(configs.development.secrets.R2_SECRET_ACCESS_KEY, SECRET_KEY);
-  } finally {
-    if (previousUrl === undefined) delete process.env.SUPABASE_SHARED_POOLER_URL;
-    else process.env.SUPABASE_SHARED_POOLER_URL = previousUrl;
-    if (previousKey === undefined) delete process.env.R2_SECRET_ACCESS_KEY;
-    else process.env.R2_SECRET_ACCESS_KEY = previousKey;
-    fs.rmSync(root, { recursive: true, force: true });
-  }
+test('github:configure: the builder only maps environments the doctor checked', () => {
+  const { environments, configs } = buildGitHubEnvironmentConfigs({
+    validatedConfigs: defaultDoctorConfigs(),
+    environments: ['production'],
+  });
+  assert.deepEqual(environments, ['production']);
+  assert.ok(!('development' in configs));
+  assert.equal(configs.production.variables.SUPABASE_PROJECT_REF, REF_PROD);
 });
 
-test('github:configure: invalid local configuration rejects before any gh call', async () => {
-  const cases = [
-    {
-      name: 'missing approved field',
-      development: { SUPABASE_SHARED_POOLER_URL: undefined },
-      production: {},
+test('github:configure: doctor failure produces zero gh calls and zero mutations', async () => {
+  const { deps, calls } = makeDeps({
+    doctor: stubDoctor({ fail: true, failMessage: 'static doctor failure' }).doctor,
+  });
+  await assert.rejects(
+    () => runConfigureGitHub({ argv: [], deps, logger: silentLogger() }),
+    /static doctor failure/,
+  );
+  assert.equal(calls.length, 0);
+});
+
+test('github:configure: doctor runs exactly once before any gh call, with argv: []', async () => {
+  const order = [];
+  const gh = makeGh();
+  const doctor = async (opts) => {
+    order.push(['doctor', opts.argv]);
+    return stubDoctorResult();
+  };
+  const run = async (opts) => {
+    order.push(['gh', opts.args[0], opts.args[1]]);
+    return gh.run(opts);
+  };
+  await runConfigureGitHub({
+    argv: ['untrusted/override'],
+    logger: silentLogger(),
+    deps: {
+      doctor,
+      buildConfigs: buildGitHubEnvironmentConfigs,
+      lookup: () => '/gh',
+      run,
     },
-    {
-      name: 'legacy variable present',
-      development: { SUPABASE_DB_URL: dbUrl('development') },
-      production: {},
-    },
-    { name: 'wrong BACKUP_ENVIRONMENT', production: { BACKUP_ENVIRONMENT: 'development' } },
-    { name: 'invalid bucket', development: { R2_BUCKET: 'staging' } },
-    { name: 'project-ref/URL mismatch', development: { SUPABASE_PROJECT_REF: 'z'.repeat(20) } },
-  ];
-  for (const { name, development, production } of cases) {
-    const root = tmpdir('cfg-gh-invalid-');
-    if (production === undefined) {
-      writeEnvFile(root, 'development', development ?? {});
-    } else {
-      writeEnvFile(root, 'development', development ?? {});
-      writeEnvFile(root, 'production', production ?? {});
-    }
-    const { deps, calls } = makeDeps();
-    try {
-      await assert.rejects(
-        () => runConfigureGitHub({ argv: [], root, deps }),
-        (err) => {
-          assert.equal(calls.length, 0, `${name}: no gh call before validation`);
-          if (name === 'wrong BACKUP_ENVIRONMENT') assert.match(err.message, /BACKUP_ENVIRONMENT/);
-          if (name === 'invalid bucket') assert.match(err.message, /R2_BUCKET/);
-          if (name === 'project-ref/URL mismatch') {
-            assert.match(err.message, /SUPABASE_SHARED_POOLER_URL/);
-          }
-          if (name === 'legacy variable present') {
-            assert.match(err.message, /UNSUPPORTED SUPABASE_DB_URL/);
-          }
-          for (const value of sentinelValues('development')) {
-            assert.ok(!err.message.includes(value), `${name}: diagnostics never echo values`);
-          }
-          return true;
-        },
-      );
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  }
+  });
+  assert.equal(order[0][0], 'doctor', 'doctor must precede the first gh call');
+  assert.deepEqual(order[0][1], [], 'configure OWNER/REPO must never reach the doctor');
+  assert.equal(order.filter(([kind]) => kind === 'doctor').length, 1);
+  assert.ok(
+    order.slice(1).every(([kind]) => kind === 'gh'),
+    'no mutation before doctor',
+  );
+  assert.ok(
+    order.slice(1).some(([, , verb]) => verb === 'view'),
+    'the read-only repository preflight is the first gh call',
+  );
+});
+
+test('github:configure: a warning-only doctor success proceeds to all uploads', async () => {
+  const { deps, calls, logger } = makeDeps();
+  const result = await runConfigureGitHub({ argv: [], logger, deps });
+  assert.equal(setCalls(calls).length, 15);
+  assert.equal(result.backupsEnabled, true);
+});
+
+test('github:configure: uploads exactly the doctor-validated values even if dotenv files disappear afterward', async () => {
+  const root = tmpdir('cfg-gh-noread-');
+  writeEnvFiles(root);
+  const validated = defaultDoctorConfigs();
+  const doctor = async () => {
+    // The doctor read the files once and returned validated in-memory
+    // objects; the files then vanish. Configure must not reread them.
+    fs.rmSync(root, { recursive: true, force: true });
+    return stubDoctorResult({ configs: validated });
+  };
+  const { deps, calls } = makeDeps({ doctor });
+  const result = await runConfigureGitHub({ argv: [], root, deps, logger: silentLogger() });
+  assert.deepEqual(result.upserts, {
+    development: { variables: 4, secrets: 3 },
+    production: { variables: 4, secrets: 3 },
+  });
+  assert.equal(setCalls(calls).length, 15);
+  const values = setCalls(calls).map((c) => c.input);
+  assert.ok(values.includes(dbUrl('development')), 'development URL uploaded from memory');
+  assert.ok(values.includes(dbUrl('production')), 'production URL uploaded from memory');
+  assert.ok(values.includes(ACCESS_KEY));
+  assert.ok(values.includes(SECRET_KEY));
+  assert.ok(values.includes(AGE_RECIPIENT));
+  assert.ok(values.includes(REF_DEV));
+  assert.ok(values.includes(REF_PROD));
+  assert.ok(!values.includes(AGE_IDENTITY), 'the private identity is never uploaded');
+  assert.ok(!values.includes(CONFIG_PATH), 'the config path is never uploaded');
+  assert.ok(!values.includes(UNKNOWN_SENTINEL), 'unknown fields are never uploaded');
+});
+
+test('github:configure: an empty doctor environment list fails before any gh call', async () => {
+  const { deps, calls } = makeDeps({
+    doctor: stubDoctor({ environments: [], configs: {} }).doctor,
+  });
+  await assert.rejects(
+    () => runConfigureGitHub({ argv: [], deps, logger: silentLogger() }),
+    /no \.env/,
+  );
+  assert.equal(calls.length, 0);
 });
 
 test('github:configure: default resolution runs gh repo view from REPOSITORY_ROOT without positional', async () => {
-  const { deps, calls, logger } = makeDeps({ loadConfig: stubLoadConfig });
+  const { deps, calls, logger } = makeDeps();
   await runConfigureGitHub({ argv: [], logger, deps });
   assert.deepEqual(calls[0].args, ['repo', 'view', '--json', 'nameWithOwner,isPrivate']);
   assert.equal(calls[0].cwd, REPOSITORY_ROOT);
 });
 
 test('github:configure: override is passed only to repo view; canonical name is used afterwards', async () => {
-  const { deps, calls, logger } = makeDeps({ loadConfig: stubLoadConfig });
+  const { deps, calls, logger } = makeDeps();
   await runConfigureGitHub({ argv: ['untrusted/override'], logger, deps });
   assert.deepEqual(calls[0].args, [
     'repo',
@@ -435,9 +467,9 @@ test('github:configure: rejects malformed or non-private repository preflight re
     },
   ];
   for (const { stdout, label } of badViews) {
-    const { deps, calls } = makeDeps({ loadConfig: stubLoadConfig, view: stdout });
+    const { deps, calls } = makeDeps({ view: stdout });
     await assert.rejects(
-      () => runConfigureGitHub({ argv: [], deps }),
+      () => runConfigureGitHub({ argv: [], deps, logger: silentLogger() }),
       /repository preflight failed/,
     );
     assert.equal(calls.length, 1, `${label}: stops before mutation`);
@@ -449,37 +481,33 @@ test('github:configure: rejects malformed or non-private repository preflight re
 });
 
 test('github:configure: rejects a missing gh executable before any command', async () => {
-  const { logger } = capturingLogger();
   const gh = makeGh();
   const deps = {
-    loadConfig: stubLoadConfig,
-    loadEnvConfigs: stubEnvConfigs,
+    doctor: stubDoctor().doctor,
+    buildConfigs: buildGitHubEnvironmentConfigs,
     lookup: () => null,
     run: gh.run,
   };
-  await assert.rejects(() => runConfigureGitHub({ argv: [], logger, deps }), /gh/);
+  await assert.rejects(() => runConfigureGitHub({ argv: [], logger: silentLogger(), deps }), /gh/);
   assert.equal(gh.calls.length, 0);
 });
 
 test('github:configure: repository inspection failure stops before mutation', async () => {
-  const { deps, calls } = makeDeps({ loadConfig: stubLoadConfig, failAt: 0 });
-  await assert.rejects(() => runConfigureGitHub({ argv: [], deps }));
+  const { deps, calls } = makeDeps({ failAt: 0 });
+  await assert.rejects(() => runConfigureGitHub({ argv: [], deps, logger: silentLogger() }));
   assert.equal(calls.length, 1);
   assert.equal(setCalls(calls).length, 0);
 });
 
 test('github:configure: environment listing failure stops before mutation', async () => {
-  const { deps, calls } = makeDeps({ loadConfig: stubLoadConfig, failAt: 1 });
-  await assert.rejects(() => runConfigureGitHub({ argv: [], deps }));
+  const { deps, calls } = makeDeps({ failAt: 1 });
+  await assert.rejects(() => runConfigureGitHub({ argv: [], deps, logger: silentLogger() }));
   assert.equal(calls.length, 2);
   assert.equal(setCalls(calls).length, 0);
 });
 
 test('github:configure: environment list is paginated with per_page=100', async () => {
-  const { deps, calls, logger } = makeDeps({
-    loadConfig: stubLoadConfig,
-    environments: 'development\n',
-  });
+  const { deps, calls, logger } = makeDeps({ environments: 'development\n' });
   await runConfigureGitHub({ argv: [], logger, deps });
   const listCall = calls[1];
   assert.ok(listCall.args.includes('--paginate'));
@@ -491,7 +519,7 @@ test('github:configure: environment list is paginated with per_page=100', async 
 });
 
 test('github:configure: creates both missing environments with PUT {} before any set', async () => {
-  const { deps, calls, logger } = makeDeps({ loadConfig: stubLoadConfig, environments: '' });
+  const { deps, calls, logger } = makeDeps({ environments: '' });
   const result = await runConfigureGitHub({ argv: [], logger, deps });
   assert.deepEqual(result.createdEnvironments, ['development', 'production']);
   const putCalls = calls.filter((c) => c.args.includes('PUT'));
@@ -520,10 +548,7 @@ test('github:configure: creates both missing environments with PUT {} before any
 });
 
 test('github:configure: existing environments are never sent to the create endpoint', async () => {
-  const { deps, calls, logger } = makeDeps({
-    loadConfig: stubLoadConfig,
-    environments: 'development\nproduction\n',
-  });
+  const { deps, calls, logger } = makeDeps({ environments: 'development\nproduction\n' });
   const result = await runConfigureGitHub({ argv: [], logger, deps });
   assert.deepEqual(result.createdEnvironments, []);
   assert.ok(!calls.some((c) => c.args.includes('PUT')), 'no create/update call for existing envs');
@@ -531,10 +556,7 @@ test('github:configure: existing environments are never sent to the create endpo
 });
 
 test('github:configure: only the missing environment is created', async () => {
-  const { deps, calls, logger } = makeDeps({
-    loadConfig: stubLoadConfig,
-    environments: 'production\n',
-  });
+  const { deps, calls, logger } = makeDeps({ environments: 'production\n' });
   const result = await runConfigureGitHub({ argv: [], logger, deps });
   assert.deepEqual(result.createdEnvironments, ['development']);
   const putCalls = calls.filter((c) => c.args.includes('PUT'));
@@ -544,37 +566,34 @@ test('github:configure: only the missing environment is created', async () => {
 });
 
 test('github:configure: fifteen upserts in deterministic environment/field order', async () => {
-  const root = tmpdir('cfg-gh-order-');
-  writeEnvFiles(root);
-  const { configs } = loadGitHubEnvironmentConfigs({ root, loadConfig: loadBackupConfig });
+  const { deps, calls, logger } = makeDeps();
+  const { configs } = buildGitHubEnvironmentConfigs({
+    validatedConfigs: defaultDoctorConfigs(),
+    environments: ['development', 'production'],
+  });
   const { calls: expected, values } = expectedSetCalls(configs);
-  const { deps, calls, logger } = makeDeps({ loadConfig: loadBackupConfig, root });
-  await runConfigureGitHub({ argv: [], root, logger, deps });
+  await runConfigureGitHub({ argv: [], logger, deps });
   const setCalls_ = setCalls(calls);
   assert.equal(setCalls_.length, 15);
   for (let i = 0; i < 15; i += 1) {
     assert.deepEqual(setCalls_[i].args, expected[i], `call ${i}`);
     assert.equal(setCalls_[i].input, values[i], `stdin value ${i}`);
   }
-  fs.rmSync(root, { recursive: true, force: true });
 });
 
 test('github:configure: values travel only via stdin, never in arguments', async () => {
-  const root = tmpdir('cfg-gh-stdin-');
-  writeEnvFiles(root);
-  const { deps, calls, logger } = makeDeps({ loadConfig: loadBackupConfig, root });
-  await runConfigureGitHub({ argv: [], root, logger, deps });
+  const { deps, calls, logger } = makeDeps();
+  await runConfigureGitHub({ argv: [], logger, deps });
   const setCalls_ = setCalls(calls);
   for (const call of setCalls_) {
     for (const value of sentinelValues(call.args[3])) {
       assert.ok(!call.args.includes(value), `${value} must not appear in args`);
     }
   }
-  fs.rmSync(root, { recursive: true, force: true });
 });
 
 test('github:configure: uses secret/variable set, never --body or --env-file', async () => {
-  const { deps, calls, logger } = makeDeps({ loadConfig: stubLoadConfig });
+  const { deps, calls, logger } = makeDeps();
   await runConfigureGitHub({ argv: [], logger, deps });
   const setCalls_ = setCalls(calls);
   assert.ok(setCalls_.every((c) => c.args[0] === 'secret' || c.args[0] === 'variable'));
@@ -586,10 +605,7 @@ test('github:configure: uses secret/variable set, never --body or --env-file', a
 });
 
 test('github:configure: no delete call when no legacy secret is inventoried', async () => {
-  const { deps, calls } = makeDeps({
-    loadConfig: stubLoadConfig,
-    environments: 'development\nproduction\n',
-  });
+  const { deps, calls } = makeDeps({ environments: 'development\nproduction\n' });
   await runConfigureGitHub({ argv: [], logger: silentLogger(), deps });
   const deleteCalls = calls.filter((c) => c.args[0] === 'secret' && c.args[1] === 'delete');
   assert.equal(deleteCalls.length, 0, 'absent legacy secrets must not be deleted');
@@ -597,7 +613,6 @@ test('github:configure: no delete call when no legacy secret is inventoried', as
 
 test('github:configure: only the fixed legacy secret is ever deleted, at Environment scope, after every env upsert', async () => {
   const { deps, calls } = makeDeps({
-    loadConfig: stubLoadConfig,
     environments: 'development\nproduction\n',
     secretInventory: {
       development: ['SUPABASE_DB_URL'],
@@ -638,7 +653,6 @@ test('github:configure: only the fixed legacy secret is ever deleted, at Environ
 
 test('github:configure: sets the repository-level BACKUPS_ENABLED opt-in last', async () => {
   const { deps, calls, logger } = makeDeps({
-    loadConfig: stubLoadConfig,
     environments: 'development\nproduction\n',
     secretInventory: { development: ['SUPABASE_DB_URL'], production: ['SUPABASE_DB_URL'] },
   });
@@ -665,10 +679,7 @@ test('github:configure: sets the repository-level BACKUPS_ENABLED opt-in last', 
 });
 
 test('github:configure: secret inventory uses --env, --repo, and --json name with the canonical repository', async () => {
-  const { deps, calls } = makeDeps({
-    loadConfig: stubLoadConfig,
-    environments: 'development\nproduction\n',
-  });
+  const { deps, calls } = makeDeps({ environments: 'development\nproduction\n' });
   await runConfigureGitHub({ argv: [], logger: silentLogger(), deps });
   const listCalls = calls.filter((c) => c.args[0] === 'secret' && c.args[1] === 'list');
   assert.equal(listCalls.length, 2);
@@ -719,7 +730,12 @@ test('github:configure: inventory completes for every existing environment befor
   const result = await runConfigureGitHub({
     argv: [],
     logger: silentLogger(),
-    deps: { loadConfig: stubLoadConfig, loadEnvConfigs: stubEnvConfigs, lookup: () => '/gh', run },
+    deps: {
+      doctor: stubDoctor().doctor,
+      buildConfigs: buildGitHubEnvironmentConfigs,
+      lookup: () => '/gh',
+      run,
+    },
   });
   const listIndexes = order.map((o, i) => (o.startsWith('list:') ? i : -1)).filter((i) => i !== -1);
   assert.deepEqual(listIndexes, [2, 3], `inventory must precede mutation: ${order.join(', ')}`);
@@ -756,8 +772,8 @@ test('github:configure: inventory failure causes zero mutation', async () => {
         argv: [],
         logger: silentLogger(),
         deps: {
-          loadConfig: stubLoadConfig,
-          loadEnvConfigs: stubEnvConfigs,
+          doctor: stubDoctor().doctor,
+          buildConfigs: buildGitHubEnvironmentConfigs,
           lookup: () => '/gh',
           run,
         },
@@ -795,8 +811,8 @@ test('github:configure: malformed or truncated secret inventory fails closed bef
           argv: [],
           logger: silentLogger(),
           deps: {
-            loadConfig: stubLoadConfig,
-            loadEnvConfigs: stubEnvConfigs,
+            doctor: stubDoctor().doctor,
+            buildConfigs: buildGitHubEnvironmentConfigs,
             lookup: () => '/gh',
             run,
           },
@@ -814,7 +830,6 @@ test('github:configure: malformed or truncated secret inventory fails closed bef
 
 test('github:configure: one upsert failure leaves every legacy secret untouched', async () => {
   const { deps, calls } = makeDeps({
-    loadConfig: stubLoadConfig,
     environments: 'development\nproduction\n',
     secretInventory: { development: ['SUPABASE_DB_URL'], production: ['SUPABASE_DB_URL'] },
     failAt: 6, // a variable upsert (after view, env list, and the two inventories)
@@ -830,7 +845,6 @@ test('github:configure: one upsert failure leaves every legacy secret untouched'
 
 test('github:configure: newly created environments are never probed or deleted as if they had a legacy secret', async () => {
   const { deps, calls } = makeDeps({
-    loadConfig: stubLoadConfig,
     environments: 'production\n', // only production exists
     secretInventory: { production: ['SUPABASE_DB_URL'] },
   });
@@ -878,8 +892,8 @@ test('github:configure: rerun after a failed partial deletion deletes only the r
     return { stdout: '', stderr: '' };
   };
   const deps = {
-    loadConfig: stubLoadConfig,
-    loadEnvConfigs: stubEnvConfigs,
+    doctor: stubDoctor().doctor,
+    buildConfigs: buildGitHubEnvironmentConfigs,
     lookup: () => '/gh',
     run,
   };
@@ -894,8 +908,6 @@ test('github:configure: rerun after a failed partial deletion deletes only the r
 });
 
 test('github:configure: a deletion failure is redacted and stops later deletions', async () => {
-  const root = tmpdir('cfg-gh-del-fail-');
-  writeEnvFiles(root);
   let deleteCalls = 0;
   const run = async (opts) => {
     if (opts.args[1] === 'view') {
@@ -925,9 +937,13 @@ test('github:configure: a deletion failure is redacted and stops later deletions
     () =>
       runConfigureGitHub({
         argv: [],
-        root,
         logger,
-        deps: { loadConfig: loadBackupConfig, lookup: () => '/gh', run },
+        deps: {
+          doctor: stubDoctor().doctor,
+          buildConfigs: buildGitHubEnvironmentConfigs,
+          lookup: () => '/gh',
+          run,
+        },
       }),
     (err) => {
       assert.ok(!err.message.includes(dbUrl('development')), 'message must not carry the URL');
@@ -937,18 +953,14 @@ test('github:configure: a deletion failure is redacted and stops later deletions
     },
   );
   assert.equal(deleteCalls, 1, 'a failed deletion stops later deletions');
-  fs.rmSync(root, { recursive: true, force: true });
 });
 
 test('github:configure: write failure stops later writes, hides values, and rerun is safe', async () => {
-  const root = tmpdir('cfg-gh-fail-');
-  writeEnvFiles(root);
-  const { configs } = loadGitHubEnvironmentConfigs({ root, loadConfig: loadBackupConfig });
   const { logger } = capturingLogger();
   // call 0: repo view, 1: env list, 2-3: PUTs, 4-7: dev variables, 8: first dev secret.
-  const failing = makeDeps({ loadConfig: loadBackupConfig, root, environments: '', failAt: 8 });
+  const failing = makeDeps({ environments: '', failAt: 8 });
   await assert.rejects(
-    () => runConfigureGitHub({ argv: [], root, logger, deps: failing.deps }),
+    () => runConfigureGitHub({ argv: [], logger, deps: failing.deps }),
     (err) => {
       assert.equal(failing.calls.length, 9, 'no call after the failed write');
       const setCalls_ = setCalls(failing.calls);
@@ -959,8 +971,8 @@ test('github:configure: write failure stops later writes, hides values, and reru
       return true;
     },
   );
-  const second = makeDeps({ loadConfig: loadBackupConfig, root, environments: '' });
-  const result = await runConfigureGitHub({ argv: [], root, logger, deps: second.deps });
+  const second = makeDeps({ environments: '' });
+  const result = await runConfigureGitHub({ argv: [], logger, deps: second.deps });
   assert.equal(second.calls.length, 19);
   assert.deepEqual(result.createdEnvironments, ['development', 'production']);
   assert.deepEqual(result.upserts, {
@@ -968,8 +980,7 @@ test('github:configure: write failure stops later writes, hides values, and reru
     production: { variables: 4, secrets: 3 },
   });
   assert.equal(result.backupsEnabled, true);
-  assert.deepEqual(configs.development.secrets.SUPABASE_SHARED_POOLER_URL, dbUrl('development'));
-  fs.rmSync(root, { recursive: true, force: true });
+  assert.deepEqual(defaultDoctorConfigs().development.sharedPoolerUrl, dbUrl('development'));
 });
 
 test('github:configure: gh binary resolution covers Windows wrappers', () => {
@@ -999,8 +1010,8 @@ test('github:configure: Windows cmd wrapper is used end to end for list, set, an
     logger,
     platform: 'win32',
     deps: {
-      loadConfig: stubLoadConfig,
-      loadEnvConfigs: stubEnvConfigs,
+      doctor: stubDoctor().doctor,
+      buildConfigs: buildGitHubEnvironmentConfigs,
       lookup: (name) => ({ 'gh.cmd': '/c/gh.cmd' })[name] ?? null,
       run,
     },
@@ -1032,8 +1043,8 @@ test('github:configure: a truncated environment listing fails closed', async () 
         argv: [],
         logger: silentLogger(),
         deps: {
-          loadConfig: stubLoadConfig,
-          loadEnvConfigs: stubEnvConfigs,
+          doctor: stubDoctor().doctor,
+          buildConfigs: buildGitHubEnvironmentConfigs,
           lookup: () => '/gh',
           run,
         },
@@ -1043,6 +1054,33 @@ test('github:configure: a truncated environment listing fails closed', async () 
   const flat = calls.flat().join(' ');
   assert.ok(!flat.includes('PUT'), 'no environment create/update may run on a truncated listing');
   assert.ok(!flat.includes('secret set') && !flat.includes('variable set'));
+});
+
+test('github:configure: requests a static-only doctor run bounded by the overall deadline', async () => {
+  const opts = [];
+  const gh = makeGh();
+  const doctor = async (o) => {
+    opts.push(o);
+    return stubDoctorResult();
+  };
+  await runConfigureGitHub({
+    argv: [],
+    logger: silentLogger(),
+    timeoutMs: 60000,
+    deps: {
+      doctor,
+      buildConfigs: buildGitHubEnvironmentConfigs,
+      lookup: () => '/gh',
+      run: gh.run,
+    },
+  });
+  assert.equal(opts.length, 1);
+  assert.equal(opts[0].live, false, 'configure must never require Docker/network probes');
+  assert.deepEqual(opts[0].argv, [], 'configure OWNER/REPO must never reach the doctor');
+  assert.ok(
+    opts[0].timeoutMs > 0 && opts[0].timeoutMs <= 60000,
+    'the doctor must be bounded by the configure deadline',
+  );
 });
 
 test('github:configure: a stalled gh call is bounded by the timeout', async () => {
@@ -1061,8 +1099,8 @@ test('github:configure: a stalled gh call is bounded by the timeout', async () =
         logger: silentLogger(),
         timeoutMs: 20,
         deps: {
-          loadConfig: stubLoadConfig,
-          loadEnvConfigs: stubEnvConfigs,
+          doctor: stubDoctor().doctor,
+          buildConfigs: buildGitHubEnvironmentConfigs,
           lookup: () => '/gh',
           run,
         },
@@ -1072,8 +1110,6 @@ test('github:configure: a stalled gh call is bounded by the timeout', async () =
 });
 
 test('github:configure: write failures never retain unredacted credentials in the error chain', async () => {
-  const root = tmpdir('cfg-gh-chain-');
-  writeEnvFiles(root);
   const run = async (opts) => {
     if (opts.args[1] === 'view') {
       return { stdout: JSON.stringify({ nameWithOwner: CANONICAL, isPrivate: true }), stderr: '' };
@@ -1095,9 +1131,13 @@ test('github:configure: write failures never retain unredacted credentials in th
     () =>
       runConfigureGitHub({
         argv: [],
-        root,
         logger,
-        deps: { loadConfig: loadBackupConfig, lookup: () => '/gh', run },
+        deps: {
+          doctor: stubDoctor().doctor,
+          buildConfigs: buildGitHubEnvironmentConfigs,
+          lookup: () => '/gh',
+          run,
+        },
       }),
     (err) => {
       assert.ok(!err.message.includes(dbUrl('development')), 'message must not carry the URL');
@@ -1116,15 +1156,12 @@ test('github:configure: write failures never retain unredacted credentials in th
       return true;
     },
   );
-  fs.rmSync(root, { recursive: true, force: true });
 });
 
 test('github:configure: result and status output contain no fixture values', async () => {
-  const root = tmpdir('cfg-gh-output-');
-  writeEnvFiles(root);
   const { logger, output } = capturingLogger();
-  const { deps } = makeDeps({ loadConfig: loadBackupConfig, root });
-  const result = await runConfigureGitHub({ argv: [], root, logger, deps });
+  const { deps } = makeDeps();
+  const result = await runConfigureGitHub({ argv: [], logger, deps });
   const text = output();
   assert.ok(text.includes(CANONICAL));
   assert.ok(text.includes('development'));
@@ -1141,7 +1178,6 @@ test('github:configure: result and status output contain no fixture values', asy
   });
   assert.equal(result.backupsEnabled, true);
   assert.deepEqual(result.legacySecretDeletions, { development: false, production: false });
-  fs.rmSync(root, { recursive: true, force: true });
 });
 
 test('github:configure: CLI entry point responds to --help', () => {
@@ -1150,67 +1186,4 @@ test('github:configure: CLI entry point responds to --help', () => {
   assert.ok(res.stdout.includes('usage: vp run github:configure'), res.stdout);
   assert.ok(/development and production/.test(res.stdout), res.stdout);
   assert.equal(res.stderr, '');
-});
-
-test(
-  'github:configure: an unreadable dotenv file fails instead of being skipped',
-  { skip: process.platform === 'win32' },
-  () => {
-    const root = tmpdir('cfg-gh-unreadable-');
-    // A self-looping symlink is a present-but-unreadable path (ELOOP) without
-    // depending on permission semantics; it must fail closed, not be treated
-    // as absent and silently skipped.
-    fs.symlinkSync(
-      path.join(root, '.env.development.local'),
-      path.join(root, '.env.development.local'),
-    );
-    try {
-      assert.throws(
-        () => loadGitHubEnvironmentConfigs({ root, loadConfig: loadBackupConfig }),
-        (err) => err.code === 'ELOOP',
-      );
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  },
-);
-
-test('github:configure: skips environments with missing dotenv files', () => {
-  const root = tmpdir('cfg-gh-skip-');
-  writeEnvFile(root, 'production', {
-    BACKUP_ENVIRONMENT: 'production',
-    SUPABASE_PROJECT_REF: REF_PROD,
-    SUPABASE_SHARED_POOLER_URL: dbUrl('production'),
-    CLOUDFLARE_ACCOUNT_ID: ACCOUNT_ID,
-    R2_BUCKET: 'production',
-    R2_ACCESS_KEY_ID: ACCESS_KEY,
-    R2_SECRET_ACCESS_KEY: SECRET_KEY,
-    ENCRYPT_KEY: AGE_RECIPIENT,
-  });
-  try {
-    const { configs, environments } = loadGitHubEnvironmentConfigs({
-      root,
-      loadConfig: loadBackupConfig,
-    });
-    assert.deepEqual(environments, ['production']);
-    assert.ok(!('development' in configs));
-    assert.ok('production' in configs);
-    assert.equal(configs.production.variables.SUPABASE_PROJECT_REF, REF_PROD);
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('github:configure: errors when no dotenv files exist', () => {
-  const root = tmpdir('cfg-gh-none-');
-  try {
-    const { configs, environments } = loadGitHubEnvironmentConfigs({
-      root,
-      loadConfig: loadBackupConfig,
-    });
-    assert.deepEqual(environments, []);
-    assert.deepEqual(configs, {});
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
 });

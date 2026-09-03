@@ -67,8 +67,8 @@ export function createS3Adapter({ accountId, accessKeyId, secretAccessKey, endpo
 }
 
 function headBucketOp(client) {
-  return async ({ bucket }) => {
-    await client.send(new HeadBucketCommand({ Bucket: bucket }));
+  return async ({ bucket, signal }) => {
+    await client.send(new HeadBucketCommand({ Bucket: bucket }), { abortSignal: signal });
   };
 }
 
@@ -533,10 +533,13 @@ export async function downloadSnapshot({ adapter, bucket, prefix, manifest, dest
   }
 }
 
-export async function headBucketCheck({ adapter, bucket }) {
+export async function headBucketCheck({ adapter, bucket, signal }) {
   try {
-    await adapter.headBucket({ bucket });
+    await adapter.headBucket({ bucket, signal });
   } catch (err) {
+    // Static message; the raw cause is preserved so non-doctor callers keep
+    // AWS status codes, request IDs, and abort classification. The doctor
+    // discards the cause at its own reporting boundary (bare catch).
     throw new R2Error(`cannot access R2 bucket for ${bucket}: check credentials and bucket scope`, {
       cause: err,
     });

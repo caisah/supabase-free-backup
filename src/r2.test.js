@@ -961,3 +961,70 @@ test('r2: retention never deletes the last valid snapshot (unchanged-database av
     'the recent snapshot stays; both expired ones go',
   );
 });
+
+test('r2: headBucketCheck forwards the AbortSignal to the adapter', async () => {
+  const { adapter, calls } = memoryStore();
+  const signal = new AbortController().signal;
+  await headBucketCheck({ adapter, bucket: 'development', signal });
+  assert.equal(calls.length, 1);
+  // The in-memory adapter ignores extra options, so spy on the real seam.
+  let observed = null;
+  const spying = {
+    async headBucket(opts) {
+      observed = opts;
+    },
+  };
+  await headBucketCheck({ adapter: spying, bucket: 'development', signal });
+  assert.equal(observed.signal, signal, 'the signal must reach the adapter call');
+});
+
+test('r2: headBucketCheck keeps a static message, preserves the raw cause, and rejects aborts cleanly', async () => {
+  const accessKey = 'abcd1234abcd1234abcd1234abcd1234';
+  const secretKey = '0'.repeat(64);
+  // The AWS error carries the diagnostic details (status code, request ID,
+  // abort classification) that production troubleshooting needs; the doctor
+  // discards the cause at ITS reporting boundary with a bare catch.
+  const raw = new Error(`AccessDenied with key ${accessKey} and secret ${secretKey}`);
+  raw.code = 'AccessDenied';
+  const failing = {
+    async headBucket() {
+      throw raw;
+    },
+  };
+  await assert.rejects(
+    () => headBucketCheck({ adapter: failing, bucket: 'development' }),
+    (err) => {
+      assert.ok(err instanceof R2Error);
+      assert.ok(
+        !err.message.includes(accessKey) && !err.message.includes(secretKey),
+        'the R2Error message itself must stay static',
+      );
+      assert.equal(err.cause, raw, 'the raw cause must be preserved for non-doctor callers');
+      return true;
+    },
+  );
+});
+
+test('r2: an aborted HeadBucket request rejects without credentials', async () => {
+  const abort = new AbortController();
+  const failing = {
+    async headBucket({ signal }) {
+      await new Promise((resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new Error('aborted request')), {
+          once: true,
+        });
+      });
+    },
+  };
+  const pending = headBucketCheck({
+    adapter: failing,
+    bucket: 'development',
+    signal: abort.signal,
+  });
+  abort.abort();
+  await assert.rejects(pending, (err) => {
+    assert.ok(err instanceof R2Error);
+    assert.ok(!err.message.includes('aborted request'), 'raw abort error must not be echoed');
+    return true;
+  });
+});
