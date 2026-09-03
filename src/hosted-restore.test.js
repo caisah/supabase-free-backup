@@ -27,6 +27,10 @@ import { confirmExactPhrase } from './hosted-restore.js';
 const DB_URL =
   'postgresql://postgres.a1b2c3d4e5f6a7b8c9d0:the-password@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require';
 
+/** Same connection without its password: the only form ever allowed in argv. */
+const SAFE_DB_URL =
+  'postgresql://postgres.a1b2c3d4e5f6a7b8c9d0@aws-0-us-east-1.pooler.supabase.com:5432/postgres?sslmode=require';
+
 const ROLES_SQL = [
   'SET statement_timeout = 0;',
   'CREATE ROLE "anon";',
@@ -591,7 +595,15 @@ test('hosted: read-only preflight preflights the pinned image then requires a li
   const selectCall = calls.find((c) => c.args.includes('-c'));
   assert.ok(selectCall, 'SELECT 1 query must run');
   assert.ok(selectCall.args.includes('SELECT 1'));
-  assert.ok(selectCall.secretArgs.includes(DB_URL), 'target query marks url secret');
+  assert.ok(
+    !selectCall.args.some((a) => a.includes('the-password')),
+    'the password must never appear in the docker argv',
+  );
+  assert.ok(selectCall.args.includes(SAFE_DB_URL), 'the argv URL carries no password');
+  assert.ok(selectCall.args.includes('-e') && selectCall.args.includes('PGPASSWORD'));
+  assert.equal(selectCall.env.PGPASSWORD, 'the-password', 'password travels via the client env');
+  assert.ok(selectCall.secretArgs.includes(SAFE_DB_URL), 'target query marks url secret');
+  assert.ok(selectCall.secretArgs.includes('the-password'), 'target query marks password secret');
   assert.ok(calls.indexOf(selectCall) > 0, 'target query follows the version preflight');
   const failing = async (opts) => {
     if (opts.args.includes('--version')) return { stdout: 'psql (PostgreSQL) 17.6\n' };
@@ -604,11 +616,14 @@ test('hosted: read-only preflight preflights the pinned image then requires a li
 });
 
 test('hosted: psqlQuery runs Dockerized psql and never prints the URL or password', async () => {
-  const run = async ({ args, secretArgs }) => {
-    assert.ok(args.includes(DB_URL));
+  const run = async ({ args, secretArgs, env }) => {
+    assert.ok(args.includes(SAFE_DB_URL));
+    assert.ok(!args.includes(DB_URL), 'the password-bearing URL must never reach argv');
     assert.ok(args.includes('--entrypoint=psql'));
     assert.ok(args.includes(PINNED_SUPABASE_POSTGRES_IMAGE));
-    assert.ok(secretArgs.includes(DB_URL));
+    assert.ok(args.includes('-e') && args.includes('PGPASSWORD'));
+    assert.equal(env.PGPASSWORD, 'the-password');
+    assert.ok(secretArgs.includes(SAFE_DB_URL));
     assert.ok(secretArgs.includes('the-password'));
     return { stdout: 'a\nb\n' };
   };
@@ -632,10 +647,12 @@ test('hosted: psqlQuery forwards the abort signal to the Dockerized client', asy
   assert.equal(forwarded, true);
 });
 
-test('hosted: psqlQuery never prints the URL or password', async () => {
-  const run = async ({ args, secretArgs }) => {
-    assert.ok(args.includes(DB_URL));
-    assert.ok(secretArgs.includes(DB_URL));
+test('hosted: psqlQuery sends a password-less URL over argv and PGPASSWORD over the client env', async () => {
+  const run = async ({ args, secretArgs, env }) => {
+    assert.ok(args.includes(SAFE_DB_URL));
+    assert.ok(!args.includes(DB_URL), 'the password-bearing URL must never reach argv');
+    assert.deepEqual(env.PGPASSWORD, 'the-password');
+    assert.ok(secretArgs.includes('the-password'));
     return { stdout: 'a\nb\n' };
   };
   const lines = await psqlQuery({ dockerPath: '/docker', dbUrl: DB_URL, query: 'SELECT 1', run });
@@ -1243,7 +1260,10 @@ test('hosted: the isolated db URL password is registered as a secret for every c
   });
   assert.ok(seenSecrets.length >= 5, 'every psql/probe/reset/restore command must carry secrets');
   for (const secrets of seenSecrets) {
-    assert.ok(secrets.includes(DB_URL), 'db url must be registered as a secret');
+    assert.ok(
+      secrets.includes(DB_URL) || secrets.includes(SAFE_DB_URL),
+      'the connection URL (password-bearing or argv-safe form) must be registered as a secret',
+    );
     assert.ok(
       secrets.includes('the-password'),
       'the isolated password must be registered so a tool echoing it alone is redacted',

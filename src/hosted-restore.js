@@ -388,11 +388,16 @@ export function buildDockerPsqlArgs({
   postgresImage = PINNED_SUPABASE_POSTGRES_IMAGE,
   psqlArgs,
   interactive = false,
+  passwordEnv = false,
 }) {
   const dockerFlags = [
     'run',
     '--rm',
     ...(interactive ? ['--interactive'] : []),
+    // PGPASSWORD (no value) makes the docker client copy the variable from
+    // its OWN environment into the container: the password stays out of argv
+    // and off any process listing.
+    ...(passwordEnv ? ['-e', 'PGPASSWORD'] : []),
     ...DOCKER_HARDENING_FLAGS,
   ];
   return [...dockerFlags, postgresImage, ...psqlArgs];
@@ -441,7 +446,24 @@ export async function preflightDockerPsql({
   return version;
 }
 
-/** Read-only psql query; returns trimmed stdout lines. */
+/** The connection URL without its password: the only form allowed in argv. */
+function connectionUrlWithoutPassword(dbUrl) {
+  try {
+    const url = new URL(dbUrl);
+    url.password = '';
+    return url.toString();
+  } catch {
+    // Unparsable URLs are rejected later exactly as before.
+    return String(dbUrl);
+  }
+}
+
+/**
+ * Read-only psql query; returns trimmed stdout lines. The connection
+ * password travels via the docker client's environment (`-e PGPASSWORD`),
+ * never in the docker run argv: process listings and docker client metadata
+ * never carry the credential.
+ */
 export async function psqlQuery({
   dockerPath,
   postgresImage = PINNED_SUPABASE_POSTGRES_IMAGE,
@@ -450,13 +472,25 @@ export async function psqlQuery({
   run,
   signal,
 }) {
+  const password = urlPassword(dbUrl);
+  const safeUrl = connectionUrlWithoutPassword(dbUrl);
   const res = await run({
     command: dockerPath,
     args: buildDockerPsqlArgs({
       postgresImage,
-      psqlArgs: ['-X', '-q', '-t', '-A', '-c', query, dbUrl],
+      passwordEnv: Boolean(password),
+      psqlArgs: ['-X', '-q', '-t', '-A', '-c', query, safeUrl],
     }),
-    secretArgs: [dbUrl, urlPassword(dbUrl)].filter(Boolean),
+    secretArgs: [safeUrl, password].filter(
+      (value) => typeof value === 'string' && value.length > 0,
+    ),
+    // The docker client copies PGPASSWORD from its OWN environment for the
+    // bare `-e PGPASSWORD` flag; the value never appears in argv or on the
+    // client command line. It lands in the container's environment, readable
+    // only through docker-socket access (root-equivalent) — with
+    // --user=postgres the stronger bind-mounted pgpass channel is impossible
+    // (libpq ignores group/world-readable files), so this is the ceiling.
+    env: password ? { ...process.env, PGPASSWORD: password } : undefined,
     stdout: 'collect',
     stderr: 'collect',
     signal,
