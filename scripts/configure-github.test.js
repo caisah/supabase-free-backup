@@ -214,6 +214,9 @@ function expectedSetCalls(configs) {
       values.push(value);
     }
   }
+  // The repository-level opt-in is upserted last, after both environments.
+  calls.push(['variable', 'set', 'BACKUPS_ENABLED', '--repo', CANONICAL]);
+  values.push('true');
   return { calls, values };
 }
 
@@ -512,7 +515,7 @@ test('github:configure: creates both missing environments with PUT {} before any
   assert.equal(putCalls[0].input, '{}');
   assert.equal(putCalls[1].input, '{}');
   const setCalls_ = setCalls(calls);
-  assert.equal(setCalls_.length, 14);
+  assert.equal(setCalls_.length, 15);
   assert.ok(calls.indexOf(putCalls[0]) < calls.indexOf(setCalls_[0]), 'PUTs happen before sets');
 });
 
@@ -524,7 +527,7 @@ test('github:configure: existing environments are never sent to the create endpo
   const result = await runConfigureGitHub({ argv: [], logger, deps });
   assert.deepEqual(result.createdEnvironments, []);
   assert.ok(!calls.some((c) => c.args.includes('PUT')), 'no create/update call for existing envs');
-  assert.equal(setCalls(calls).length, 14);
+  assert.equal(setCalls(calls).length, 15);
 });
 
 test('github:configure: only the missing environment is created', async () => {
@@ -540,7 +543,7 @@ test('github:configure: only the missing environment is created', async () => {
   assert.ok(!putCalls[0].args.some((a) => a.endsWith('/environments/production')));
 });
 
-test('github:configure: fourteen upserts in deterministic environment/field order', async () => {
+test('github:configure: fifteen upserts in deterministic environment/field order', async () => {
   const root = tmpdir('cfg-gh-order-');
   writeEnvFiles(root);
   const { configs } = loadGitHubEnvironmentConfigs({ root, loadConfig: loadBackupConfig });
@@ -548,8 +551,8 @@ test('github:configure: fourteen upserts in deterministic environment/field orde
   const { deps, calls, logger } = makeDeps({ loadConfig: loadBackupConfig, root });
   await runConfigureGitHub({ argv: [], root, logger, deps });
   const setCalls_ = setCalls(calls);
-  assert.equal(setCalls_.length, 14);
-  for (let i = 0; i < 14; i += 1) {
+  assert.equal(setCalls_.length, 15);
+  for (let i = 0; i < 15; i += 1) {
     assert.deepEqual(setCalls_[i].args, expected[i], `call ${i}`);
     assert.equal(setCalls_[i].input, values[i], `stdin value ${i}`);
   }
@@ -592,7 +595,7 @@ test('github:configure: no delete call when no legacy secret is inventoried', as
   assert.equal(deleteCalls.length, 0, 'absent legacy secrets must not be deleted');
 });
 
-test('github:configure: only the fixed legacy secret is ever deleted, at Environment scope, after every upsert', async () => {
+test('github:configure: only the fixed legacy secret is ever deleted, at Environment scope, after every env upsert', async () => {
   const { deps, calls } = makeDeps({
     loadConfig: stubLoadConfig,
     environments: 'development\nproduction\n',
@@ -617,14 +620,48 @@ test('github:configure: only the fixed legacy secret is ever deleted, at Environ
   assert.equal(deleteCalls[0].args[4], 'development');
   assert.equal(deleteCalls[1].args[4], 'production');
   const setCalls_ = setCalls(calls);
-  assert.equal(setCalls_.length, 14);
+  assert.equal(setCalls_.length, 15);
+  const lastEnvUpsert = setCalls_[setCalls_.length - 2];
   for (const dc of deleteCalls) {
     assert.ok(
-      calls.indexOf(dc) > calls.indexOf(setCalls_[setCalls_.length - 1]),
-      'every deletion must come after all fourteen upserts',
+      calls.indexOf(dc) > calls.indexOf(lastEnvUpsert),
+      'every deletion must come after all fourteen environment upserts',
     );
   }
+  assert.ok(
+    calls.indexOf(setCalls_[setCalls_.length - 1]) > calls.indexOf(deleteCalls[1]),
+    'the BACKUPS_ENABLED opt-in must come after every deletion',
+  );
   assert.deepEqual(result.legacySecretDeletions, { development: true, production: true });
+  assert.equal(result.backupsEnabled, true);
+});
+
+test('github:configure: sets the repository-level BACKUPS_ENABLED opt-in last', async () => {
+  const { deps, calls, logger } = makeDeps({
+    loadConfig: stubLoadConfig,
+    environments: 'development\nproduction\n',
+    secretInventory: { development: ['SUPABASE_DB_URL'], production: ['SUPABASE_DB_URL'] },
+  });
+  const result = await runConfigureGitHub({ argv: [], logger, deps });
+  const optIns = calls.filter((c) => c.args[2] === 'BACKUPS_ENABLED');
+  assert.equal(optIns.length, 1);
+  assert.deepEqual(
+    optIns[0].args,
+    ['variable', 'set', 'BACKUPS_ENABLED', '--repo', CANONICAL],
+    'repository scope: no --env flag',
+  );
+  assert.equal(optIns[0].input, 'true');
+  const deletions = calls.filter((c) => c.args[0] === 'secret' && c.args[1] === 'delete');
+  assert.equal(deletions.length, 2);
+  assert.ok(
+    calls.indexOf(optIns[0]) > calls.indexOf(deletions[deletions.length - 1]),
+    'the opt-in is set after every legacy-secret deletion',
+  );
+  assert.ok(
+    calls.indexOf(optIns[0]) > calls.indexOf(setCalls(calls)[setCalls(calls).length - 2]),
+    'the opt-in is set after every environment upsert',
+  );
+  assert.equal(result.backupsEnabled, true);
 });
 
 test('github:configure: secret inventory uses --env, --repo, and --json name with the canonical repository', async () => {
@@ -691,9 +728,10 @@ test('github:configure: inventory completes for every existing environment befor
     listIndexes.every((i) => i < firstMutation),
     'all inventory must complete before any mutation',
   );
-  const lastSet = order.lastIndexOf('set');
-  assert.ok(order.indexOf('delete') > lastSet, 'deletion must follow every upsert');
-  assert.equal(order[order.length - 1], 'delete', 'deletion is last');
+  const firstDelete = order.indexOf('delete');
+  const lastEnvSet = order.lastIndexOf('set', firstDelete);
+  assert.ok(firstDelete > lastEnvSet, 'deletion must follow every environment upsert');
+  assert.equal(order[order.length - 1], 'set', 'the repository opt-in is set last');
   assert.deepEqual(result.legacySecretDeletions, { development: true, production: true });
 });
 
@@ -784,6 +822,10 @@ test('github:configure: one upsert failure leaves every legacy secret untouched'
   await assert.rejects(() => runConfigureGitHub({ argv: [], logger: silentLogger(), deps }));
   const deleteCalls = calls.filter((c) => c.args[0] === 'secret' && c.args[1] === 'delete');
   assert.equal(deleteCalls.length, 0, 'no deletion may run after a failed upsert');
+  assert.ok(
+    !calls.flat().join(' ').includes('BACKUPS_ENABLED'),
+    'a failed upsert must never enable backups',
+  );
 });
 
 test('github:configure: newly created environments are never probed or deleted as if they had a legacy secret', async () => {
@@ -919,12 +961,13 @@ test('github:configure: write failure stops later writes, hides values, and reru
   );
   const second = makeDeps({ loadConfig: loadBackupConfig, root, environments: '' });
   const result = await runConfigureGitHub({ argv: [], root, logger, deps: second.deps });
-  assert.equal(second.calls.length, 18);
+  assert.equal(second.calls.length, 19);
   assert.deepEqual(result.createdEnvironments, ['development', 'production']);
   assert.deepEqual(result.upserts, {
     development: { variables: 4, secrets: 3 },
     production: { variables: 4, secrets: 3 },
   });
+  assert.equal(result.backupsEnabled, true);
   assert.deepEqual(configs.development.secrets.SUPABASE_SHARED_POOLER_URL, dbUrl('development'));
   fs.rmSync(root, { recursive: true, force: true });
 });
@@ -1096,6 +1139,7 @@ test('github:configure: result and status output contain no fixture values', asy
     development: { variables: 4, secrets: 3 },
     production: { variables: 4, secrets: 3 },
   });
+  assert.equal(result.backupsEnabled, true);
   assert.deepEqual(result.legacySecretDeletions, { development: false, production: false });
   fs.rmSync(root, { recursive: true, force: true });
 });

@@ -9,7 +9,10 @@
  * Both environments are always validated and synchronized together; values
  * come only from `.env.<environment>.local` (never from the process
  * environment). Only the fixed allowlists below are uploaded, secrets travel
- * exclusively over gh stdin, and the target repository must be private.
+ * exclusively over gh stdin, and the target repository must be private. The
+ * repository-level BACKUPS_ENABLED opt-in is set to `true` as the final
+ * step: only after every environment upsert and legacy-secret deletion
+ * succeeded, so a partial configuration can never auto-enable backups.
  */
 
 import fs from 'node:fs';
@@ -52,6 +55,15 @@ export const GITHUB_VARIABLES = Object.freeze({
   CLOUDFLARE_ACCOUNT_ID: 'accountId',
   R2_BUCKET: 'bucket',
   ENCRYPT_KEY: 'ageRecipient',
+});
+
+/**
+ * Repository-level variables, upserted after every environment mutation.
+ * BACKUPS_ENABLED must be the exact lowercase string `true` for either
+ * workflow job to run, so configure always pushes that fixed value.
+ */
+export const REPOSITORY_VARIABLES = Object.freeze({
+  BACKUPS_ENABLED: 'true',
 });
 
 const REPOSITORY_ARG = /^[^/\s]+\/[^/\s]+$/;
@@ -198,16 +210,20 @@ async function setGitHubValue({
   logger,
   signal,
 }) {
-  const args = [kind, 'set', name, '--env', environment, '--repo', repository];
+  // A null environment means repository scope (e.g. the BACKUPS_ENABLED opt-in).
+  const args = [kind, 'set', name];
+  if (environment) args.push('--env', environment);
+  args.push('--repo', repository);
+  const scope = environment ?? 'the repository';
   try {
     await run({ command: ghBin, args, input: value, stdout: 'collect', stderr: 'collect', signal });
   } catch (err) {
     throw new Error(
-      `github configuration failed: ${kind} ${name} on ${environment}: ${logger.redact(err.message ?? String(err))}`,
+      `github configuration failed: ${kind} ${name} on ${scope}: ${logger.redact(err.message ?? String(err))}`,
       { cause: sanitizeCause(err, logger) },
     );
   }
-  logger.status(`github ${repository}: ${kind} ${name} set on ${environment}`);
+  logger.status(`github ${repository}: ${kind} ${name} set on ${scope}`);
 }
 
 /** Parse `gh secret list --json name` stdout (list of { name }) defensively. */
@@ -300,7 +316,8 @@ async function deleteLegacyGitHubSecret({ run, ghBin, environment, repository, l
  * repository -> list environments -> inventory existing environment secret
  * names -> create missing environments -> upsert every variable and every
  * new secret for every configured environment -> delete SUPABASE_DB_URL only
- * where the pre-mutation inventory showed it existed.
+ * where the pre-mutation inventory showed it existed -> set the
+ * repository-level BACKUPS_ENABLED opt-in last.
  */
 export async function runConfigureGitHub({
   argv = process.argv.slice(2),
@@ -481,7 +498,27 @@ export async function runConfigureGitHub({
       legacySecretDeletions[environment] = true;
     }
 
-    return { repository: nameWithOwner, createdEnvironments, upserts, legacySecretDeletions };
+    // Repository-level opt-in, strictly last: a failed upsert or deletion
+    // must never leave the backup jobs enabled on a partial configuration.
+    await setGitHubValue({
+      run,
+      ghBin,
+      kind: 'variable',
+      name: 'BACKUPS_ENABLED',
+      environment: null,
+      repository: nameWithOwner,
+      value: REPOSITORY_VARIABLES.BACKUPS_ENABLED,
+      logger,
+      signal,
+    });
+
+    return {
+      repository: nameWithOwner,
+      createdEnvironments,
+      upserts,
+      backupsEnabled: true,
+      legacySecretDeletions,
+    };
   } catch (err) {
     if (signal.aborted) {
       // A real child-process abort (ProcessAbortedError) or a stall both mean

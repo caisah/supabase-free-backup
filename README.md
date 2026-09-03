@@ -28,7 +28,7 @@ by storing daily (for the last week) db snapshots in Cloudflare R2 and a weekly 
 
 1. Create a separate private GitHub repository from this source. (A public fork remains public and cannot run backups.)
 2. Create `.env.production.local` and, if needed, `.env.development.local`; only production is mandatory. See [Configuration](#configuration).
-3. Set the required GitHub Actions variables and secrets (or use `github:configure` script). `github:configure` validates every local file first, inventories existing GitHub Environment secret names without reading values, upserts the approved variables/secrets, and finally deletes the legacy `SUPABASE_DB_URL` secret from each environment only after every environment completed all upserts (see [Supabase connection migration](#supabase-connection-migration)).
+3. Set the required GitHub Actions variables and secrets (or use `github:configure` script). `github:configure` validates every local file first, inventories existing GitHub Environment secret names without reading values, upserts the approved variables/secrets, and finally deletes the legacy `SUPABASE_DB_URL` secret from each environment only after every environment completed all upserts (see [Supabase connection migration](#supabase-connection-migration)). As its final step it sets the repository-level `BACKUPS_ENABLED=true` opt-in, so a failed or partial run never enables backup jobs.
 
 ## Architecture
 
@@ -114,7 +114,7 @@ Configuration values (see [.env.example](.env.example)):
 
 | Variable                                    | Purpose                                     | Notes                                                                                                                        |
 | ------------------------------------------- | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `BACKUPS_ENABLED`                           | GitHub Actions opt-in                       | must be set to `true` to enable automatic jobs; not consumed by local commands;                                              |
+| `BACKUPS_ENABLED`                           | GitHub Actions opt-in                       | repository-level Actions variable set to exactly `true` by `github:configure` as its final step; only exact `true` enables jobs; not consumed by local commands |
 | `BACKUP_ENVIRONMENT`                        | `development` \| `production`               | must match target (development for env.development.local & production from env.production.local)                             |
 | `SUPABASE_PROJECT_REF`                      | supabase project reference                  | the unique 20-character identifier for your Supabase project, shown as the last part of your dashboard URL (after /project/) |
 | `SUPABASE_SHARED_POOLER_URL`                         | **Supabase Shared Session Pooler URL**     | copy the Session pooler value from Dashboard > Connect > Session pooler (`postgresql://postgres.<project-ref>:<password>@aws-<pool>-<region>.pooler.supabase.com:5432/postgres?sslmode=require`); direct `db.<...>.supabase.co` URLs and transaction-mode port `6543` are rejected; the legacy `SUPABASE_DB_URL` name is rejected |
