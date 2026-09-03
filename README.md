@@ -17,7 +17,7 @@ by storing daily (for the last week) db snapshots in Cloudflare R2 and a weekly 
 
 ## Prerequisites
 
-- **Node.js >= the release pinned in `.node-version`** (the preflight rejects older versions; npm `12.0.2`);
+- **Node.js >= the release pinned in `.node-version`** (the preflight rejects older versions);
 - **age** ([used for encryption](https://github.com/FiloSottile/age));
 - **Docker** (Having Supabase installed from a docker image suffices);
 - **`gh`** (**optional** - only for `github:configure` script).
