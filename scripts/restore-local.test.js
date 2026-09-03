@@ -5,11 +5,18 @@ import path from 'node:path';
 import { runRestoreLocal } from './restore-local.js';
 import { exitCodeForResult } from './args.js';
 import { LocalRestoreError } from '../src/local-restore.js';
+import { REPOSITORY_ROOT } from '../src/config.js';
 import { tmpdir, writePrivateFile } from '../src/test-fixtures.js';
+
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const ID = '2026-08-24T03-17-09Z';
 
-/** Validate the local-stack workdir fixture (no config.toml needed; runner injects it). */
+/** Fixture constants: the exact config file and the derived project root. */
+const PROJECT_CONFIG = path.join('/', 'project', 'supabase', 'config.toml');
+const PROJECT_ROOT = path.join('/', 'project');
+
 function fakeDeps(overrides = {}) {
   const calls = { prepare: [], confirm: 0, restore: 0, cleanup: 0, validate: 0 };
   const deps = {
@@ -19,7 +26,7 @@ function fakeDeps(overrides = {}) {
         environment,
         source,
         ageIdentity: 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ',
-        projectWorkdir: path.join('/', 'project'),
+        supabaseConfigPath: PROJECT_CONFIG,
         accountId: '0123456789abcdef0123456789abcdef',
         bucket: environment,
         accessKeyId: 'a',
@@ -63,10 +70,11 @@ function fakeDeps(overrides = {}) {
         },
       };
     },
-    doValidateWorkdir: () => {
+    doValidateWorkdir: (opts) => {
       calls.validate += 1;
+      calls.validateOpts = opts;
       return {
-        workdir: path.join('/', 'project'),
+        workdir: PROJECT_ROOT,
         projectId: 'testproj',
         dbPort: 54322,
         dbContainer: 'supabase_db_testproj',
@@ -118,10 +126,61 @@ test('restore-local: every environment/source combination reaches common prepara
   }
 });
 
-test('restore-local: cheap workdir validation precedes expensive source preparation', async () => {
+test('restore-local: config loads and the self-reference check anchor to the repository root, never the caller cwd', async () => {
+  const script = fileURLToPath(new URL('./restore-local.js', import.meta.url));
+  const code = `
+    import { runRestoreLocal } from ${JSON.stringify(script)};
+    const calls = { root: null, repoRoot: null };
+    await runRestoreLocal({
+      options: { environment: 'development', source: 'r2', backup: 'latest' },
+      env: {},
+      logger: { addSecret() {}, status() {}, warn() {}, error() {}, redact: (t) => t },
+      deps: {
+        loadConfig: (opts) => {
+          calls.root = opts.root;
+          return {
+            environment: 'development',
+            source: 'r2',
+            ageIdentity: 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ',
+            supabaseConfigPath: '/abs/project/supabase/config.toml',
+            bucket: 'development',
+            accessKeyId: 'a',
+            secretAccessKey: 'b',
+          };
+        },
+        locateCli: () => process.execPath,
+        assertPin: async () => {},
+        doValidateWorkdir: (opts) => {
+          calls.repoRoot = opts.repoRoot;
+          return { workdir: '/abs/project', projectId: 'p', dbPort: 54322, dbContainer: 'c' };
+        },
+        lookup: () => process.execPath,
+        doPrepare: async () => ({ snapshotId: 'id', cleanup: async () => {} }),
+        doConfirm: async () => false,
+        stdIn: { isTTY: true },
+        stdErr: { write() {} },
+      },
+    });
+    process.stdout.write(JSON.stringify(calls));
+  `;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', code], {
+    cwd: tmpdir('bp-restore-cwd-'),
+    encoding: 'utf8',
+  });
+  assert.equal(child.status, 0, child.stderr);
+  const calls = JSON.parse(child.stdout);
+  assert.equal(calls.root, REPOSITORY_ROOT, 'config loads must anchor at the repository root');
+  assert.equal(
+    calls.repoRoot,
+    REPOSITORY_ROOT,
+    'the self-reference check must use the repository root',
+  );
+});
+
+test('restore-local: config-path validation precedes source preparation and receives the exact file', async () => {
   const { deps, calls } = fakeDeps({
     doValidateWorkdir: () => {
-      throw new LocalRestoreError('PROJECT_WORKDIR has no supabase/config.toml: /bad');
+      throw new LocalRestoreError('SUPABASE_CONFIG_PATH does not exist: /bad');
     },
   });
   await assert.rejects(
@@ -133,19 +192,34 @@ test('restore-local: cheap workdir validation precedes expensive source preparat
         logger: silent,
         deps,
       }),
-    /config\.toml/,
+    /SUPABASE_CONFIG_PATH does not exist/,
   );
   assert.equal(calls.prepare.length, 0, 'no snapshot download before a failing local check');
   assert.equal(calls.confirm, 0);
   assert.equal(calls.restore, 0);
 
-  // In the happy path the workdir check runs before doPrepare is invoked.
+  // The runner passes the config file path from the fixed development
+  // identity and the repository root as the relative base.
+  const { deps: deps2, calls: calls2 } = fakeDeps();
+  await runRestoreLocal({
+    options: localOptions({ source: 'repo' }),
+    env: {},
+    cwd: '/repo',
+    logger: silent,
+    deps: deps2,
+  });
+  assert.deepEqual(calls2.validateOpts, {
+    supabaseConfigPath: PROJECT_CONFIG,
+    repoRoot: '/repo',
+  });
+
+  // In the happy path the config-path check runs before doPrepare is invoked.
   const order = [];
-  const { deps: deps2 } = fakeDeps({
-    doValidateWorkdir: () => {
+  const { deps: deps3 } = fakeDeps({
+    doValidateWorkdir: (opts) => {
       order.push('validate');
       return {
-        workdir: path.join('/', 'project'),
+        workdir: opts.supabaseConfigPath ? PROJECT_ROOT : '/wrong',
         projectId: 'testproj',
         dbPort: 54322,
         dbContainer: 'supabase_db_testproj',
@@ -163,7 +237,7 @@ test('restore-local: cheap workdir validation precedes expensive source preparat
         env: {},
         cwd: '/repo',
         logger: silent,
-        deps: deps2,
+        deps: deps3,
       }),
     /ordering check/,
   );
@@ -248,7 +322,7 @@ test('restore-local: the warning names the exact container, port, and snapshot o
   const { deps } = fakeDeps({
     doValidateWorkdir: () => {
       return {
-        workdir: path.join('/', 'project'),
+        workdir: PROJECT_ROOT,
         projectId: 'testproj',
         dbPort: 54322,
         dbContainer: 'supabase_db_testproj',
@@ -282,7 +356,7 @@ test('restore-local: workdir validation runs before the pinned-CLI version check
     doValidateWorkdir: () => {
       order.push('validate');
       return {
-        workdir: path.join('/', 'project'),
+        workdir: PROJECT_ROOT,
         projectId: 'testproj',
         dbPort: 54322,
         dbContainer: 'supabase_db_testproj',

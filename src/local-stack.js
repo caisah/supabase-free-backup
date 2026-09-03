@@ -47,56 +47,113 @@ export function parseWorkdirConfig(configToml) {
   // Normalize CRLF so a Windows-checked-out config.toml parses identically.
   const normalized = configToml.replace(/\r\n/g, '\n');
   const dbSection = dbSectionOf(normalized);
-  const major = /major_version\s*=\s*(\d+)/.exec(dbSection);
+  // Line-anchored within the section so commented-out lookalikes
+  // (`# major_version = 15`) can never win over the real assignment;
+  // keys may be indented and strings single- or double-quoted (valid TOML).
+  const major = /^\s*major_version\s*=\s*(\d+)/m.exec(dbSection);
   const port = /^\s*port\s*=\s*(\d+)/m.exec(dbSection);
-  const projectId = /^project_id\s*=\s*"([^"]+)"/m.exec(normalized);
+  const projectId = /^\s*project_id\s*=\s*(?:"([^"]+)"|'([^']+)')/m.exec(normalized);
   return {
-    projectId: projectId ? projectId[1] : null,
+    projectId: projectId ? (projectId[1] ?? projectId[2]) : null,
     majorVersion: major ? Number(major[1]) : null,
     dbPort: port ? Number(port[1]) : null,
   };
 }
 
-/** Resolve PROJECT_WORKDIR and enforce the type/self-reference checks. */
-function resolveWorkdirPath({ projectWorkdir, repoRoot }) {
-  const resolved = path.resolve(projectWorkdir);
+const SUPABASE_CONFIG_BASENAME = 'config.toml';
+const SUPABASE_DIRNAME = 'supabase';
+const DB_CONTAINER_PREFIX = 'supabase_db_';
+
+/**
+ * Validate SUPABASE_CONFIG_PATH as the exact main-project config file.
+ * Error messages name the variable only (never the filesystem path),
+ * matching the config.js names-only policy. Order matters: existence/file
+ * checks and the LAYOUT check run on the configured path BEFORE
+ * canonicalization, so a symlink alias with a different name cannot bypass
+ * the <project>/supabase/config.toml contract and a valid symlinked
+ * config.toml stays valid. The project root is derived from the CONFIGURED
+ * path (never the symlink target: migrations live in the configured
+ * project), then canonicalized so a symlinked project directory and
+ * symlinked /tmp ancestors resolve to the real directory. Canonical paths
+ * are used only for the self-reference containment check and the read, so
+ * validation and use never resolve the file at different moments.
+ */
+function loadProjectConfig({ supabaseConfigPath, repoRoot }) {
+  if (typeof supabaseConfigPath !== 'string' || supabaseConfigPath.trim().length === 0) {
+    throw new LocalStackError('SUPABASE_CONFIG_PATH must be a non-empty string', {
+      stage: 'workdir',
+    });
+  }
+  const resolved = path.resolve(supabaseConfigPath);
+
   let stat;
   try {
     stat = fs.statSync(resolved);
-  } catch {
-    throw new LocalStackError(`PROJECT_WORKDIR does not exist: ${resolved}`, {
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      throw new LocalStackError('SUPABASE_CONFIG_PATH does not exist', {
+        stage: 'workdir',
+        cause: err,
+      });
+    }
+    // EACCES, ELOOP, ENOTDIR, EINVAL: never masquerade as a missing file.
+    throw new LocalStackError('Cannot access SUPABASE_CONFIG_PATH', {
       stage: 'workdir',
+      cause: err,
     });
   }
-  if (!stat.isDirectory()) {
-    throw new LocalStackError(`PROJECT_WORKDIR is not a directory: ${resolved}`, {
-      stage: 'workdir',
-    });
+  if (!stat.isFile()) {
+    throw new LocalStackError('SUPABASE_CONFIG_PATH is not a file', { stage: 'workdir' });
   }
-  const realRoot = fs.realpathSync(resolved);
-  const realRepo = fs.realpathSync(repoRoot);
-  if (realRoot === realRepo) {
+
+  // Layout check on the CONFIGURED path, before canonicalization.
+  const supabaseDir = path.dirname(resolved);
+  if (
+    path.basename(resolved) !== SUPABASE_CONFIG_BASENAME ||
+    path.basename(supabaseDir) !== SUPABASE_DIRNAME
+  ) {
     throw new LocalStackError(
-      'PROJECT_WORKDIR must point at the sibling project, not this repository',
+      `SUPABASE_CONFIG_PATH must point to <project>/${SUPABASE_DIRNAME}/${SUPABASE_CONFIG_BASENAME}`,
       { stage: 'workdir' },
     );
   }
-  return { realRoot };
-}
 
-/** Load the workdir's supabase/config.toml text and canonical path. */
-function loadWorkdirConfig({ realRoot, projectWorkdir }) {
-  const configPath = path.join(realRoot, 'supabase', 'config.toml');
+  let canonicalConfigPath;
+  let canonicalRepoRoot;
+  try {
+    canonicalConfigPath = fs.realpathSync(resolved);
+    canonicalRepoRoot = fs.realpathSync(repoRoot);
+  } catch (err) {
+    throw new LocalStackError('Cannot resolve SUPABASE_CONFIG_PATH', {
+      stage: 'workdir',
+      cause: err,
+    });
+  }
+
+  // Self-reference containment on the CANONICAL paths: a config inside this
+  // repository (directly or nested under subdirectories, through symlinks)
+  // must never feed the destructive local commands.
+  const workdirCandidate = path.dirname(supabaseDir);
+  if (
+    canonicalConfigPath === canonicalRepoRoot ||
+    canonicalConfigPath.startsWith(canonicalRepoRoot + path.sep)
+  ) {
+    throw new LocalStackError(
+      'SUPABASE_CONFIG_PATH must point at the main project, not this repository',
+      { stage: 'workdir' },
+    );
+  }
+
   let configToml;
   try {
-    configToml = fs.readFileSync(configPath, 'utf8');
-  } catch {
-    throw new LocalStackError(
-      `PROJECT_WORKDIR has no supabase/config.toml: ${path.join(projectWorkdir, 'supabase')}`,
-      { stage: 'workdir' },
-    );
+    configToml = fs.readFileSync(canonicalConfigPath, 'utf8');
+  } catch (err) {
+    throw new LocalStackError('Cannot read SUPABASE_CONFIG_PATH', {
+      stage: 'workdir',
+      cause: err,
+    });
   }
-  return { configPath, configToml };
+  return { configToml, projectRoot: fs.realpathSync(workdirCandidate) };
 }
 
 /**
@@ -104,12 +161,10 @@ function loadWorkdirConfig({ realRoot, projectWorkdir }) {
  * version, and a [db] port. `project_id` must be present BEFORE the
  * `supabase_db_<project>` container name is derived.
  */
-function validateParsedWorkdirConfig({ configToml, configPath, expectedMajorVersion }) {
+function validateParsedWorkdirConfig({ configToml, expectedMajorVersion }) {
   const parsed = parseWorkdirConfig(configToml);
   if (!parsed.projectId) {
-    throw new LocalStackError(`The project config must set project_id: ${configPath}`, {
-      stage: 'workdir',
-    });
+    throw new LocalStackError('The project config must set project_id', { stage: 'workdir' });
   }
   if (parsed.majorVersion !== expectedMajorVersion) {
     throw new LocalStackError(
@@ -124,29 +179,28 @@ function validateParsedWorkdirConfig({ configToml, configPath, expectedMajorVers
 }
 
 /** Build the stable validated-workdir result shape. */
-function buildWorkdirResult({ realRoot, configPath, parsed }) {
+function buildWorkdirResult({ projectRoot, parsed }) {
   return {
-    workdir: realRoot,
+    workdir: projectRoot,
     projectId: parsed.projectId,
     dbPort: parsed.dbPort,
-    dbContainer: `supabase_db_${parsed.projectId}`,
-    configPath,
+    dbContainer: `${DB_CONTAINER_PREFIX}${parsed.projectId}`,
   };
 }
 
 /**
- * Validate the project workdir: a real directory (not the backup repo
- * itself) containing supabase/config.toml with Postgres major version 17.
+ * Validate the main project's config file: an existing regular
+ * `<project>/supabase/config.toml` (never this backup repository's own
+ * config, also through a symlink) with Postgres major version 17.
  */
 export function validateWorkdir({
-  projectWorkdir,
+  supabaseConfigPath,
   repoRoot,
   expectedMajorVersion = POSTGRES_MAJOR_VERSION,
 }) {
-  const { realRoot } = resolveWorkdirPath({ projectWorkdir, repoRoot });
-  const { configPath, configToml } = loadWorkdirConfig({ realRoot, projectWorkdir });
-  const parsed = validateParsedWorkdirConfig({ configToml, configPath, expectedMajorVersion });
-  return buildWorkdirResult({ realRoot, configPath, parsed });
+  const { configToml, projectRoot } = loadProjectConfig({ supabaseConfigPath, repoRoot });
+  const parsed = validateParsedWorkdirConfig({ configToml, expectedMajorVersion });
+  return buildWorkdirResult({ projectRoot, parsed });
 }
 
 /**

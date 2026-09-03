@@ -2,8 +2,9 @@
  * Local-stack database restore (restore:local).
  *
  * Restores a fully verified hosted snapshot (r2|repo, decrypted) into the
- * local Supabase database owned by `PROJECT_WORKDIR` (Docker volumes only,
- * never tracked sibling files) and restarts the full local stack.
+ * local Supabase database owned by the main project selected through
+ * SUPABASE_CONFIG_PATH (Docker volumes only, never tracked sibling files)
+ * and restarts the full local stack.
  * Destruction begins only after source verification and the exact
  * `RESTORE local` confirmation.
  *

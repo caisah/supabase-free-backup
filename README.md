@@ -69,7 +69,7 @@ flowchart TD
 | `repository.js`                                      | Reading/writing dated snapshot dirs in Git                                                                                                                                                |
 | `restore.js`                                         | Shared verification: manifest schema, sizes, SHA-256, part order, codec-aware row-data restore (decryption only for age snapshots), aggregate fingerprint; sources: repo, R2, local store |
 | `hosted-restore.js`                                  | Hosted restore: Dockerized psql client (pinned ephemeral image), reset target, apply verified snapshot in one transaction                                                                 |
-| `local-stack.js`                                     | Read-only local-stack helpers: workdir parsing/validation and the psql probe used by `backup:local`                                                                                       |
+| `local-stack.js`                                     | Read-only local-stack helpers: `SUPABASE_CONFIG_PATH` file validation (config path -> canonical project root, port, container) and the psql probe used by `backup:local`                                                                                 |
 | `local-backup.js`                                    | Local store: private tree/lock, read-only stability guard, crash-durable publish-before-retention                                                                                         |
 | `runtime.js`, `stream.js`, `process.js`, `logger.js` | Node runtime gate, streaming, subprocess, logging utilities                                                                                                                               |
 
@@ -123,10 +123,29 @@ Configuration values (see [.env.example](.env.example)):
 | `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | R2 credentials (scoped to the bucket)       |                                                                                                                              |
 | `ENCRYPT_KEY`                               | public age recipient (`age1…`)              | backup only (hosted); not consumed by any restore or local command                                                        |
 | `DECRYPT_KEY`                               | private age identity (`AGE-SECRET-KEY-…`)   | r2/repo restores only (and legacy encrypted local snapshots); never uploaded                                                 |
-| `PROJECT_WORKDIR`                           | path to sibling project where supabase runs | always read from the local-stack (`development`) environment file; `backup:local` dump source and `restore:local` target     |
-|                                             |                                             |                                                                                                                              |
+| `SUPABASE_CONFIG_PATH`                  | exact main-project `supabase/config.toml` file                  | required by `backup:local`, `reset:local`, and the target side of `restore:local`; read from the local-stack (`development`) environment file; relative values resolve from this repository; the project root used as Supabase CLI cwd is derived from it; the legacy `PROJECT_WORKDIR` name is rejected |
 
 To generate `ENCRYPT_KEY` and `DECRYPT_KEY` run `npm run generate-age-keys` to populate these fields inside .env files.
+
+### Supabase config path migration
+
+Local commands (`backup:local`, `reset:local`, and the target side of
+`restore:local`) now require the main project's exact config file instead of
+its directory. Breaking change:
+
+```dotenv
+# before
+PROJECT_WORKDIR=../main-project
+# after
+SUPABASE_CONFIG_PATH=../main-project/supabase/config.toml
+```
+
+`SUPABASE_CONFIG_PATH` is validated as an existing regular file at
+`<project>/supabase/config.toml` (never this repository's own config);
+relative values resolve from this backup repository. A leftover
+`PROJECT_WORKDIR` is rejected by those commands with
+`UNSUPPORTED PROJECT_WORKDIR (rename to SUPABASE_CONFIG_PATH)` — there is no
+grace period, fallback, or alias.
 
 ## Scripts
 
@@ -150,7 +169,7 @@ To generate `ENCRYPT_KEY` and `DECRYPT_KEY` run `npm run generate-age-keys` to p
 | Script                                                                                                            | Purpose                                                                         |
 | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
 | `npm run backup -- --environment development\|production`                                                         | Dump, fingerprint, upload changed snapshot to R2, run retention                 |
-| `npm run backup:local -- --environment development\|production`                                                   | Package the ALREADY-RUNNING local <workdir> DB into `local-backups/<env>/`      |
+| `npm run backup:local`                                                                                        | Package the ALREADY-RUNNING local stack DB into `local-backups/local/`   |
 | `npm run restore:development -- --source r2\|repo\|local --backup latest\|<snapshot-id>`                          | Restore into hosted development DB                                              |
 | `npm run restore:production -- --source r2\|repo\|local --backup latest\|<snapshot-id>`                           | Restore into hosted production DB (maintenance window required)                 |
 | `npm run reset:development` / `npm run reset:production`                                                                 | Wipe the hosted DB to empty (`supabase db reset --db-url`); typed confirmation required, production phrase names the project ref; nothing is restored afterwards |
@@ -174,7 +193,8 @@ To generate `ENCRYPT_KEY` and `DECRYPT_KEY` run `npm run generate-age-keys` to p
   workdir has no migrations/seeds, and the target is fixed by the
   per-environment `.env.<environment>.local` connection URL (never
   `supabase link` global state). `reset:local` instead rebuilds the local
-  stack from the sibling `PROJECT_WORKDIR`'s own migrations/seed, with the
+  stack from the sibling project selected by `SUPABASE_CONFIG_PATH`'s own
+  migrations/seed, with the
   explicit `--local` flag — never link state.
 - `--backup` accepts `latest` or one exact canonical snapshot id
   (`YYYY-MM-DDTHH-mm-ssZ`); unavailable ids print the valid choices.
@@ -185,8 +205,9 @@ To generate `ENCRYPT_KEY` and `DECRYPT_KEY` run `npm run generate-age-keys` to p
 - `restore:local` reads a hosted snapshot (`--source r2|repo`, always
   decrypted with the age identity) into the local `<workdir>` stack. The
   snapshot environment selects only the SOURCE; the destructive target is
-  always the workdir from the local-stack (`development`) environment
-  file (`PROJECT_WORKDIR`). The stack is stopped with its DB volume
+  always the config path from the local-stack (`development`) environment
+  file (`SUPABASE_CONFIG_PATH`), whose derived project root becomes the
+  Supabase CLI cwd. The stack is stopped with its DB volume
   deleted, bootstrapped fresh (`db start` only — services stay down), then
   the verified snapshot applies in **one psql transaction**
   (`ON_ERROR_STOP=1`, `--single-transaction`) that begins by atomically
@@ -229,15 +250,16 @@ flowchart LR
 
 ### Local backup (`backup:local`)
 
-`npm run backup:local -- --environment <development|production>` packages the
-**already-running local Supabase stack** owned by the sibling project
-into a private, repository-local store. It reuses the exact dump, fingerprint,
+`npm run backup:local` (no arguments) packages the **already-running local
+Supabase stack** owned by the sibling project into a private,
+repository-local store. It reuses the exact dump, fingerprint,
 gzip + plaintext part splitting, and manifest pipeline as the hosted backup,
 but never encrypts (no age binary, no `ENCRYPT_KEY`), never touches R2, and
 never starts, stops, resets, or migrates the local stack. It uses only
-read-only connectivity and source-state probes. The selected environment only
-selects **target metadata** (`SUPABASE_PROJECT_REF`); the data source is always
-the local database.
+read-only connectivity and source-state probes. There is no environment
+selection: the config identity is fixed to the `development` dotenv (where
+`SUPABASE_PROJECT_REF` records the sibling project) and snapshots are always
+labeled `local`.
 
 `npm run reset:local` is the deliberate destructive counterpart (pinned CLI,
 sibling-workdir checks, explicit `--local`, warning before the run — no typed
@@ -290,7 +312,7 @@ local-backups/local/<YYYY-MM-DDTHH-mm-ssZ>/
 ### Restore a local backup to a hosted environment
 
 `npm run restore:development|restore:production -- --source local --backup
-latest|<snapshot-id>` restores a snapshot from `local-backups/<target-env>/`
+latest|<snapshot-id>` restores a snapshot from `local-backups/local/`
 into the hosted target database. Plaintext snapshots need **no decryption**:
 no `DECRYPT_KEY`, no age binary, no R2 credentials. `DECRYPT_KEY` is
 **optional** for `--source local` — it is only resolved when actually

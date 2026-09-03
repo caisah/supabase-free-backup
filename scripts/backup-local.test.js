@@ -55,6 +55,7 @@ const EXECUTABLES = {
   supabasePath: '/fake/supabase',
   dockerPath: '/fake/docker',
 };
+const PROJECT_CONFIG_PATH = '/workdir/project/supabase/config.toml';
 const PROJECT_STACK = {
   workdir: '/workdir/project',
   dbPort: PORT,
@@ -137,9 +138,13 @@ function depsFor({ repoRoot: _repoRoot, runAt, seed = 'a', extra = {} } = {}) {
       loadConfig: () => ({
         environment: LOCAL_STACK_ENVIRONMENT,
         projectRef: REF,
-        projectWorkdir: PROJECT_STACK.workdir,
+        supabaseConfigPath: PROJECT_CONFIG_PATH,
       }),
-      doValidateWorkdir: () => PROJECT_STACK,
+      doValidateWorkdir: (opts) => {
+        calls.validate += 1;
+        calls.validateOpts = opts;
+        return PROJECT_STACK;
+      },
       doResolveExecutables: () => EXECUTABLES,
       doAssertRunning: assertLocalStackRunning,
       doDump: async (opts) => {
@@ -254,7 +259,7 @@ test('backup-local: changed content or target ref publishes a new snapshot and r
         loadConfig: ({ environment }) => ({
           environment,
           projectRef: REF_PROD,
-          projectWorkdir: PROJECT_STACK.workdir,
+          supabaseConfigPath: PROJECT_CONFIG_PATH,
         }),
       };
     }
@@ -285,6 +290,18 @@ test('backup-local: dump cwd is the backup repository; source URL is only the wo
   assert.ok(!calls.dump[0].dbUrl.includes('.supabase.co'));
   assert.equal(calls.dump[0].cwd, repoRoot, 'dump runs with the backup repo as cwd');
   assert.notEqual(repoRoot, PROJECT_STACK.workdir, 'never the sibling workdir');
+  fs.rmSync(repoRoot, { recursive: true, force: true });
+});
+
+test('backup-local: the exact SUPABASE_CONFIG_PATH file reaches workdir validation', async () => {
+  const repoRoot = tmpdir('bp-bl-');
+  const { deps, calls } = depsFor({ repoRoot, runAt: T1 });
+  const result = await runBackupLocal({ env: {}, repoRoot, logger: silentLogger(), deps });
+  assert.equal(result.changed, true);
+  assert.deepEqual(calls.validateOpts, {
+    supabaseConfigPath: PROJECT_CONFIG_PATH,
+    repoRoot,
+  });
   fs.rmSync(repoRoot, { recursive: true, force: true });
 });
 

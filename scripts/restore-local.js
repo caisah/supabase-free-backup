@@ -7,13 +7,14 @@
  *   vp run restore:local --environment production --source repo --backup <snapshot-id>
  *
  * `--environment` selects which hosted environment's snapshots are read; the
- * TARGET is always the sibling PROJECT_WORKDIR stack (never this repository's
- * minimal workdir). Both sources are encrypted, so the age identity is always
- * resolved; `--source local` is NOT offered — the plaintext local store only
- * feeds hosted restores (`restore:development|production --source local`).
+ * TARGET is always the local stack of the main project identified by
+ * SUPABASE_CONFIG_PATH (never this repository's minimal workdir). Both
+ * sources are encrypted, so the age identity is always resolved;
+ * `--source local` is NOT offered — the plaintext local store only feeds
+ * hosted restores (`restore:development|production --source local`).
  *
  * Source verification, the pinned CLI version gate, and the local-stack
- * workdir checks (sibling project directory with a Postgres 17
+ * SUPABASE_CONFIG_PATH checks (the sibling project's Postgres 17
  * supabase/config.toml) all complete BEFORE the interactive `RESTORE local`
  * confirmation gate; after the phrase, the stack is freshly bootstrapped
  * and a read-only managed-data compatibility probe runs before any data is
@@ -27,7 +28,7 @@ import { assertNodeVersion } from '../src/runtime.js';
 import { createLogger } from '../src/logger.js';
 import { runCommand, lookupExecutable } from '../src/process.js';
 import { locateSupabaseCli, assertPinnedSupabaseCliVersion } from '../src/database.js';
-import { loadLocalRestoreConfig } from '../src/config.js';
+import { loadLocalRestoreConfig, REPOSITORY_ROOT } from '../src/config.js';
 import { prepareRestore, createRestoreAdapter } from '../src/restore.js';
 import { createS3Adapter } from '../src/r2.js';
 import { confirmExactPhrase } from '../src/hosted-restore.js';
@@ -108,13 +109,13 @@ function createLocalRestoreContext({ options, env, cwd, d }) {
 }
 
 /**
- * Resolve the local target workdir (cheap synchronous file checks first,
+ * Resolve the local target config file (cheap synchronous file checks first,
  * so an invalid target fails before any subprocess is spawned), then the
  * executables and the pinned-CLI version gate.
  */
 async function prepareLocalTarget({ ctx, d }) {
-  const workdir = d.doValidateWorkdir({
-    projectWorkdir: ctx.cfg.projectWorkdir,
+  const stack = d.doValidateWorkdir({
+    supabaseConfigPath: ctx.cfg.supabaseConfigPath,
     repoRoot: ctx.cwd,
   });
   const executables = await resolveLocalRestoreExecutables({
@@ -124,7 +125,7 @@ async function prepareLocalTarget({ ctx, d }) {
     platform: process.platform,
   });
   await d.assertPin({ supabasePath: executables.supabasePath, run: d.run });
-  return { executables, workdir };
+  return { executables, workdir: stack };
 }
 
 /** Fully acquire, verify, and decrypt the selected snapshot source. */
@@ -148,12 +149,12 @@ async function prepareLocalRestoreSource({ ctx, d, executables }) {
 }
 
 /** Render the data-loss warning and ask for the exact `RESTORE local` phrase. */
-async function confirmLocalRestore({ ctx, d, prepared, workdir, isTTY }) {
+async function confirmLocalRestore({ ctx, d, prepared, stack, isTTY }) {
   d.stdErr.write(
     renderLocalWarning({
-      workdir: workdir.workdir,
-      dbContainer: workdir.dbContainer,
-      dbPort: workdir.dbPort,
+      workdir: stack.workdir,
+      dbContainer: stack.dbContainer,
+      dbPort: stack.dbPort,
       environment: ctx.environment,
       source: ctx.source,
       snapshotId: prepared.snapshotId,
@@ -169,13 +170,13 @@ async function confirmLocalRestore({ ctx, d, prepared, workdir, isTTY }) {
 }
 
 /** Execute the destructive local restore and report completion. */
-async function applyLocalRestore({ ctx, d, prepared, executables, workdir, logger }) {
+async function applyLocalRestore({ ctx, d, prepared, executables, stack, logger }) {
   await d.doRestore({
     supabasePath: executables.supabasePath,
-    workdir: workdir.workdir,
+    workdir: stack.workdir,
     prepared,
     dockerPath: executables.dockerPath,
-    dbContainer: workdir.dbContainer,
+    dbContainer: stack.dbContainer,
     run: d.run,
     logger,
   });
@@ -184,7 +185,7 @@ async function applyLocalRestore({ ctx, d, prepared, executables, workdir, logge
       environment: ctx.environment,
       source: ctx.source,
       snapshotId: prepared.snapshotId,
-      workdir: workdir.workdir,
+      workdir: stack.workdir,
       sourceProjectRef: prepared.sourceProjectRef,
     }),
   );
@@ -203,7 +204,7 @@ async function applyLocalRestore({ ctx, d, prepared, executables, workdir, logge
 export async function runRestoreLocal({
   options,
   env = process.env,
-  cwd = process.cwd(),
+  cwd = REPOSITORY_ROOT,
   logger = createLogger({ stream: process.stderr }),
   deps = {},
 } = {}) {
@@ -212,7 +213,7 @@ export async function runRestoreLocal({
   logger.addSecret(ctx.cfg.accessKeyId);
   logger.addSecret(ctx.cfg.secretAccessKey);
   logger.addSecret(ctx.cfg.ageIdentity);
-  const { executables, workdir } = await prepareLocalTarget({ ctx, d });
+  const { executables, workdir: stack } = await prepareLocalTarget({ ctx, d });
   const prepared = await prepareLocalRestoreSource({ ctx, d, executables });
   for (const warning of prepared.warnings ?? []) {
     logger.warn(warning);
@@ -223,7 +224,7 @@ export async function runRestoreLocal({
       ctx,
       d,
       prepared,
-      workdir,
+      stack,
       isTTY: deps.isTTY ?? Boolean(d.stdIn.isTTY),
     });
     if (!ok) {
@@ -235,7 +236,7 @@ export async function runRestoreLocal({
       d,
       prepared,
       executables,
-      workdir,
+      stack,
       logger,
     });
   } finally {

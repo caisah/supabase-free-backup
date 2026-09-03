@@ -63,6 +63,9 @@ const POOLER_DATABASE_PATH = '/postgres';
 /** Literal legacy hosted-connection variable name (hard-cutover gate only). */
 export const LEGACY_DB_URL_VARIABLE = 'SUPABASE_DB_URL';
 
+/** Literal legacy local-workdir variable name (hard-cutover gate only). */
+export const LEGACY_PROJECT_WORKDIR_VARIABLE = 'PROJECT_WORKDIR';
+
 /** Stable diagnostic keyword for source disagreements; shared with tests. */
 export const CONFLICT_PREFIX = 'CONFLICT';
 
@@ -196,7 +199,10 @@ const VARIABLE_SCHEMAS = {
     shape: AGE_IDENTITY_SHAPE,
     hint: 'expected an AGE-SECRET-KEY-... identity',
   }),
-  PROJECT_WORKDIR: fieldSchema('PROJECT_WORKDIR'),
+  // The main project's exact supabase/config.toml file. PROJECT_WORKDIR is
+  // deliberately NOT a schema entry: the legacy name is only ever read from
+  // the raw sources by the hard-cutover diagnostic below.
+  SUPABASE_CONFIG_PATH: fieldSchema('SUPABASE_CONFIG_PATH'),
 };
 
 function shapeProblems(fields) {
@@ -253,7 +259,7 @@ function conflictScopedNames(requirements) {
   if (requirements.r2) names.push('R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET');
   if (requirements.ageRecipient) names.push('ENCRYPT_KEY');
   if (requirements.ageIdentity) names.push('DECRYPT_KEY');
-  if (requirements.projectWorkdir) names.push('PROJECT_WORKDIR');
+  if (requirements.supabaseConfigPath) names.push('SUPABASE_CONFIG_PATH');
   return new Set(names);
 }
 
@@ -314,26 +320,35 @@ function collectRequirementProblems({ requirements, resolved }) {
   if (requirements.ageIdentity && !resolved.DECRYPT_KEY) {
     problems.push('MISSING DECRYPT_KEY');
   }
-  if (requirements.projectWorkdir && !resolved.PROJECT_WORKDIR) {
-    problems.push('MISSING PROJECT_WORKDIR');
+  if (requirements.supabaseConfigPath && !resolved.SUPABASE_CONFIG_PATH) {
+    problems.push('MISSING SUPABASE_CONFIG_PATH');
   }
   return problems;
 }
 
 /**
- * Hard-cutover diagnostic for the legacy hosted-connection variable. Runs
- * only when the selected operation consumes a hosted Shared Pooler URL;
- * inspects BOTH process and dotenv sources; never resolves or returns the
- * old value; fails even when the new field is also present so stale
- * configuration cannot silently linger. Reports variable names only.
+ * Hard-cutover diagnostics for legacy variable names. Each runs only when
+ * the selected operation consumes the replacement field; inspects BOTH
+ * process and dotenv sources; never resolves or returns the old value;
+ * fails even when the new field is also present so stale configuration
+ * cannot silently linger. Reports variable names only.
  */
 function collectLegacyVariableProblems({ requirements, vars, fileValues }) {
-  if (!requirements.sharedPoolerUrl) return [];
-  const present =
-    (typeof vars[LEGACY_DB_URL_VARIABLE] === 'string' && vars[LEGACY_DB_URL_VARIABLE].length > 0) ||
-    (typeof fileValues[LEGACY_DB_URL_VARIABLE] === 'string' &&
-      fileValues[LEGACY_DB_URL_VARIABLE].length > 0);
-  return present ? ['UNSUPPORTED SUPABASE_DB_URL (rename to SUPABASE_SHARED_POOLER_URL)'] : [];
+  const problems = [];
+  const isConfigured = (name) =>
+    [vars[name], fileValues[name]].some((value) => typeof value === 'string' && value.length > 0);
+
+  if (requirements.sharedPoolerUrl && isConfigured(LEGACY_DB_URL_VARIABLE)) {
+    problems.push('UNSUPPORTED SUPABASE_DB_URL (rename to SUPABASE_SHARED_POOLER_URL)');
+  }
+
+  if (requirements.supabaseConfigPath && isConfigured(LEGACY_PROJECT_WORKDIR_VARIABLE)) {
+    problems.push(
+      `UNSUPPORTED ${LEGACY_PROJECT_WORKDIR_VARIABLE} (rename to SUPABASE_CONFIG_PATH)`,
+    );
+  }
+
+  return problems;
 }
 
 /** Cross-field checks: bucket/environment mapping and Shared Pooler URL classification. */
@@ -356,12 +371,12 @@ function collectCrossFieldProblems({ environment, requirements, resolved }) {
   return problems;
 }
 
-/** Resolve PROJECT_WORKDIR against the repository root. */
-function resolveProjectWorkdir({ resolved, root }) {
-  if (!resolved.PROJECT_WORKDIR) return undefined;
-  return path.isAbsolute(resolved.PROJECT_WORKDIR)
-    ? resolved.PROJECT_WORKDIR
-    : path.resolve(root, resolved.PROJECT_WORKDIR);
+/** Resolve SUPABASE_CONFIG_PATH against the repository root. */
+function resolveSupabaseConfigPath({ resolved, root }) {
+  if (!resolved.SUPABASE_CONFIG_PATH) return undefined;
+  return path.isAbsolute(resolved.SUPABASE_CONFIG_PATH)
+    ? resolved.SUPABASE_CONFIG_PATH
+    : path.resolve(root, resolved.SUPABASE_CONFIG_PATH);
 }
 
 /** Select the fields this operation is allowed to resolve. */
@@ -382,7 +397,7 @@ function resolveConfigFields({ vars, fileValues, fieldNames }) {
 }
 
 /** Build the stable public config shape from validated fields. */
-function buildOperationConfig({ environment, requirements, resolved, projectWorkdir }) {
+function buildOperationConfig({ environment, requirements, resolved, supabaseConfigPath }) {
   const config = {
     environment,
     projectRef: resolved.SUPABASE_PROJECT_REF,
@@ -393,7 +408,7 @@ function buildOperationConfig({ environment, requirements, resolved, projectWork
     secretAccessKey: resolved.R2_SECRET_ACCESS_KEY,
     ageRecipient: resolved.ENCRYPT_KEY,
     ageIdentity: resolved.DECRYPT_KEY,
-    projectWorkdir,
+    supabaseConfigPath,
     r2Endpoint: resolved.CLOUDFLARE_ACCOUNT_ID
       ? `https://${resolved.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`
       : undefined,
@@ -414,7 +429,7 @@ function buildOperationConfig({ environment, requirements, resolved, projectWork
   }
   if (requirements.ageRecipient) scoped.ageRecipient = config.ageRecipient;
   if (requirements.ageIdentity) scoped.ageIdentity = config.ageIdentity;
-  if (requirements.projectWorkdir) scoped.projectWorkdir = projectWorkdir;
+  if (requirements.supabaseConfigPath) scoped.supabaseConfigPath = supabaseConfigPath;
   return scoped;
 }
 
@@ -424,12 +439,13 @@ const BACKUP_REQUIREMENTS = {
   accountId: true,
   r2: true,
   ageRecipient: true,
+  consumedOnly: true,
 };
 
-/** Local backup: target metadata + workdir only, never age or the hosted path. */
+/** Local backup: target metadata + config path only, never age or the hosted path. */
 const LOCAL_BACKUP_REQUIREMENTS = {
   projectRef: true,
-  projectWorkdir: true,
+  supabaseConfigPath: true,
   consumedOnly: true,
 };
 
@@ -530,7 +546,7 @@ export function loadOperationConfig({
     environment,
     requirements,
     resolved,
-    projectWorkdir: resolveProjectWorkdir({ resolved, root }),
+    supabaseConfigPath: resolveSupabaseConfigPath({ resolved, root }),
   });
 }
 
@@ -554,13 +570,14 @@ export function loadHostedRestoreConfig({ source, ...opts }) {
 }
 
 /**
- * Local-stack restore: hosted snapshot (r2|repo) into the sibling workdir.
- * Consumes the source credentials of the SELECTED environment (the snapshot
- * source) but never the hosted connection URL/ref: the target is always the
- * local stack, so no hosted URL exists on this path. The target workdir is
- * read from the FIXED local-stack environment (LOCAL_STACK_ENVIRONMENT),
- * exactly like backup:local/reset:local — selecting a production snapshot
- * can never redirect the destructive local target to a production workdir.
+ * Local-stack restore: hosted snapshot (r2|repo) into the sibling project
+ * stack. Consumes the source credentials of the SELECTED environment (the
+ * snapshot source) but never the hosted connection URL/ref: the target is
+ * always the local stack, so no hosted URL exists on this path. The target
+ * config path is read from the FIXED local-stack environment
+ * (LOCAL_STACK_ENVIRONMENT), exactly like backup:local/reset:local —
+ * selecting a production snapshot can never redirect the destructive local
+ * target to a production workdir.
  * Restore only decrypts, so the encryption recipient (ENCRYPT_KEY) is
  * neither required nor consumed.
  */
@@ -579,23 +596,24 @@ const LOCAL_RESTORE_REQUIREMENTS = {
 
 /**
  * Local-stack restore (development/production snapshot). The source
- * credentials resolve from the selected environment; PROJECT_WORKDIR is
- * resolved from the FIXED local-stack environment file, so the snapshot
+ * credentials resolve from the selected environment; SUPABASE_CONFIG_PATH
+ * is resolved from the FIXED local-stack environment file, so the snapshot
  * environment never selects the destructive target.
  */
-export function loadLocalRestoreConfig({ source, root, vars, ...opts }) {
+export function loadLocalRestoreConfig({ source, root, vars, dotenvPath, ...opts }) {
   const requirements = LOCAL_RESTORE_REQUIREMENTS[source];
   if (!requirements) {
     throw new ConfigError(['source must be one of: r2, repo']);
   }
-  const sourceCfg = loadOperationConfig({ ...opts, root, vars, requirements });
+  const sourceCfg = loadOperationConfig({ ...opts, dotenvPath, root, vars, requirements });
   const targetCfg = loadOperationConfig({
     environment: LOCAL_STACK_ENVIRONMENT,
     root,
     vars,
     requirements: LOCAL_RESET_REQUIREMENTS,
+    dotenvPath,
   });
-  return { ...sourceCfg, projectWorkdir: targetCfg.projectWorkdir };
+  return { ...sourceCfg, supabaseConfigPath: targetCfg.supabaseConfigPath };
 }
 
 /** Hosted reset: target URL and ref only, same consumed-scope as local restores. */
@@ -610,13 +628,13 @@ export function loadHostedResetConfig(opts) {
   return loadOperationConfig({ ...opts, requirements: HOSTED_RESET_REQUIREMENTS });
 }
 
-/** Local reset: sibling workdir only; the stack identity is the fixed development dotenv. */
+/** Local reset: sibling config path only; the stack identity is the fixed development dotenv. */
 const LOCAL_RESET_REQUIREMENTS = {
-  projectWorkdir: true,
+  supabaseConfigPath: true,
   consumedOnly: true,
 };
 
-/** Local reset: workdir-only config from the fixed development identity. */
+/** Local reset: config-path-only loader from the fixed development identity. */
 export function loadLocalResetConfig(opts) {
   return loadOperationConfig({ ...opts, requirements: LOCAL_RESET_REQUIREMENTS });
 }

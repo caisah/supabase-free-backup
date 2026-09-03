@@ -8,11 +8,12 @@
  *
  * No environment selection: the local stack is a single database whose
  * config identity is fixed to the development dotenv (`.env.development.local`,
- * BACKUP_ENVIRONMENT must be `development`), and the target is the sibling
- * PROJECT_WORKDIR — never this repository's minimal workdir (which has no
- * migrations) and never `supabase link` state: the reset runs with the
- * explicit `--local` flag in the sibling workdir, so a linked or stray CLI
- * can never redirect it at a hosted project.
+ * BACKUP_ENVIRONMENT must be `development`), and the target is the main
+ * project identified by SUPABASE_CONFIG_PATH — never this repository's
+ * minimal workdir (which has no migrations) and never `supabase link`
+ * state: the reset runs with the explicit `--local` flag in the derived
+ * project root, so a linked or stray CLI can never redirect it at a hosted
+ * project.
  *
  * The pinned CLI version gate applies as on every destructive path. Docker
  * and a running local stack are required; the CLI fails with its own clear
@@ -29,7 +30,7 @@ import { assertNodeVersion } from '../src/runtime.js';
 import { createLogger } from '../src/logger.js';
 import { runCommand } from '../src/process.js';
 import { locateSupabaseCli, assertPinnedSupabaseCliVersion } from '../src/database.js';
-import { loadLocalResetConfig, LOCAL_STACK_ENVIRONMENT } from '../src/config.js';
+import { loadLocalResetConfig, LOCAL_STACK_ENVIRONMENT, REPOSITORY_ROOT } from '../src/config.js';
 import { validateWorkdir } from '../src/local-stack.js';
 import { parseLocalResetArgs, LOCAL_RESET_USAGE } from './args.js';
 
@@ -47,7 +48,7 @@ async function resetLocalDatabase({ supabasePath, workdir, run }) {
 /** Full local-stack reset orchestration; heavy deps are injectable for tests. */
 export async function runLocalReset({
   env = process.env,
-  cwd = process.cwd(),
+  cwd = REPOSITORY_ROOT,
   logger = createLogger({ stream: process.stderr }),
   deps = {},
 } = {}) {
@@ -58,7 +59,10 @@ export async function runLocalReset({
     locateCli: deps.locateCli ?? locateSupabaseCli,
   };
   const cfg = d.loadConfig({ environment: LOCAL_STACK_ENVIRONMENT, vars: env, root: cwd });
-  const workdir = d.doValidateWorkdir({ projectWorkdir: cfg.projectWorkdir, repoRoot: cwd });
+  const stack = d.doValidateWorkdir({
+    supabaseConfigPath: cfg.supabaseConfigPath,
+    repoRoot: cwd,
+  });
 
   const supabasePath = d.locateCli({ root: cwd });
   if (!supabasePath || !fs.existsSync(supabasePath)) {
@@ -67,13 +71,13 @@ export async function runLocalReset({
   await assertPinnedSupabaseCliVersion({ supabasePath, run: d.run });
 
   logger.status(
-    `Resetting local stack database (project ${workdir.projectId}, container ${workdir.dbContainer})`,
+    `Resetting local stack database (project ${stack.projectId}, container ${stack.dbContainer})`,
   );
   logger.status(
-    `WARNING: all current data in ${workdir.workdir} will be lost and rebuilt from its migrations/seed.`,
+    `WARNING: all current data in ${stack.workdir} will be lost and rebuilt from its migrations/seed.`,
   );
-  await resetLocalDatabase({ supabasePath, workdir: workdir.workdir, run: d.run });
-  logger.status(`db reset complete for local stack ${workdir.workdir}`);
+  await resetLocalDatabase({ supabasePath, workdir: stack.workdir, run: d.run });
+  logger.status(`db reset complete for local stack ${stack.workdir}`);
 }
 
 /** CLI entry point: parse, run, and map the result to the exit code. */

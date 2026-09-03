@@ -24,7 +24,7 @@ const ACCESS_KEY = 'r2-access-key-1234567890';
 const SECRET_KEY = 'r2-secret-key-abcdefghijklmnopqrstuv';
 const AGE_RECIPIENT = AGE_RECIPIENT_1;
 const AGE_IDENTITY = AGE_IDENTITY_1;
-const WORKDIR = '/tmp/project-workdir';
+const CONFIG_PATH = '/tmp/main-project/supabase/config.toml';
 const UNKNOWN_SENTINEL = 'unknown-sentinel-value-never-uploaded';
 const CANONICAL = 'owner/canonical-repo';
 
@@ -45,7 +45,7 @@ function sentinelValues(environment) {
     environment === 'development' ? REF_DEV : REF_PROD,
     ACCOUNT_ID,
     AGE_RECIPIENT,
-    WORKDIR,
+    CONFIG_PATH,
   ];
 }
 
@@ -61,7 +61,7 @@ function envFileValues(environment, overrides = {}) {
     R2_SECRET_ACCESS_KEY: SECRET_KEY,
     ENCRYPT_KEY: AGE_RECIPIENT,
     DECRYPT_KEY: AGE_IDENTITY,
-    PROJECT_WORKDIR: WORKDIR,
+    SUPABASE_CONFIG_PATH: CONFIG_PATH,
     SOME_UNKNOWN_KEY: UNKNOWN_SENTINEL,
     ...overrides,
   };
@@ -100,7 +100,7 @@ function stubConfig(environment) {
     secretAccessKey: SECRET_KEY,
     ageRecipient: AGE_RECIPIENT,
     ageIdentity: AGE_IDENTITY,
-    projectWorkdir: WORKDIR,
+    supabaseConfigPath: CONFIG_PATH,
   };
 }
 
@@ -303,7 +303,7 @@ test('github:configure: maps both environments to exactly the approved allowlist
       };
       assert.ok(!('DECRYPT_KEY' in flat), 'DECRYPT_KEY must not sync');
       assert.ok(!('BACKUP_ENVIRONMENT' in flat), 'BACKUP_ENVIRONMENT must not sync');
-      assert.ok(!('PROJECT_WORKDIR' in flat), 'PROJECT_WORKDIR must not sync');
+      assert.ok(!('SUPABASE_CONFIG_PATH' in flat), 'SUPABASE_CONFIG_PATH must not sync');
       assert.ok(!('SOME_UNKNOWN_KEY' in flat), 'unknown dotenv keys must not sync');
       assert.ok(
         !('SUPABASE_DB_URL' in flat),

@@ -7,6 +7,7 @@ import {
   loadBackupConfig,
   loadHostedRestoreConfig,
   loadLocalBackupConfig,
+  loadLocalResetConfig,
   loadLocalRestoreConfig,
   classifySharedPoolerUrl,
   ConfigError,
@@ -53,7 +54,7 @@ function devFile(root, overrides = {}) {
     R2_SECRET_ACCESS_KEY: 'dev-secret-key-abcdefghijklmnop',
     ENCRYPT_KEY: 'age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
     DECRYPT_KEY: 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ',
-    PROJECT_WORKDIR: '../project',
+    SUPABASE_CONFIG_PATH: '../project/supabase/config.toml',
     ...overrides,
   });
 }
@@ -191,14 +192,15 @@ test('config: variables the operation does not consume never conflict', () => {
   const root = makeRoot();
   devFile(root);
   // Backup does not consume the private age identity: a differing DECRYPT_KEY
-  // shell export must not block the run.
+  // shell export must not block the run, and must not be resolved into the
+  // backup config object either.
   const identity = 'AGE-SECRET-KEY-1ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ';
   const backupCfg = loadBackupConfig({
     environment: 'development',
     root,
     vars: { DECRYPT_KEY: identity },
   });
-  assert.equal(backupCfg.ageIdentity, identity);
+  assert.ok(!Object.hasOwn(backupCfg, 'ageIdentity'), 'identity never exposed to backup');
   // Repo restore never touches R2: differing R2 exports must not block an
   // emergency repository restore (resolution still prefers the process
   // export; only the CONFLICT gate is scoped to consumed variables).
@@ -648,6 +650,27 @@ test('config: backup never requires the private age identity', () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test('config: hosted backup never returns the private identity or the config path', () => {
+  // The shared dotenv file legitimately carries DECRYPT_KEY (restores need
+  // it) and SUPABASE_CONFIG_PATH (local commands need it); a hosted backup
+  // run must not resolve either into its config object.
+  const root = makeRoot();
+  devFile(root); // default file has valid DECRYPT_KEY and SUPABASE_CONFIG_PATH
+  const cfg = loadBackupConfig({ environment: 'development', root, vars: {} });
+  assert.ok(!Object.hasOwn(cfg, 'ageIdentity'), 'private identity must not be exposed');
+  assert.ok(!Object.hasOwn(cfg, 'supabaseConfigPath'), 'config path must not be exposed');
+  // ... and a conflicting shell DECRYPT_KEY export neither blocks nor leaks.
+  const cfg2 = loadBackupConfig({
+    environment: 'development',
+    root,
+    vars: { DECRYPT_KEY: 'AGE-SECRET-KEY-1ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ' },
+  });
+  assert.ok(!Object.hasOwn(cfg2, 'ageIdentity'));
+  assert.ok(!Object.hasOwn(cfg2, 'supabaseConfigPath'));
+  assert.equal(cfg2.projectRef, REF_DEV, 'consumed fields still resolve');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test('config: restore loaders require the age identity', () => {
   const root = makeRoot();
   devFile(root, { DECRYPT_KEY: undefined });
@@ -715,7 +738,7 @@ test('config: local backup succeeds with only its own requirements', () => {
   assert.equal(cfg.environment, 'development');
   assert.equal(cfg.projectRef, REF_DEV);
   assert.equal(cfg.ageRecipient, undefined, 'ENCRYPT_KEY is not consumed by local backup');
-  assert.equal(cfg.projectWorkdir, path.join(root, '..', 'project'));
+  assert.equal(cfg.supabaseConfigPath, path.join(root, '..', 'project', 'supabase', 'config.toml'));
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -749,7 +772,7 @@ test('config: local backup returns only consumed fields', () => {
   assert.deepEqual(cfg, {
     environment: 'development',
     projectRef: REF_DEV,
-    projectWorkdir: path.resolve(root, '../project'),
+    supabaseConfigPath: path.resolve(root, '../project/supabase/config.toml'),
   });
   for (const name of [
     'sharedPoolerUrl',
@@ -767,16 +790,24 @@ test('config: local backup returns only consumed fields', () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('config: local backup resolves an explicit workdir and requires PROJECT_WORKDIR', () => {
+test('config: a relative SUPABASE_CONFIG_PATH resolves against the repository root and an absolute value is preserved', () => {
   const root = makeRoot();
-  devFile(root, { PROJECT_WORKDIR: '../project-proj' });
+  // Relative value: resolved against the supplied repository root.
+  devFile(root, { SUPABASE_CONFIG_PATH: '../project-proj/supabase/config.toml' });
   const cfg = loadLocalBackupConfig({ environment: 'development', root, vars: {} });
-  assert.equal(path.resolve(root, '../project-proj'), cfg.projectWorkdir);
+  assert.equal(cfg.supabaseConfigPath, path.resolve(root, '../project-proj/supabase/config.toml'));
 
-  devFile(root, { PROJECT_WORKDIR: undefined });
+  // Absolute value: path resolution preserves it unchanged.
+  const absolute = path.join('/tmp', 'elsewhere', 'supabase', 'config.toml');
+  devFile(root, { SUPABASE_CONFIG_PATH: absolute });
+  const cfgAbs = loadLocalBackupConfig({ environment: 'development', root, vars: {} });
+  assert.equal(cfgAbs.supabaseConfigPath, absolute);
+
+  // Missing: local backup fails with MISSING SUPABASE_CONFIG_PATH.
+  devFile(root, { SUPABASE_CONFIG_PATH: undefined });
   assert.throws(
     () => loadLocalBackupConfig({ environment: 'development', root, vars: {} }),
-    (err) => err instanceof ConfigError && err.message.includes('MISSING PROJECT_WORKDIR'),
+    (err) => err instanceof ConfigError && err.message.includes('MISSING SUPABASE_CONFIG_PATH'),
   );
   fs.rmSync(root, { recursive: true, force: true });
 });
@@ -824,16 +855,6 @@ test('config: local backup consumed disagreements conflict; unused ones never do
       return true;
     },
   );
-  assert.throws(
-    () =>
-      loadLocalBackupConfig({
-        environment: 'development',
-        root,
-        vars: { PROJECT_WORKDIR: '../other' },
-      }),
-    (err) =>
-      err instanceof ConfigError && err.message.includes(`${CONFLICT_PREFIX} PROJECT_WORKDIR`),
-  );
   // ENCRYPT_KEY is no longer consumed: a differing process export neither
   // conflicts nor blocks the run (names-only scoping covers this).
   const cfg = loadLocalBackupConfig({
@@ -843,6 +864,137 @@ test('config: local backup consumed disagreements conflict; unused ones never do
   });
   assert.equal(cfg.environment, 'development');
   assert.equal(cfg.projectRef, REF_DEV);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: differing process and dotenv SUPABASE_CONFIG_PATH values conflict without echoing paths', () => {
+  const root = makeRoot();
+  devFile(root);
+  assert.throws(
+    () =>
+      loadLocalBackupConfig({
+        environment: 'development',
+        root,
+        vars: { SUPABASE_CONFIG_PATH: '../other/supabase/config.toml' },
+      }),
+    (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(err.message.includes(`${CONFLICT_PREFIX} SUPABASE_CONFIG_PATH`), err.message);
+      assert.ok(!err.message.includes('project'), 'neither path value may be reported');
+      assert.ok(!err.message.includes('config.toml'), 'neither path value may be reported');
+      return true;
+    },
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: PROJECT_WORKDIR is rejected by every local path consumer (never a fallback)', () => {
+  const root = makeRoot();
+  const legacyMessage = 'UNSUPPORTED PROJECT_WORKDIR (rename to SUPABASE_CONFIG_PATH)';
+  const loaders = [
+    ['local backup', () => loadLocalBackupConfig({ environment: 'development', root, vars: {} })],
+    ['local reset', () => loadLocalResetConfig({ environment: 'development', root, vars: {} })],
+    [
+      'local restore',
+      () => loadLocalRestoreConfig({ environment: 'development', source: 'repo', root, vars: {} }),
+    ],
+  ];
+
+  // Legacy name in the local-stack dotenv file.
+  for (const [label, load] of loaders) {
+    devFile(root, {
+      SUPABASE_CONFIG_PATH: undefined,
+      PROJECT_WORKDIR: '../project',
+    });
+    assert.throws(
+      load,
+      (err) => {
+        assert.ok(err instanceof ConfigError, label);
+        assert.ok(err.message.includes(legacyMessage), `${label}: ${err.message}`);
+        return true;
+      },
+      `${label} dotenv source`,
+    );
+  }
+
+  // Legacy name in the process environment.
+  devFile(root, { SUPABASE_CONFIG_PATH: undefined });
+  assert.throws(
+    () =>
+      loadLocalBackupConfig({
+        environment: 'development',
+        root,
+        vars: { PROJECT_WORKDIR: '../project' },
+      }),
+    (err) => err instanceof ConfigError && err.message.includes(legacyMessage),
+  );
+
+  // Both old and new names present: still fails; the old value is never an
+  // alias for the new one.
+  devFile(root);
+  assert.throws(
+    () =>
+      loadLocalBackupConfig({
+        environment: 'development',
+        root,
+        vars: { PROJECT_WORKDIR: '../project' },
+      }),
+    (err) => err instanceof ConfigError && err.message.includes(legacyMessage),
+  );
+
+  // Old-only configuration reports BOTH the missing new name and the
+  // unsupported old name; it never silently resolves the old value.
+  devFile(root, {
+    SUPABASE_CONFIG_PATH: undefined,
+    PROJECT_WORKDIR: '../project',
+  });
+  assert.throws(
+    () => loadLocalBackupConfig({ environment: 'development', root, vars: {} }),
+    (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(err.message.includes('MISSING SUPABASE_CONFIG_PATH'), err.message);
+      assert.ok(err.message.includes(legacyMessage), err.message);
+      return true;
+    },
+  );
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: a hosted-only consumed operation is never blocked by an unrelated PROJECT_WORKDIR export', () => {
+  const root = makeRoot();
+  devFile(root, { SUPABASE_CONFIG_PATH: undefined });
+  // The hosted local-source restore consumes only ref/URL/environment, so a
+  // stale PROJECT_WORKDIR export must neither fail nor leak into the result.
+  const cfg = loadHostedRestoreConfig({
+    environment: 'development',
+    source: 'local',
+    root,
+    vars: { PROJECT_WORKDIR: '../project' },
+  });
+  assert.equal(cfg.projectRef, REF_DEV);
+  assert.ok(!Object.hasOwn(cfg, 'supabaseConfigPath'), 'path never exposed to hosted loaders');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: loadLocalResetConfig returns only environment and supabaseConfigPath', () => {
+  const root = makeRoot();
+  devFile(root, {
+    SUPABASE_SHARED_POOLER_URL: 'not-a-url',
+    SUPABASE_PROJECT_REF: 'not-a-ref',
+    ENCRYPT_KEY: 'not-an-age-key',
+    DECRYPT_KEY: 'not-an-age-identity',
+  });
+  const cfg = loadLocalResetConfig({ environment: 'development', root, vars: {} });
+  assert.deepEqual(cfg, {
+    environment: 'development',
+    supabaseConfigPath: path.resolve(root, '../project/supabase/config.toml'),
+  });
+  // Local reset requires the new name from the fixed development identity.
+  devFile(root, { SUPABASE_CONFIG_PATH: undefined });
+  assert.throws(
+    () => loadLocalResetConfig({ environment: 'development', root, vars: {} }),
+    (err) => err instanceof ConfigError && err.message.includes('MISSING SUPABASE_CONFIG_PATH'),
+  );
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -874,7 +1026,7 @@ test('config: hosted local source never consumes DECRYPT_KEY (legacy encrypted-l
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('config: local restore consumes workdir + source credentials, never the hosted URL', () => {
+test('config: local restore consumes config path + source credentials, never the hosted URL', () => {
   const root = makeRoot();
   devFile(root, {
     SUPABASE_SHARED_POOLER_URL: 'not-a-valid-pooler-url',
@@ -893,7 +1045,10 @@ test('config: local restore consumes workdir + source credentials, never the hos
   assert.equal(r2Cfg.environment, 'development');
   assert.equal(r2Cfg.bucket, 'development');
   assert.equal(r2Cfg.accessKeyId, 'dev-access-key-12345');
-  assert.equal(r2Cfg.projectWorkdir, path.resolve(root, '..', 'project'));
+  assert.equal(
+    r2Cfg.supabaseConfigPath,
+    path.resolve(root, '..', 'project', 'supabase', 'config.toml'),
+  );
   assert.equal(r2Cfg.ageIdentity, 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ');
   for (const name of ['projectRef', 'sharedPoolerUrl']) {
     assert.ok(!Object.hasOwn(r2Cfg, name), `r2 local restore exposed ${name}`);
@@ -904,24 +1059,53 @@ test('config: local restore consumes workdir + source credentials, never the hos
     root,
     vars: {},
   });
-  assert.equal(repoCfg.projectWorkdir, r2Cfg.projectWorkdir);
+  assert.equal(repoCfg.supabaseConfigPath, r2Cfg.supabaseConfigPath);
   for (const name of ['accountId', 'bucket', 'accessKeyId', 'secretAccessKey', 'projectRef']) {
     assert.ok(!Object.hasOwn(repoCfg, name), `repo local restore exposed ${name}`);
   }
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('config: local restore requires the age identity and workdir; r2 also needs credentials', () => {
+test('config: loadLocalRestoreConfig resolves the target config path from the same explicit dotenv file', () => {
+  const root = makeRoot();
+  // No per-environment files at all: the caller points both loads at one
+  // explicit dotenv file via dotenvPath.
+  const customPath = path.join(root, '.env.custom.local');
+  writeEnv(root, 'custom', {
+    BACKUP_ENVIRONMENT: 'development',
+    SUPABASE_CONFIG_PATH: '../project/supabase/config.toml',
+    CLOUDFLARE_ACCOUNT_ID: '0123456789abcdef0123456789abcdef',
+    R2_BUCKET: 'development',
+    R2_ACCESS_KEY_ID: 'dev-access-key-12345',
+    R2_SECRET_ACCESS_KEY: 'dev-secret-key-abcdefghijklmnop',
+    DECRYPT_KEY: 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ',
+  });
+  const cfg = loadLocalRestoreConfig({
+    environment: 'development',
+    source: 'r2',
+    root,
+    vars: {},
+    dotenvPath: customPath,
+  });
+  assert.equal(
+    cfg.supabaseConfigPath,
+    path.resolve(root, '..', 'project', 'supabase', 'config.toml'),
+  );
+  assert.equal(cfg.ageIdentity, 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('config: local restore requires the age identity and config path; r2 also needs credentials', () => {
   const root = makeRoot();
   devFile(root, { DECRYPT_KEY: undefined });
   assert.throws(
     () => loadLocalRestoreConfig({ environment: 'development', source: 'repo', root, vars: {} }),
     (err) => err instanceof ConfigError && err.message.includes('DECRYPT_KEY'),
   );
-  devFile(root, { PROJECT_WORKDIR: undefined });
+  devFile(root, { SUPABASE_CONFIG_PATH: undefined });
   assert.throws(
     () => loadLocalRestoreConfig({ environment: 'development', source: 'repo', root, vars: {} }),
-    (err) => err instanceof ConfigError && err.message.includes('PROJECT_WORKDIR'),
+    (err) => err instanceof ConfigError && err.message.includes('SUPABASE_CONFIG_PATH'),
   );
   devFile(root, {
     R2_ACCESS_KEY_ID: undefined,
@@ -947,11 +1131,11 @@ test('config: local restore requires the age identity and workdir; r2 also needs
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-test('config: local restore workdir comes from the fixed local-stack environment, never the snapshot environment', () => {
+test('config: local restore config path comes from the fixed local-stack environment, never the snapshot environment', () => {
   const root = makeRoot();
   // The local stack lives in the development file; the production file has
-  // its own (different) workdir plus the production source credentials.
-  devFile(root, { PROJECT_WORKDIR: '../dev-project' });
+  // its own (different) config path plus the production source credentials.
+  devFile(root, { SUPABASE_CONFIG_PATH: '../dev-project/supabase/config.toml' });
   writeEnv(root, 'production', {
     BACKUP_ENVIRONMENT: 'production',
     CLOUDFLARE_ACCOUNT_ID: '0123456789abcdef0123456789abcdef',
@@ -959,7 +1143,7 @@ test('config: local restore workdir comes from the fixed local-stack environment
     R2_ACCESS_KEY_ID: 'prod-access-key-12345',
     R2_SECRET_ACCESS_KEY: 'prod-secret-key-abcdefghijklmnop',
     DECRYPT_KEY: 'AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ',
-    PROJECT_WORKDIR: '../prod-project',
+    SUPABASE_CONFIG_PATH: '../prod-project/supabase/config.toml',
   });
   const cfg = loadLocalRestoreConfig({
     environment: 'production',
@@ -971,8 +1155,11 @@ test('config: local restore workdir comes from the fixed local-stack environment
   assert.equal(cfg.environment, 'production');
   assert.equal(cfg.bucket, 'production');
   assert.equal(cfg.accessKeyId, 'prod-access-key-12345');
-  // Target side: the destructive target is ALWAYS the local-stack workdir.
-  assert.equal(cfg.projectWorkdir, path.resolve(root, '..', 'dev-project'));
+  // Target side: the destructive target is ALWAYS the local-stack config path.
+  assert.equal(
+    cfg.supabaseConfigPath,
+    path.resolve(root, '..', 'dev-project', 'supabase', 'config.toml'),
+  );
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -1003,7 +1190,7 @@ test('config: hosted local-source restore consumes only ref, URL, and environmen
   assert.equal(cfg.environment, 'development');
   assert.equal(cfg.projectRef, REF_DEV);
   assert.equal(cfg.sharedPoolerUrl, sharedPoolerUrl(REF_DEV));
-  assert.equal(cfg.projectWorkdir, undefined);
+  assert.ok(!Object.hasOwn(cfg, 'supabaseConfigPath'), 'path never exposed to hosted loaders');
   for (const name of [
     'accountId',
     'bucket',

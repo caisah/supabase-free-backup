@@ -99,7 +99,10 @@ export async function runBackupLocal({
 } = {}) {
   const d = resolveLocalBackupDeps(deps);
   const cfg = d.loadConfig({ environment: LOCAL_STACK_ENVIRONMENT, vars: env, root: repoRoot });
-  const stack = d.doValidateWorkdir({ projectWorkdir: cfg.projectWorkdir, repoRoot });
+  const stack = d.doValidateWorkdir({
+    supabaseConfigPath: cfg.supabaseConfigPath,
+    repoRoot,
+  });
   const executables = d.doResolveExecutables({
     lookup: d.lookup,
     locateCli: d.locateCli,
@@ -147,7 +150,7 @@ export async function runBackupLocal({
 
     const packaged = await dumpAndPackageSnapshot({
       dbUrl: localUrl, // never cfg.dbUrl: the local stack is the only source
-      cwd: repoRoot, // never cfg.projectWorkdir: dump uses the backup repo
+      cwd: repoRoot, // never the derived main-project root: dump uses the backup repo
       outDir: workspace.outDir,
       pkgDir: candidate.pkgDir,
       snapshotId,
