@@ -51,6 +51,8 @@ See [Restore](#restore).
 
 ## Architecture
 
+### Backup flow
+
 Remote backups run daily at **03:17 UTC** when the private repository has
 `BACKUPS_ENABLED=true`. Local backups run on demand with `npm run backup:local`.
 
@@ -68,6 +70,37 @@ flowchart LR
         LD --> P["Package<br/>plaintext rows"]
         P --> S["local-backups/local<br/>latest snapshot"]
     end
+```
+
+### Restore flow
+
+R2 and Git snapshots can restore to hosted or local targets. Plaintext local
+snapshots can restore only to hosted targets. Every snapshot is verified before
+confirmation and any target is changed.
+
+```mermaid
+flowchart LR
+    R["R2<br/>daily · encrypted rows"]
+    G["Git repository<br/>weekly · encrypted rows"]
+    L["local-backups/local<br/>plaintext rows"]
+
+    subgraph hosted["Hosted target · development or production"]
+        HV["Acquire + verify<br/>decrypt if encrypted"] --> HC{"Typed confirmation"}
+        HC --> HR["Reset target"]
+        HR --> HA["Apply snapshot"]
+    end
+
+    subgraph localRestore["Local Supabase target"]
+        LV["Acquire + verify<br/>decrypt rows"] --> LC{"Typed confirmation"}
+        LC --> LR["Rebuild local stack"]
+        LR --> LA["Apply snapshot"]
+    end
+
+    R --> HV
+    G --> HV
+    L -->|hosted only| HV
+    R --> LV
+    G --> LV
 ```
 
 ## Backup scope
