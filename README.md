@@ -47,7 +47,7 @@ See [Backup](#backup).
 
 ### Restore
 
-See [Restore](#restore).
+See [Restore](#restore-1).
 
 ## Architecture
 
